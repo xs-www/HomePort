@@ -111,6 +111,28 @@ export const auditQuerySchema = z.object({
 });
 
 /**
+ * 保存设置：`{ values: { KEY: value } }`。
+ *
+ * 值的类型不在此处约束（每种类型的规则由 `registry.validateSettingValue` 负责，
+ * 因为规则依赖设置项定义）；这里只保证"是个非空对象"。
+ */
+export const updateSettingsBodySchema = z.object({
+  values: z.record(z.union([z.string(), z.number(), z.boolean()])).refine((value) => Object.keys(value).length > 0, {
+    message: '至少提供一个待保存的设置项',
+  }),
+});
+
+/** 重置设置：`{ keys?: string[] }`，省略表示全部重置。 */
+export const resetSettingsBodySchema = z.object({
+  keys: z.array(z.string().trim().min(1).max(128)).max(200).optional(),
+});
+
+/** 测试 tailnet 连通性：可带尚未保存的候选 Token。 */
+export const testTailscaleBodySchema = z.object({
+  token: z.string().max(512).optional(),
+});
+
+/**
  * 解析 + 校验；失败抛 `VALIDATION_FAILED`（含 `fieldErrors`）。
  *
  * 两处刻意的写法：

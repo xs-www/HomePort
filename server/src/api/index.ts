@@ -16,6 +16,7 @@ import { registerContainerRoutes } from './containers.js';
 import type { RouteContext } from './context.js';
 import { registerHealthRoutes } from './health.js';
 import { registerOverviewRoutes } from './overview.js';
+import { registerSettingsRoutes } from './settings.js';
 import { registerSystemRoutes } from './system.js';
 import { registerTailscaleRoutes } from './tailscale.js';
 import { registerToolRoutes } from './tools.js';
@@ -29,6 +30,9 @@ const PROTECTED_PREFIXES: ReadonlyArray<{ prefix: string; register: (app: Fastif
   { prefix: '/api/system', register: registerSystemRoutes },
   { prefix: '/api/tools', register: registerToolRoutes },
   { prefix: '/api/users', register: registerUserRoutes },
+  // 设置域内的每个 handler 自行要求 admin（不能只靠 prefix 守卫，
+  // 因为 /api/users 下也有非 admin 的 /me 路由，保持一致的写法更安全）
+  { prefix: '/api/settings', register: registerSettingsRoutes },
 ];
 
 export function registerRoutes(app: FastifyInstance, ctx: RouteContext): void {

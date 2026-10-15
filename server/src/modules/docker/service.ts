@@ -68,17 +68,38 @@ const UNPUBLISHED_NOTE = '该端口未发布到宿主，容器网络内可见';
 
 export class ContainerService {
   private readonly deps: ContainerServiceDeps;
-  private readonly listCache: TtlCache<{ items: ContainerSummary[]; source: SourceStatus }>;
+  private listCache: TtlCache<{ items: ContainerSummary[]; source: SourceStatus }>;
   private readonly log: Logger;
 
   constructor(deps: ContainerServiceDeps) {
     this.deps = deps;
     this.log = deps.logger.child({ mod: 'containers' });
-    this.listCache = new TtlCache({
-      ttlMs: deps.config.cache.containersTtlMs,
+    this.listCache = this.createCache();
+  }
+
+  /** 建立容器墙缓存（TTL 取自 config，运行时可变）。 */
+  private createCache(): TtlCache<{ items: ContainerSummary[]; source: SourceStatus }> {
+    return new TtlCache({
+      ttlMs: this.deps.config.cache.containersTtlMs,
       maxEntries: 16,
       logger: this.log,
     });
+  }
+
+  /**
+   * 运行时设置变更后同步内部状态。
+   *
+   * 目前处理 `PORTAL_CACHE_CONTAINERS_TTL_MS`：TTL 是构造时读取的，
+   * 因此需要重建缓存对象（旧缓存清空，下一次请求重新拉取）。
+   *
+   * @returns 是否有实际变化
+   */
+  syncConfig(): boolean {
+    const ttl = this.deps.config.cache.containersTtlMs;
+    if (this.listCache.defaultTtlMs === ttl) return false;
+    this.listCache = this.createCache();
+    this.log.debug('容器列表缓存 TTL 已更新', { ttlMs: ttl });
+    return true;
   }
 
   /** 数据源状态（供 /api/health 与前端角标使用）。 */

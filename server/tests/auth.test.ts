@@ -547,4 +547,161 @@ describe('接口契约', () => {
     // probe=0 时不探测
     expect(body.items.every((item) => item.status.state === 'unknown')).toBe(true);
   });
+
+  // ------------------------------------------------ 运行时设置（admin）
+  it('设置接口：匿名 401、viewer 403、admin 200', async () => {
+    const anonymous = await app.inject({ method: 'GET', url: '/api/settings' });
+    expect(anonymous.statusCode).toBe(401);
+  });
+
+  it('设置接口返回全部项，且每项都标注生效级别与来源', async () => {
+    const response = await app.inject({ method: 'GET', url: '/api/settings', headers: { cookie: admin.cookie } });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      groups: Array<{ id: string; label: string }>;
+      settings: Array<{
+        key: string;
+        effect: string;
+        source: string;
+        editable: boolean;
+        group: string;
+        sensitive?: boolean;
+      }>;
+      version: string;
+    };
+    expect(body.groups.length).toBeGreaterThan(0);
+    expect(body.settings.length).toBeGreaterThan(10);
+
+    const tailscaleToken = body.settings.find((item) => item.key === 'PORTAL_TAILSCALE_API_TOKEN');
+    expect(tailscaleToken).toBeDefined();
+    expect(tailscaleToken?.effect).toBe('reload');
+    expect(tailscaleToken?.editable).toBe(true);
+    expect(tailscaleToken?.sensitive).toBe(true);
+
+    // 每一项的 group 必须在 groups 里声明过，否则前端会漏渲染
+    const groupIds = new Set(body.groups.map((group) => group.id));
+    for (const setting of body.settings) {
+      expect(groupIds.has(setting.group), `${setting.key} 的分组 ${setting.group} 未声明`).toBe(true);
+      expect(['live', 'reload', 'restart']).toContain(setting.effect);
+      expect(['default', 'env', 'database']).toContain(setting.source);
+      // restart 级不可编辑
+      if (setting.effect === 'restart') expect(setting.editable).toBe(false);
+    }
+  });
+
+  it('保存设置：立即生效项被写入，restart 级项被拒绝', async () => {
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/api/settings',
+      headers: { cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: {
+        values: {
+          PORTAL_CACHE_CONTAINERS_TTL_MS: 4321,
+          PORTAL_TOOLS_PROBE_TIMEOUT_MS: 2222,
+          PORTAL_PORT: 9999, // restart 级，应被拒绝
+          PORTAL_UNKNOWN_KEY: 'x', // 未知键，应被拒绝
+        },
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      updatedKeys: string[];
+      rejectedRestartKeys: string[];
+      invalid: Array<{ key: string; error: string }>;
+      view: { settings: Array<{ key: string; value: unknown; source: string }> };
+    };
+    expect(body.updatedKeys).toContain('PORTAL_CACHE_CONTAINERS_TTL_MS');
+    expect(body.updatedKeys).toContain('PORTAL_TOOLS_PROBE_TIMEOUT_MS');
+    expect(body.rejectedRestartKeys).toContain('PORTAL_PORT');
+    expect(body.invalid.map((item) => item.key)).toContain('PORTAL_UNKNOWN_KEY');
+
+    // 视图里应立刻反映新值与来源
+    const ttl = body.view.settings.find((item) => item.key === 'PORTAL_CACHE_CONTAINERS_TTL_MS');
+    expect(ttl?.value).toBe(4321);
+    expect(ttl?.source).toBe('database');
+  });
+
+  it('保存设置：非法值被拒绝并给出字段级原因', async () => {
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/api/settings',
+      headers: { cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { values: { PORTAL_METRICS_INTERVAL_MS: 999999 } },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { updatedKeys: string[]; invalid: Array<{ key: string; error: string }> };
+    expect(body.updatedKeys).not.toContain('PORTAL_METRICS_INTERVAL_MS');
+    const issue = body.invalid.find((item) => item.key === 'PORTAL_METRICS_INTERVAL_MS');
+    expect(issue?.error).toContain('60000');
+  });
+
+  it('保存设置：敏感项提交占位符不覆盖原值', async () => {
+    // 先写入一个 Token
+    const set = await app.inject({
+      method: 'PATCH',
+      url: '/api/settings',
+      headers: { cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { values: { PORTAL_TAILSCALE_API_TOKEN: 'tskey-api-realtoken123' } },
+    });
+    expect(set.statusCode).toBe(200);
+
+    // 读回时应被打码，且不含原文
+    const read = await app.inject({ method: 'GET', url: '/api/settings', headers: { cookie: admin.cookie } });
+    const settings = (read.json() as { settings: Array<{ key: string; value: unknown; masked: boolean }> }).settings;
+    const token = settings.find((item) => item.key === 'PORTAL_TAILSCALE_API_TOKEN');
+    expect(token?.masked).toBe(true);
+    expect(String(token?.value)).not.toContain('realtoken123');
+
+    // 提交占位符 = 不修改
+    const masked = await app.inject({
+      method: 'PATCH',
+      url: '/api/settings',
+      headers: { cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { values: { PORTAL_TAILSCALE_API_TOKEN: '********' } },
+    });
+    expect(masked.statusCode).toBe(200);
+    expect((masked.json() as { updatedKeys: string[] }).updatedKeys).not.toContain('PORTAL_TAILSCALE_API_TOKEN');
+  });
+
+  it('重置设置：指定键恢复默认', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/settings/reset',
+      headers: { cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { keys: ['PORTAL_CACHE_CONTAINERS_TTL_MS'] },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as {
+      removed: number;
+      view: { settings: Array<{ key: string; source: string; value: unknown }> };
+    };
+    expect(body.removed).toBeGreaterThanOrEqual(1);
+    const ttl = body.view.settings.find((item) => item.key === 'PORTAL_CACHE_CONTAINERS_TTL_MS');
+    expect(ttl?.source).not.toBe('database');
+    expect(ttl?.value).toBe(2000);
+  });
+
+  it('测试 tailnet 连通性：无 Token 时给出可操作的提示而非报错', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/settings/test/tailscale',
+      headers: { cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: {},
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { ok: boolean; message: string; source: { detail: string | null } };
+    expect(body.ok).toBe(false);
+    // 消息里应告诉用户去哪里拿 Token
+    expect(body.message).toMatch(/Token|令牌|Keys/i);
+  });
+
+  it('设置接口需要 CSRF（变更类）', async () => {
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/api/settings',
+      headers: { cookie: admin.cookie },
+      payload: { values: { PORTAL_METRICS_INTERVAL_MS: 5000 } },
+    });
+    expect(response.statusCode).toBe(403);
+  });
 });

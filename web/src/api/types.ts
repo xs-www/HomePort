@@ -434,3 +434,82 @@ export interface AuditListResponse {
   items: AuditEntry[];
   total: number;
 }
+
+// ---------------------------------------------------------------- 运行时设置
+
+/**
+ * 生效级别。
+ *
+ * - `live`：下次读取即生效
+ * - `reload`：保存后自动重建对应数据源，立即生效
+ * - `restart`：**改不了**，需重建容器（容器创建参数）
+ */
+export type SettingEffect = 'live' | 'reload' | 'restart';
+
+export type SettingValueType = 'string' | 'number' | 'boolean' | 'enum' | 'string-list';
+
+export type SettingGroup = 'tailscale' | 'docker' | 'system' | 'tools' | 'performance' | 'boot';
+
+export interface SettingView {
+  key: string;
+  group: SettingGroup;
+  label: string;
+  description: string;
+  effect: SettingEffect;
+  valueType: SettingValueType;
+  envVar: string;
+  /** 当前生效值（敏感项已打码） */
+  value: unknown;
+  /** 是否被打码（前端用密码框 + 占位符） */
+  masked: boolean;
+  source: 'default' | 'env' | 'database';
+  defaultValue: unknown;
+  envValue: string | null;
+  databaseValue: unknown;
+  choices?: Array<{ value: string; label: string }>;
+  min?: number;
+  max?: number;
+  unit?: string;
+  sensitive?: boolean;
+  restartReason?: string;
+  updatedAt?: string;
+  updatedBy?: string | null;
+  /** false 表示需重建容器，界面不给编辑控件 */
+  editable: boolean;
+}
+
+export interface SettingsResponse {
+  groups: ReadonlyArray<{ id: SettingGroup; label: string; description: string }>;
+  settings: SettingView[];
+  version: string;
+}
+
+export interface UpdateSettingsResponse {
+  updatedKeys: string[];
+  rejectedRestartKeys: string[];
+  invalid: Array<{ key: string; error: string }>;
+  reloaded: { tailscale: boolean; docker: boolean };
+  view: SettingsResponse;
+}
+
+export interface ResetSettingsResponse {
+  removed: number;
+  view: SettingsResponse;
+}
+
+export interface TailscaleDeviceSummary {
+  hostname: string;
+  os: string;
+  online: boolean;
+  ipv4: string | null;
+}
+
+export interface TailscaleTestResponse {
+  ok: boolean;
+  mode: 'cli' | 'api' | 'off';
+  source: { available: boolean; mode: string; detail: string | null };
+  deviceCount: number | null;
+  onlineCount: number | null;
+  devices: TailscaleDeviceSummary[];
+  message: string;
+}

@@ -303,7 +303,96 @@ data: {}
 
 ---
 
-## 8. 权限矩阵
+## 8. 运行时设置（admin）
+
+管理员可在界面内修改部分配置，优先级 **数据库 > 环境变量 > 内置默认**。
+`.env` 部署方式完全不受影响：未在界面改过的项仍按 `.env` 生效。
+
+### `GET /api/settings`
+需 admin。→ `200`
+```json
+{
+  "groups": [
+    { "id": "tailscale", "label": "tailnet 数据源", "description": "查询 tailnet 设备与在线状态…" }
+  ],
+  "settings": [{
+    "key": "PORTAL_TAILSCALE_API_TOKEN",
+    "group": "tailscale",
+    "label": "API Token",
+    "description": "在 Tailscale 管理后台 → Settings → Keys → Generate access token 生成…",
+    "effect": "reload",
+    "valueType": "string",
+    "envVar": "PORTAL_TAILSCALE_API_TOKEN",
+    "value": "tskey-api-********",
+    "masked": true,
+    "source": "database",
+    "defaultValue": "",
+    "envValue": null,
+    "databaseValue": "tskey-api-********",
+    "sensitive": true,
+    "updatedAt": "2026-10-16T01:23:45.000Z",
+    "updatedBy": "admin",
+    "editable": true
+  }],
+  "version": "3:2026-10-16T01:23:45.000Z"
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `effect` | `live`（下次读取生效）/ `reload`（保存后自动重建数据源）/ `restart`（**需重建容器**） |
+| `source` | `default` / `env` / `database` —— 当前值来自哪一层 |
+| `editable` | `effect === 'restart'` 时为 `false`，前端**不应**提供编辑控件 |
+| `masked` | 敏感项已打码；提交 `********` 或空字符串表示"不修改" |
+| `envValue` | 环境变量里的原值（便于对照"界面改了什么"），敏感项同样打码 |
+| `restartReason` | `restart` 级项不可改的具体原因 |
+
+### `PATCH /api/settings`
+需 admin + CSRF。**部分成功语义**。
+```json
+{ "values": { "PORTAL_TAILSCALE_API_TOKEN": "tskey-api-xxx", "PORTAL_METRICS_INTERVAL_MS": 5000 } }
+```
+→ `200`
+```json
+{
+  "updatedKeys": ["PORTAL_TAILSCALE_API_TOKEN", "PORTAL_METRICS_INTERVAL_MS"],
+  "rejectedRestartKeys": [],
+  "invalid": [{ "key": "…", "error": "不能大于 60000ms" }],
+  "reloaded": { "tailscale": true, "docker": false },
+  "view": { "groups": [], "settings": [], "version": "…" }
+}
+```
+- 合法项写入并**立即生效**（`reloaded` 说明重建了哪些数据源）。
+- `restart` 级键 → `rejectedRestartKeys`（服务端也会拒绝，不只是界面隐藏）。
+- 非法值 → `invalid[].error`，其余项照常写入。
+- 响应带回最新 `view`，前端无需二次请求。
+
+### `POST /api/settings/reset`
+需 admin + CSRF。`{ "keys": ["PORTAL_METRICS_INTERVAL_MS"] }`；省略 `keys` 表示全部重置。
+→ `200 { "removed": 1, "view": { ... } }`
+
+### `POST /api/settings/test/tailscale`
+需 admin + CSRF。测试 tailnet 连通性，支持**尚未保存**的候选 Token（"先测再存"）。
+```json
+{ "token": "tskey-api-xxx" }
+```
+→ `200`
+```json
+{
+  "ok": true,
+  "mode": "api",
+  "source": { "available": true, "mode": "api", "detail": null },
+  "deviceCount": 12,
+  "onlineCount": 4,
+  "devices": [{ "hostname": "sisi-laptop", "os": "windows", "online": true, "ipv4": "100.72.255.29" }],
+  "message": "API 模式可用：读到 12 台设备，其中 4 台在线。"
+}
+```
+失败时 `ok: false` 且 `message` 给出**可操作**的下一步（401 → 重新生成 Token；403 → 检查 ACL；超时 → 检查外网出口）。
+
+---
+
+## 9. 权限矩阵
 
 | 接口 | 匿名 | viewer | admin |
 | --- | :-: | :-: | :-: |
@@ -313,7 +402,8 @@ data: {}
 | `/api/overview`、`/api/containers*`、`/api/tailscale/*`、`/api/system/*`、`/api/tools*` | ❌ | ✅ | ✅ |
 | `/api/users/me*` | ❌ | ✅ | ✅ |
 | `/api/users` 及 `/api/users/:id*` | ❌ | ❌ | ✅ |
+| `/api/settings` 及 `/api/settings/*` | ❌ | ❌ | ✅ |
 
-## 9. 变更记录
+## 10. 变更记录
 
 接口的任何变动必须同步更新本文件，并在 [09-changelog.md](./09-changelog.md) 记录。

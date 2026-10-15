@@ -18,14 +18,18 @@ import type {
   LoginResponse,
   MeResponse,
   OverviewResponse,
+  ResetSettingsResponse,
   SessionActivity,
   SessionUser,
   SessionView,
+  SettingsResponse,
   SystemSnapshotResponse,
   TailnetStatusLite,
   TailnetStatusResponse,
+  TailscaleTestResponse,
   ToolListResponse,
   ToolView,
+  UpdateSettingsResponse,
   UserListResponse,
   UserPreferences,
 } from './types.js';
@@ -313,6 +317,40 @@ export class ApiClient {
 
   auditLog(limit = 100): Promise<AuditListResponse> {
     return this.request<AuditListResponse>('/users/audit/log', { query: { limit } });
+  }
+
+  // ------------------------------------------------------------ 运行时设置（admin）
+
+  /** 读取全部设置项（含来源与生效级别）。 */
+  settings(): Promise<SettingsResponse> {
+    return this.request<SettingsResponse>('/settings', { timeoutMs: SLOW_TIMEOUT_MS });
+  }
+
+  /** 保存设置项；返回被拒绝/非法的键与最新视图。 */
+  updateSettings(values: Record<string, unknown>): Promise<UpdateSettingsResponse> {
+    return this.request<UpdateSettingsResponse>('/settings', {
+      method: 'PATCH',
+      body: { values },
+      timeoutMs: SLOW_TIMEOUT_MS,
+    });
+  }
+
+  /** 重置设置项；`keys` 省略表示全部重置。 */
+  resetSettings(keys?: string[]): Promise<ResetSettingsResponse> {
+    return this.request<ResetSettingsResponse>('/settings/reset', {
+      method: 'POST',
+      body: keys ? { keys } : {},
+      timeoutMs: SLOW_TIMEOUT_MS,
+    });
+  }
+
+  /** 测试 tailnet 连通性；可带尚未保存的候选 Token。 */
+  testTailscale(token?: string): Promise<TailscaleTestResponse> {
+    return this.request<TailscaleTestResponse>('/settings/test/tailscale', {
+      method: 'POST',
+      body: token ? { token } : {},
+      timeoutMs: SLOW_TIMEOUT_MS,
+    });
   }
 }
 

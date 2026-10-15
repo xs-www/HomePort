@@ -271,7 +271,7 @@ curl /containers          # SPA 回退 200
 2. **Windows 上 `/proc` 挂载会误导**：Docker Desktop 的 WSL2 里挂 `/proc` 得到的是
    虚拟机视图，与任务管理器对不上。当前代码优先用 `host-proc`，因此 Windows 用户
    需**主动不挂** `/proc` 才能走 `os-cpus` 路径。后续可改为按宿主平台自动判断。
-3. **无 TOTP 二次验证**、**无安全响应头（CSP/HSTS）**：见 `06-security.md` §8 残余风险。
+3. **无 TOTP 二次验证**、**无安全响应头（CSP/HSTS）**：见 `06-security.md` §9 残余风险。
 4. **无容器写操作**：当前为有意的产品边界（只读）。若后续需要启停，必须在
    `06-security.md` 重新评估威胁模型（拥有 `docker.sock` 等于拥有宿主 root）。
 5. **未做镜像构建实测**：本机 Docker Desktop 可用，但尚未实际 `docker compose up --build`
@@ -446,3 +446,163 @@ curl /api/overview                  # warnings 仅剩 tailscale(未配 Token) �
 ```
 
 `typecheck` 两个 workspace 均 0 error，129 个测试用例通过。
+
+---
+
+## [2026-10-16] 管理员可在界面内修改运行时配置（免重建容器）
+
+### 背景
+
+用户反馈：为了填一个 Tailscale API Token 就要改 `.env` 再重建容器，太繁琐，
+NAS 上更麻烦。要求把这类配置操作搬到界面里，管理员账号可直接修改。
+
+### 方案与边界
+
+采用 **数据库覆盖 > 环境变量 > 内置默认** 的三层优先级：`.env` 部署方式完全不受影响，
+界面只覆盖被显式改过的项。同时明确划出**容器架构的硬边界**：
+
+| 级别 | 含义 | 项数 |
+| --- | --- | --- |
+| `live` | 下次读取即生效 | 17 |
+| `reload` | 保存后自动重建对应数据源 | 6 |
+| `restart` | **改不了**，需重建容器（界面不给控件，服务端也拒绝写入） | 5 |
+
+磁盘挂载点被明确标注为"半自动"：界面能改"显示哪些、怎么标注"，
+但路径本身必须先挂进容器（这是容器创建参数，任何界面都改不了）。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 新增 | `server/src/db/settings.ts` | `SettingsRepository`：settings 表的读写与批量操作 |
+| 新增 | `server/src/modules/settings/registry.ts` | 设置定义表、三层解析、校验、`applyTo` 写回 |
+| 新增 | `server/src/modules/settings/service.ts` | `SettingsService`：应用编排、视图、更新/重置、连通性测试 |
+| 新增 | `server/src/modules/settings/tailscaleProbe.ts` | tailnet 连通性测试（可注入 fetch / 命令执行器） |
+| 新增 | `server/src/modules/settings/types.ts` | `TailscaleTestResult` 等契约类型 |
+| 新增 | `server/src/api/settings.ts` | `/api/settings/*` 四个 admin 接口 |
+| 新增 | `web/src/pages/admin/SettingsPanel.tsx` | 系统设置面板（分组、生效级别、测试连接） |
+| 新增 | `server/tests/settings.test.ts` | 27 个单测 |
+| 修改 | `server/src/db/database.ts` | 迁移 v2 建 `settings` 表 |
+| 修改 | `server/src/config.ts` | 新增 `tools.probeHost`；`docker`/`tools`/`tailscale` 字段改为可写 |
+| 修改 | `server/src/modules/tailscale/service.ts` | provider 改为可变 + 新增 `reload()` |
+| 修改 | `server/src/modules/docker/provider.ts` | 新增 `bindConfig()` / `reload()`；TTL 等改为每次读 config |
+| 修改 | `server/src/modules/docker/service.ts` | 新增 `syncConfig()`（重建 TtlCache） |
+| 修改 | `server/src/modules/system/provider.ts` | 新增 `syncConfig()`（重建 HostProcReader、清空 CPU 基线） |
+| 修改 | `server/src/modules/system/service.ts` | 转发 `syncConfig()` |
+| 修改 | `server/src/util/cache.ts` | 新增 `defaultTtlMs` getter |
+| 修改 | `server/src/app.ts` | 装配 `SettingsRepository` / `SettingsService`，注入 `onReload` 热重建钩子 |
+| 修改 | `server/src/api/{index,context}.ts` | 注册 `/api/settings` 域；`RouteContext` 增 `settings` |
+| 修改 | `server/src/http/schemas.ts` | 新增 `updateSettingsBodySchema` / `resetSettingsBodySchema` / `testTailscaleBodySchema` |
+| 修改 | `web/src/api/{types,client}.ts` | 设置相关类型与 5 个客户端方法 |
+| 修改 | `web/src/pages/AdminPage.tsx` | 新增「系统设置」标签页 |
+| 修改 | `docs/static/{02,03,04,05,06,07,09}.md`、`README.md` | 文档回归 |
+
+### 逐项明细
+
+#### 新增：`server/src/db/settings.ts`
+
+- `SettingsRepository` — `list` / `toMap` / `get` / `upsert` / `upsertMany` / `delete` / `deleteMany` / `deleteAll`。
+  **只存被显式覆盖过的键**；值统一以 TEXT 存储（布尔存 `'1'`/`'0'`），
+  这样表结构不随配置项增减而迁移。`key` **等于环境变量名**，便于界面直接显示对应变量。
+
+#### 新增：`server/src/modules/settings/registry.ts`
+
+- `buildSettingDefinitions(config)` — 28 项设置的元数据（分组、生效级别、类型、默认值、
+  范围、是否敏感、`restart` 原因）。
+- `parseSettingValue` / `serializeSettingValue` — 字符串 ↔ 类型化值的双向转换。
+- `validateSettingValue(definition, input)` — 逐类型校验，并对
+  `DOCKER_ENDPOINT`（地址形式）、`PORTAL_DISK_MOUNTS`（复用 config 的 `=` 语法规则）、
+  路径类字段（必须绝对路径）做专门检查。**`restart` 级一律返回不通过**。
+- `maskSecret(value)` — 保留 `tskey-api-` 前缀便于确认身份，其余打码。
+- `resolveSettings({ config, repository })` — 三层解析，每项返回
+  `{ value, source, envValue, databaseValue, updatedAt, updatedBy }`。
+- `applyTo(config, map, overriddenKeys)` — 就地改写 `PortalConfig`，返回
+  `{ changedKeys, reloadTailscale, reloadDocker, skippedKeys }`。
+
+**为什么 `overriddenKeys` 参数是必需的**（本任务发现并修复的 bug）：
+`PORTAL_DISK_MOUNTS` 的默认值是空字符串，而 config 的初值来自 `.env`/平台默认。
+最初实现无条件按"解析结果 vs 当前值"比对，导致**未设置该项时把 `.env` 里配好的挂载点清空**。
+必须靠 `overriddenKeys` 区分"用户显式清空"与"从未设置"。已加回归测试。
+
+#### 新增：`server/src/modules/settings/service.ts`
+
+- `SettingsService.initialize()` — 启动时应用数据库覆盖值。**必须在任何数据源被使用前调用**。
+- `ensureApplied(force?)` — 惰性幂等应用。版本标识为 settings 表的 `条数:最新updatedAt`，
+  避免每个请求都跑一次完整 apply。
+- `view()` — 组装前端视图（敏感项打码、附来源与生效级别、`editable` 由 effect 推导）。
+- `update(input)` — 部分成功语义：合法项写入并**立即应用**，`restart` 级进
+  `rejectedRestartKeys`，非法项进 `invalid`；写审计（敏感项只记键名）。
+- `reset(keys | null, actor, ip)` — 删除覆盖值（恢复默认）。
+- `testTailscale(candidateToken?)` — 连通性测试。
+
+#### 新增：`server/src/modules/settings/tailscaleProbe.ts`
+
+- `effectiveMode(mode, hasToken)` — 复现 `auto` 策略，供测试与 UI 说明。
+- `probeTailscale(input)` — CLI 与 API 两条路径。**永不抛异常**，
+  按 HTTP 状态给出可操作结论：401 → 重新生成 Token；403 → 检查 ACL；
+  404 → tailnet 标识有误；超时 → 检查外网出口。
+  `runCommand` 与 `fetchImpl` 可注入，便于单测。
+
+#### 修改：`server/src/app.ts`
+
+装配顺序调整：`SettingsService` 在数据源**之前**构造并 `initialize()`，
+`onReload` 钩子在需要时重建 `DockerProvider` / `ContainerService` 缓存 /
+`SystemProvider` 的 proc 读取器 / `TailscaleService` 数据源。
+这样首次启动就按数据库里的最终配置构造数据源，不会先用旧配置再用新配置。
+
+#### 修改：`server/src/modules/tailscale/service.ts`
+
+- `provider` 由 `readonly` 改为可变私有字段；新增 `reload()`：
+  按当前 config 重新 `selectTailscaleProvider`、清空缓存、预热一次。
+  **填一个新的 API Token 无需重建容器即可生效**（这正是用户的核心诉求）。
+
+### 配置/接口/数据模型影响
+
+- **DB 迁移**：新增 v2 `runtime_settings`（建 `settings` 表）。老库自动升级，幂等。
+- **HTTP 接口**：新增 `GET /api/settings`、`PATCH /api/settings`、
+  `POST /api/settings/reset`、`POST /api/settings/test/tailscale`（均限 admin）。
+- **环境变量**：新增 `PORTAL_TOOLS_PROBE_HOST`；**语义变化** ——
+  Tailscale / Docker / 系统指标 / 工具 / 缓存这五组变量现在可被界面覆盖
+  （未覆盖时行为与之前完全一致）。
+- **审计动作**：新增 `settings.update` / `settings.reset`。
+
+### 验证方式
+
+```bash
+npm test                          # 164 passed (4 files)，新增 27 个设置单测 + 8 个接口集成测试
+
+docker compose up -d --build      # 重建成功，日志显示 "迁移已应用 version 2"
+docker compose ps                 # Up (healthy)
+
+# 1) 设置列表：分组与生效级别
+GET /api/settings                 # groups=6 组，live 17 / reload 6 / restart 5，可编辑 23/28
+# 2) 用错误 Token 测试连接（应给出可操作提示而非报错）
+POST /api/settings/test/tailscale {"token":"tskey-api-wrong"}
+#   → ok=false，"Token 无效、已过期或被吊销。请重新生成一个 access token…"
+# 3) 界面改设置立即生效
+PATCH /api/settings {"values":{"PORTAL_TOOLS_PROBE_TIMEOUT_MS":2500,"PORTAL_TOOLS_EXTRA":"immich:Immich:2283","PORTAL_PORT":9999}}
+#   → updatedKeys=[PROBE_TIMEOUT, TOOLS_EXTRA]；rejectedRestartKeys=[PORTAL_PORT]；读数 source=database
+GET /api/tools?probe=0            # → total=9，出现 immich（验证"立即生效"）
+POST /api/settings/reset {"keys":[…]}  # → 恢复默认，total 回到 8
+GET /api/users/audit/log          # → settings.update / settings.reset 已记录
+```
+
+### 过程中的自伤与修复
+
+用 PowerShell 的 `Get-Content -Raw` + `WriteAllText` 改 `docs/static/02-configuration.md` 时，
+PowerShell 5.1 按 ANSI（GBK）解码了 UTF-8 文件，导致**中文全部变成乱码、行结构被破坏**。
+已 `git checkout` 恢复该文件，改用文件编辑工具重做，并对**全部文档**加了编码校验
+（检查 U+FFFD 与典型 mojibake 特征），确认无残留损坏。
+
+**教训**：改含中文的文本文件一律用文件编辑工具，不要用 PowerShell 文本管道。
+
+### 已知限制 / 后续
+
+1. `sensitive` 项（API Token）在数据库中**明文存储** —— 需要回读去调用外部 API，
+   与密码哈希不同。已在 `06-security.md` §7 记录取舍与后续加密方向。
+2. 界面暂不支持"工具目录 JSON 内容"的可视化编辑（只能填文件路径）；
+   结构化编辑（增删改单条工具）留待后续。
+3. 设置的并发写未做冲突检测（两个管理员同时改会后者覆盖）。
+   当前单机场景风险可忽略，已记入 todo。
+4. `restart` 级项在界面上是只读的，但**没有**提供"一键生成新 compose"之类的能力，
+   仍需手工编辑 `docker-compose.yml`。

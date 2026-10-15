@@ -85,6 +85,22 @@ export const MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 2,
+    name: 'runtime_settings',
+    up: (db) => {
+      // 运行时可配置项：管理员在界面里修改的值存这里，优先级高于环境变量。
+      // 只存「被显式覆盖过」的键，未覆盖的走环境变量/内置默认（见 settings 模块）。
+      db.exec(`
+        CREATE TABLE settings (
+          key        TEXT PRIMARY KEY,
+          value      TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          updated_by TEXT
+        );
+      `);
+    },
+  },
 ];
 
 export interface OpenDbOptions {

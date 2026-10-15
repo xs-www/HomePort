@@ -14,8 +14,7 @@ import { TtlCache } from '../../util/cache.js';
 import type { HostInfoProvider } from '../docker/service.js';
 import { getCachedTailnetInfo, setCachedTailnetInfo } from './hostInfoCache.js';
 import { runCommand } from '../../util/exec.js';
-import type { CommandRunner, TailscaleProvider } from './provider.js';
-import { unavailableStatus } from './provider.js';
+import { selectTailscaleProvider, unavailableStatus, type CommandRunner, type TailscaleProvider } from './provider.js';
 import type { SourceStatus, TailnetStatus, TailnetStatusLite } from './types.js';
 export interface TailscaleServiceDeps {
   provider: TailscaleProvider;
@@ -27,25 +26,48 @@ export class TailscaleService implements HostInfoProvider {
   private readonly deps: TailscaleServiceDeps;
   private readonly cache: TtlCache<TailnetStatus>;
   private lastStatus: TailnetStatus | null = null;
+  /** 当前数据源；运行时设置变更后会重建（见 `reload`） */
+  private provider: TailscaleProvider;
 
   constructor(deps: TailscaleServiceDeps) {
     this.deps = deps;
+    this.provider = deps.provider;
     this.cache = new TtlCache<TailnetStatus>({
+      // TTL 从 config 读取时取值，因此运行时调整 PORTAL_CACHE_TAILSCALE_TTL_MS 后
+      // 下一次 reload 即生效（见 reload()）
       ttlMs: deps.config.cache.tailscaleTtlMs,
       maxEntries: 4,
       logger: deps.logger.child({ mod: 'tailscale' }),
     });
   }
 
+  /**
+   * 按当前 `config` 重建数据源并清空缓存。
+   *
+   * 调用时机：管理员在设置页改了模式/Token/socket/bin 之后。
+   * 这样填一个新的 API Token 无需重建容器即可生效。
+   */
+  async reload(): Promise<void> {
+    const next = await selectTailscaleProvider(this.deps.config, this.deps.logger, defaultCommandRunner);
+    this.provider = next;
+    this.cache.clear();
+    this.deps.logger.info('tailnet 数据源已重建', {
+      mode: next.mode,
+      configured: next.isConfigured(),
+    });
+    // 预热一次，让容器墙立刻能用新的 tailnet 地址判定可达性
+    await this.warmup();
+  }
+
   /** 数据源模式（cli / api / none）。 */
   get mode(): string {
-    return this.deps.provider.mode;
+    return this.provider.mode;
   }
 
   /** 拉取状态（带缓存）。同时刷新给容器模块用的同步缓存。 */
   async getStatus(force = false): Promise<TailnetStatus> {
     if (force) this.cache.delete('status');
-    const status = await this.cache.get('status', () => this.deps.provider.fetchStatus());
+    const status = await this.cache.get('status', () => this.provider.fetchStatus());
     this.remember(status);
     return status;
   }

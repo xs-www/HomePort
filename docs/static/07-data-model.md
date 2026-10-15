@@ -70,6 +70,27 @@
 | `default_page` | TEXT | NOT NULL DEFAULT 'overview' | 默认落地页 |
 | `updated_at` | TEXT | NOT NULL | ISO |
 
+### `settings`（迁移 v2）
+
+运行时设置的数据库覆盖层。**只存被显式覆盖过的键**，未覆盖的走环境变量或内置默认。
+
+| 列 | 类型 | 说明 |
+| --- | --- | --- |
+| `key` | TEXT PK | 稳定键名，**等于环境变量名**（如 `PORTAL_TAILSCALE_API_TOKEN`） |
+| `value` | TEXT NOT NULL | 统一以字符串存储（布尔存 `'1'`/`'0'`），解析由 `settings/registry.ts` 负责 |
+| `updated_at` | TEXT NOT NULL | ISO 时间，同时用作"设置版本"的一部分 |
+| `updated_by` | TEXT NULL | 最后修改者的用户名 |
+
+**为什么值统一存字符串**：表结构不需要随配置项增减而迁移，
+新增一个设置项只是往 `buildSettingDefinitions()` 里加一条记录。
+
+**为什么用 `key = 环境变量名`**：界面上能直接显示对应的 `.env` 变量名，
+排查时"界面改的"与"环境变量配的"一眼可对应。
+
+> 敏感值（如 API Token）**以明文存储在数据库中**，与密码哈希不同 ——
+> 因为它需要被回读去调用外部 API。数据库文件权限由 Docker 卷管理；
+> 界面读取时一律打码，审计日志也只记录键名不记录值。见 `06-security.md` §6。
+
 ### `audit_log`
 
 | 列 | 类型 | 说明 |
@@ -79,7 +100,7 @@
 | `actor_id` | INTEGER NULL | 执行者；系统动作可空 |
 | `actor_name` | TEXT NULL | 冗余用户名（用户被删后仍可追溯） |
 | `action` | TEXT NOT NULL | 见下表 |
-| `target` | TEXT NULL | 如 `user:3` |
+| `target` | TEXT NULL | 如 `user:3` 或 `settings` |
 | `detail` | TEXT NULL | 人类可读描述 |
 | `ip` | TEXT NULL | 来源 IP |
 
@@ -96,14 +117,17 @@
 | `user.create` / `user.update` / `user.delete` | 账号增删改 |
 | `user.password_reset` | 管理员重置密码 |
 | `user.sessions_revoked` | 强制下线 |
+| `settings.update` | 界面修改运行时设置（**敏感项只记键名，不记值**） |
+| `settings.reset` | 恢复设置为默认值 |
 
 ## 3. 迁移
 
-`MIGRATIONS`（`src/db/database.ts`）当前只有一项：
+`MIGRATIONS`（`src/db/database.ts`）当前有两项：
 
 | version | name | 内容 |
 | --- | --- | --- |
-| 1 | `initial_auth_schema` | 上述五张表与全部索引 |
+| 1 | `initial_auth_schema` | 用户 / 会话 / 偏好 / 审计 四张表与全部索引 |
+| 2 | `runtime_settings` | `settings` 表（运行时设置覆盖层） |
 
 **迁移规则**
 

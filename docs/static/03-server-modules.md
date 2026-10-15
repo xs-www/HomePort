@@ -316,6 +316,53 @@ TCP 通但 HTTP 不通仍判 `up`（服务可能是纯 TCP 或需鉴权跳转）
 **"最后一个管理员"保护**：`update`/`delete` 在写库**前**校验，
 拒绝任何会让启用 admin 数量归零的操作（降级、禁用、删除）。
 
+### `src/modules/settings/`（运行时设置）
+
+| 文件 | 导出 | 说明 |
+| --- | --- | --- |
+| `registry.ts` | `SettingDefinition` `SettingEffect` `SettingValueType` `SettingGroup` `SettingView` `SETTING_GROUPS` `MASK_TOKEN` `buildSettingDefinitions` `resolveSettings` `settingsToMap` `applyTo` `validateSettingValue` `parseSettingValue` `serializeSettingValue` `maskSecret` `ApplyResult` `ResolvedSetting` | 三层解析 + 校验 + 写回 config |
+| `service.ts` | `SettingsService` `SettingsView` `UpdateSettingsInput` `UpdateSettingsResult` | 业务出口（含热重建编排） |
+| `tailscaleProbe.ts` | `probeTailscale` `effectiveMode` `summarizeApiDevices` `TailscaleProbeInput` `CommandExecutor` | 连通性测试（可注入 fetch/命令执行器） |
+| `types.ts` | `TailscaleTestResult` `TailscaleDeviceSummary` | 契约类型 |
+
+**三层优先级**：`数据库覆盖 > 环境变量 > 内置默认`。
+`resolveSettings()` 对每项同时返回 `source`、`envValue`、`databaseValue`，供界面展示"改了什么"。
+
+**`applyTo(config, map, overriddenKeys)`** — 就地改写 `PortalConfig`，返回
+`{ changedKeys, reloadTailscale, reloadDocker, skippedKeys }`。
+
+> **踩过的坑**：`overriddenKeys` 参数是必需的。`PORTAL_DISK_MOUNTS` 的默认值是空字符串，
+> 而 config 的初值来自 `.env`/平台默认。若无条件按"解析结果 vs 当前值"比对，
+> 未设置该项时会把 `.env` 里配好的挂载点**清空**。必须区分"用户清空"与"从未设置"。
+
+**生效级别的实现约定**
+
+| 级别 | 实现 |
+| --- | --- |
+| `live` | 依赖方每次调用时从 `config` 读取（如 `ToolsService`、`SystemProvider`） |
+| `reload` | `applyTo` 返回 `reloadTailscale` / `reloadDocker`，由 `app.ts` 注入的 `onReload` 执行重建 |
+| `restart` | `validateSettingValue` 直接拒绝；`applyTo` 显式列入 `skippedKeys` |
+
+个别值在构造期读取，无法靠"每次读 config"生效，需要显式同步：
+
+| 值 | 同步方式 |
+| --- | --- |
+| `PORTAL_CACHE_CONTAINERS_TTL_MS` | `ContainerService.syncConfig()` 重建 TtlCache |
+| `PORTAL_HOST_PROC` | `SystemProvider.syncConfig()` 重建 HostProcReader 并清空 CPU 基线 |
+| `DOCKER_ENDPOINT` | `DockerProvider.reload()` 重建 dockerode 连接 |
+| Tailscale 模式/Token/socket/bin/tailnet | `TailscaleService.reload()` 重新选择数据源并预热 |
+
+**`SettingsService` 方法**
+
+| 方法 | 说明 |
+| --- | --- |
+| `initialize()` | 启动时应用数据库覆盖值（**必须在数据源被使用前调用**） |
+| `ensureApplied(force?)` | 惰性幂等应用；以 settings 表的 `版本 = 条数:最新updatedAt` 判断是否需要重跑 |
+| `view()` | 全部设置项视图（敏感项打码、含来源与生效级别） |
+| `update(input)` | 部分成功语义：合法项写入、`restart` 级拒绝、非法项报告原因 |
+| `reset(keys \| null, actor, ip)` | 删除覆盖值（恢复默认），单事务 |
+| `testTailscale(candidateToken?)` | 连通性测试，支持尚未保存的候选 Token |
+
 ### `src/modules/overview/service.ts`
 
 `OverviewService.build(request, role)`：并行取四个数据源（`Promise.allSettled`），

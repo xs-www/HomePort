@@ -156,7 +156,8 @@ export function humanBytes(bytes: number | null): string {
 export class SystemProvider {
   private readonly config: PortalConfig;
   private readonly log: Logger;
-  private readonly proc: HostProcReader;
+  /** 宿主 /proc 读取器。路径可被运行时设置改变，故非 readonly */
+  private proc: HostProcReader;
   private prevCpu: CpuTimes | null = null;
   private prevPerCore: Array<{ index: number; total: number; idleAll: number }> = [];
   /** 上次采样时间：两次采样间隔过短时复用量值，避免出现 null / 抖动 */
@@ -171,6 +172,28 @@ export class SystemProvider {
     this.config = options.config;
     this.log = options.logger.child({ mod: 'system' });
     this.proc = new HostProcReader(options.config.system.procPath);
+  }
+
+  /**
+   * 运行时设置变更后同步内部状态。
+   *
+   * 处理 `PORTAL_HOST_PROC`（proc 根路径在构造时固定）：
+   * 路径变化时重建读取器并清空 CPU 基线（避免跨数据源做差得出错误读数）。
+   * 其余项（nvidia-smi 路径、各类超时）在调用点从 `this.config` 读取，无需同步。
+   *
+   * @returns 是否有实际变化
+   */
+  syncConfig(): boolean {
+    const procPath = this.config.system.procPath;
+    if (this.proc.root === procPath) return false;
+    this.proc = new HostProcReader(procPath);
+    this.prevCpu = null;
+    this.prevPerCore = [];
+    this.prevCpuAt = 0;
+    this.lastCpuView = null;
+    this.cachedGpu = null;
+    this.log.info('宿主 /proc 路径已更新', { procPath, available: this.proc.usingHostProc });
+    return true;
   }
 
   /** 宿主 /proc 是否可用。 */

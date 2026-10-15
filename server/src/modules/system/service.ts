@@ -23,6 +23,11 @@ export class SystemService {
     this.deps = deps;
   }
 
+  /** 运行时设置变更后同步 provider 内部状态（如 /proc 路径）。 */
+  syncConfig(): boolean {
+    return this.deps.provider.syncConfig();
+  }
+
   /** 完整快照（含宿主身份）。 */
   async snapshot(): Promise<SystemSnapshot> {
     return this.deps.provider.snapshot();

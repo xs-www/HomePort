@@ -11,8 +11,9 @@ import { useAsync, useSubmit } from '../hooks/useAsync.js';
 import { Shell } from '../layout/Shell.js';
 import { formatDateTime, formatRelative } from '../lib/format.js';
 import type { SessionUser, UserPreferences } from '../api/types.js';
+import { SettingsPanel } from './admin/SettingsPanel.js';
 
-type Tab = 'users' | 'audit' | 'security';
+type Tab = 'users' | 'audit' | 'security' | 'settings';
 
 export function AdminPage(): ReactNode {
   const { api, user: currentUser, preferences, updatePreferences } = useAuth();
@@ -33,6 +34,7 @@ export function AdminPage(): ReactNode {
             { value: 'users', label: '用户与权限', icon: 'user' },
             { value: 'audit', label: '审计日志', icon: 'log' },
             { value: 'security', label: '安全与偏好', icon: 'shield' },
+            { value: 'settings', label: '系统设置', icon: 'system' },
           ] as Array<{ value: Tab; label: string; icon: string }>
         ).map((item) => (
           <button
@@ -74,6 +76,8 @@ export function AdminPage(): ReactNode {
       ) : null}
 
       {tab === 'security' ? <SecurityTab preferences={preferences} onChange={updatePreferences} /> : null}
+
+      {tab === 'settings' ? <SettingsPanel /> : null}
     </Shell>
   );
 }

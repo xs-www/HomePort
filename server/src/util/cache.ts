@@ -42,6 +42,11 @@ export class TtlCache<T> {
     this.logger = options.logger;
   }
 
+  /** 当前默认 TTL（供运行时同步逻辑比对）。 */
+  get defaultTtlMs(): number {
+    return this.ttlMs;
+  }
+
   /** 读取未过期缓存；不存在或已过期返回 undefined。 */
   peek(key: string): T | undefined {
     const hit = this.entries.get(key);

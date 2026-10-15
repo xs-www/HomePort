@@ -12,7 +12,7 @@
 import Docker from 'dockerode';
 import type { ContainerInfo, ContainerInspectInfo } from 'dockerode';
 import type { PortalConfig } from '../../config.js';
-import type { Logger } from '../../logger.js';
+import { createSilentLogger, type Logger } from '../../logger.js';
 import { demuxDockerLogs } from '../../util/dockerStream.js';
 import type { SourceStatus } from './types.js';
 
@@ -175,19 +175,76 @@ export function normalizeStats(stats: RawDockerStats): DockerStatsRaw {
 }
 
 export class DockerProvider {
-  private readonly docker: Docker;
+  private docker: Docker;
   private readonly logger: Logger;
   private readonly includeStopped: boolean;
   private readonly statsTimeoutMs: number;
-  private readonly mode: string;
+  private mode: string;
+  /** 构造时用的 endpoint，用于判断是否需要重建连接 */
+  private endpoint: string;
+  /** 运行时可变配置的来源（enableRuntimeConfig 后启用） */
+  private configRef: PortalConfig | null = null;
 
-  constructor(options: DockerProviderOptions) {
+  /**
+   * @param options 配置与日志；或直接注入一个已构造的 dockerode 实例（测试/高级用法）
+   */
+  constructor(options: DockerProviderOptions | Docker) {
+    if (options instanceof Docker) {
+      this.docker = options;
+      this.logger = createSilentLogger().child({ mod: 'docker' });
+      this.includeStopped = true;
+      this.statsTimeoutMs = 4000;
+      this.mode = 'injected';
+      this.endpoint = '';
+      return;
+    }
     const dockerOptions = resolveDockerEndpoint(options.config.docker.endpoint);
     this.docker = new Docker(dockerOptions);
     this.logger = options.logger.child({ mod: 'docker' });
     this.includeStopped = options.config.docker.includeStopped;
     this.statsTimeoutMs = options.config.docker.statsTimeoutMs;
     this.mode = endpointMode(dockerOptions);
+    this.endpoint = options.config.docker.endpoint;
+  }
+
+  /**
+   * 让 provider 跟随一份可变的 config（运行时设置热更新用）。
+   *
+   * 调用后 `includeStopped` / `statsTimeoutMs` 每次读取都会从 config 取最新值；
+   * endpoint 变化需要调用 `reload()` 重建连接。
+   */
+  bindConfig(config: PortalConfig): void {
+    this.configRef = config;
+  }
+
+  /** 当前生效的 stats 超时（运行时可变）。 */
+  private statsTimeout(): number {
+    return this.configRef?.docker.statsTimeoutMs ?? this.statsTimeoutMs;
+  }
+
+  /** 当前生效的"是否含已停止容器"默认值（运行时可变）。 */
+  private defaultAll(): boolean {
+    return this.configRef?.docker.includeStopped ?? this.includeStopped;
+  }
+
+  /**
+   * 按当前 config 重建 dockerode 连接。
+   *
+   * 调用时机：管理员改了 `DOCKER_ENDPOINT` 之后。
+   *
+   * @returns 是否真的发生了重建（endpoint 未变时为 false）
+   */
+  reload(): boolean {
+    if (!this.configRef) return false;
+    const endpoint = this.configRef.docker.endpoint;
+    if (endpoint === this.endpoint) return false;
+
+    const dockerOptions = resolveDockerEndpoint(endpoint);
+    this.docker = new Docker(dockerOptions);
+    this.mode = endpointMode(dockerOptions);
+    this.endpoint = endpoint;
+    this.logger.info('Docker 连接已重建', { mode: this.mode });
+    return true;
   }
 
   /** dockerode 实例（仅供测试/诊断）。 */
@@ -213,7 +270,7 @@ export class DockerProvider {
    * @param all 是否包含已停止容器；默认取配置
    * @returns 容器原始数据；daemon 不可达时抛错（由 service 转成 SourceStatus）
    */
-  async listContainers(all: boolean = this.includeStopped): Promise<ContainerInspectInfo[]> {
+  async listContainers(all: boolean = this.defaultAll()): Promise<ContainerInspectInfo[]> {
     const list: ContainerInfo[] = await this.docker.listContainers({ all });
     const sorted = [...list].sort((a, b) => {
       const stateRank = (state: string): number => (state === 'running' ? 0 : 1);
@@ -275,7 +332,7 @@ export class DockerProvider {
     try {
       const stats = (await withTimeout(
         this.docker.getContainer(id).stats({ stream: false }),
-        this.statsTimeoutMs,
+        this.statsTimeout(),
         'docker stats 超时',
       )) as unknown as RawDockerStats;
       return normalizeStats(stats);

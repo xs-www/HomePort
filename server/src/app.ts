@@ -16,6 +16,7 @@ import { config as defaultConfig, ensureDataDir, type PortalConfig } from './con
 import { createLogger, type Logger } from './logger.js';
 import { initDatabase, type Db } from './db/database.js';
 import { AuditRepository, PreferencesRepository, UsersRepository } from './db/users.js';
+import { SettingsRepository } from './db/settings.js';
 import { handleError } from './http/errors.js';
 import { createAuthHook } from './http/guards.js';
 import { AuthService } from './modules/auth/service.js';
@@ -23,6 +24,7 @@ import { SessionsRepository } from './modules/auth/sessions.js';
 import { DockerProvider } from './modules/docker/provider.js';
 import { ContainerService } from './modules/docker/service.js';
 import { OverviewService } from './modules/overview/service.js';
+import { SettingsService } from './modules/settings/service.js';
 import { SystemProvider } from './modules/system/provider.js';
 import { SystemService } from './modules/system/service.js';
 import { selectTailscaleProvider } from './modules/tailscale/provider.js';
@@ -85,13 +87,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
   const sessionsRepo = new SessionsRepository(db);
   const preferencesRepo = new PreferencesRepository(db);
   const auditRepo = new AuditRepository(db);
+  const settingsRepo = new SettingsRepository(db);
 
   const tailscaleProvider = await selectTailscaleProvider(config, logger, defaultCommandRunner);
   const tailscale = new TailscaleService({ provider: tailscaleProvider, config, logger });
-  // 预热一次，让容器模块立刻能拿到本机 tailnet 地址（否则首次渲染全部容器都判为不可达）
-  await tailscale.warmup();
 
   const dockerProvider = new DockerProvider({ config, logger });
+  // 让 provider 跟随可变的 config（includeStopped / statsTimeout 每次读取取最新值）
+  dockerProvider.bindConfig(config);
   const containers = new ContainerService({ provider: dockerProvider, hostInfo: tailscale, config, logger });
 
   const systemProvider = new SystemProvider({ config, logger });
@@ -99,6 +102,27 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
 
   const tools = new ToolsService({ config, logger });
   const overview = new OverviewService({ containers, tailscale, system, tools, config, logger });
+
+  // ---- 运行时设置服务 ----
+  // 构造一次即可：`initialize()` 内部会先应用数据库覆盖值，
+  // 再触发 onReload 重建数据源，顺序由 SettingsService.ensureApplied 保证。
+  const settings = new SettingsService({
+    config,
+    repository: settingsRepo,
+    audit: auditRepo,
+    logger,
+    onReload: async ({ tailscale: reloadTs, docker: reloadDocker }) => {
+      if (reloadDocker) dockerProvider.reload();
+      // 缓存 TTL 与 /proc 路径属构造期读取的值，这里同步一次
+      containers.syncConfig();
+      system.syncConfig();
+      if (reloadTs) await tailscale.reload();
+    },
+  });
+  // **必须在任何数据源被使用之前**：让数据库里的覆盖值先生效
+  await settings.initialize();
+  // 预热一次，让容器模块立刻能拿到本机 tailnet 地址（否则首次渲染全部容器都判为不可达）
+  await tailscale.warmup();
 
   const auth = new AuthService({
     users: usersRepo,
@@ -166,6 +190,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
     system,
     tools,
     overview,
+    settings,
     audit: auditRepo,
   };
 

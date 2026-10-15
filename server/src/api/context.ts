@@ -11,6 +11,7 @@ import type { AuditRepository } from '../db/users.js';
 import type { AuthService } from '../modules/auth/service.js';
 import type { ContainerService, HostContextRequest } from '../modules/docker/service.js';
 import type { OverviewService } from '../modules/overview/service.js';
+import type { SettingsService } from '../modules/settings/service.js';
 import type { SystemService } from '../modules/system/service.js';
 import type { TailscaleService } from '../modules/tailscale/service.js';
 import type { ToolsService } from '../modules/tools/service.js';
@@ -26,6 +27,7 @@ export interface RouteContext {
   system: SystemService;
   tools: ToolsService;
   overview: OverviewService;
+  settings: SettingsService;
   audit: AuditRepository;
 }
 
