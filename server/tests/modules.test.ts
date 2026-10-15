@@ -531,6 +531,10 @@ describe('system/provider · nvidia-smi 解析', () => {
   it('文件系统魔数 → 名称', () => {
     expect(describeFsType(0xef53)).toBe('ext4');
     expect(describeFsType(0x01021994)).toBe('tmpfs');
+    // 实测：WSL2 / Docker Desktop 挂载 Windows 盘时 statfs 报 0x01021997（9p）
+    expect(describeFsType(0x01021997)).toBe('9p');
+    expect(describeFsType(0x794c7630)).toBe('overlayfs');
+    expect(describeFsType(0x958458f6)).toBe('virtiofs');
     expect(describeFsType(0x999999)).toBe('0x999999');
     expect(describeFsType(undefined)).toBeNull();
   });

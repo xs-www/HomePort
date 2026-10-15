@@ -35,9 +35,29 @@ export interface ProbeOptions {
   probePath: string;
   expectedStatus: number | null;
   timeoutMs: number;
-  /** 失败后的兜底主机（通常为 127.0.0.1） */
-  fallbackHost?: string | null;
+  /**
+   * 兜底主机列表（按顺序尝试）。
+   *
+   * 为什么需要：门户跑在容器里，用户浏览器访问门户用的主机名（如 `localhost`
+   * 或 `127.0.0.1`）在容器内指向**容器自己**，而不是宿主。
+   * 宿主上的服务在容器内要用 `host.docker.internal` 才连得上。
+   * 默认兜底链见 `defaultFallbackHosts()`。
+   */
+  fallbackHosts?: readonly string[];
   logger?: Logger;
+}
+
+/**
+ * 默认兜底主机链。
+ *
+ * - `host.docker.internal`：Docker Desktop 与（配了 host-gateway 的）Linux 上
+ *   指向宿主的特殊域名，是"宿主服务"最可靠的探测目标。
+ * - `127.0.0.1`：门户原生运行（非容器）时就是宿主本身。
+ *
+ * 去重与"跳过与首选相同者"的逻辑在 `probeTool` 内处理。
+ */
+export function defaultFallbackHosts(): string[] {
+  return ['host.docker.internal', '127.0.0.1'];
 }
 
 /** TCP 连通性测试。 */
@@ -116,33 +136,60 @@ export function httpStatus(
 /**
  * 综合探测单个工具。
  *
+ * 依次尝试：首选主机（门户的对外主机名）→ 兜底链。
+ * 任一成功即返回 `up`，并在 `detail` 说明实际是通过哪个主机连上的 ——
+ * 这样"入口链接打不开但端口是通的"这类问题能被用户直接看到。
+ *
  * @returns 探测结果（永不抛异常）
  */
 export async function probeTool(options: ProbeOptions): Promise<ProbeResult> {
-  const { host, port, scheme, probePath, expectedStatus, timeoutMs, fallbackHost, logger } = options;
+  const { host, port, scheme, probePath, expectedStatus, timeoutMs, logger } = options;
   const checkedAt = new Date().toISOString();
 
-  const primary = await tryProbe(host, port, scheme, probePath, expectedStatus, timeoutMs);
-  if (primary.state === 'up' || !fallbackHost || fallbackHost === host) {
-    return { ...primary, checkedAt, target: primary.state === 'unknown' ? null : { host, port } };
+  // 组装候选目标：首选 + 兜底（去重、保持顺序）
+  const targets: string[] = [];
+  for (const candidate of [host, ...(options.fallbackHosts ?? defaultFallbackHosts())]) {
+    const trimmed = candidate?.trim();
+    if (!trimmed) continue;
+    if (!targets.includes(trimmed)) targets.push(trimmed);
   }
 
-  const secondary = await tryProbe(fallbackHost, port, scheme, probePath, expectedStatus, timeoutMs);
-  if (secondary.state === 'up') {
-    return {
-      ...secondary,
-      checkedAt,
-      target: { host: fallbackHost, port },
-      detail: `经 ${fallbackHost} 可访问，但经 ${host} 不可访问。若其它设备也打不开，请检查容器的端口绑定地址与防火墙`,
-    };
+  const failures: Array<{ host: string; detail: string | null }> = [];
+
+  for (const target of targets) {
+    const attempt = await tryProbe(target, port, scheme, probePath, expectedStatus, timeoutMs);
+    if (attempt.state === 'up') {
+      const isPrimary = target === targets[0];
+      return {
+        ...attempt,
+        checkedAt,
+        target: { host: target, port },
+        // 备用主机连上时明确说明，避免用户以为入口链接一定可用
+        detail: isPrimary
+          ? attempt.detail
+          : `端口可用（经 ${target} 探测）。若从浏览器打不开，可能是入口链接中的主机名在当前网络下不可达`,
+      };
+    }
+    failures.push({ host: target, detail: attempt.detail });
   }
 
-  logger?.debug('工具探测失败', { host, port, primary: primary.detail, secondary: secondary.detail });
+  // 全部失败：以首选主机的失败原因为主，附上其余尝试结果
+  const primary = failures[0];
+  const others = failures
+    .slice(1)
+    .map((f) => `${f.host}：${f.detail ?? '未知'}`)
+    .join('；');
+  logger?.debug('工具探测全部失败', { host, port, failures });
+
   return {
-    ...primary,
+    state: 'down',
+    latencyMs: null,
+    httpStatus: null,
     checkedAt,
     target: null,
-    detail: primary.detail ?? secondary.detail ?? '无法连接',
+    detail: others
+      ? `${primary?.detail ?? '无法连接'}（另尝试 ${others}）`
+      : (primary?.detail ?? '无法连接'),
   };
 }
 

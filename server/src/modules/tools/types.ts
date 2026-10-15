@@ -17,6 +17,14 @@ export interface ToolStatusView {
   detail: string | null;
   /** 是否来自过期缓存（正在后台刷新） */
   stale: boolean;
+  /**
+   * 实际探测成功的目标主机与端口。
+   *
+   * 容器化部署下宿主服务只能经 `host.docker.internal` 连上，
+   * 与用户浏览器访问的入口主机（tailnet IP / MagicDNS）不同 ——
+   * 把这个差异暴露出来，便于解释"端口通但入口打不开"。
+   */
+  target: { host: string; port: number } | null;
 }
 
 export interface ToolUrlCandidate {

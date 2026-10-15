@@ -19,52 +19,106 @@ docker compose logs homepage | Select-String 初始化令牌  # Windows
 
 ## 2. 指标取数边界（重要，先看这个）
 
-门户跑在容器里，但展示的是**宿主**资源。这个差异决定了哪些数字是"真值"：
+门户展示的是**宿主**资源，但它跑在容器里，两者的可见范围不同。
+下表是**实测结论**（不是推断）：
 
-| 指标 | Linux/NAS 宿主 | Windows 宿主（Docker Desktop） |
-| --- | --- | --- |
-| CPU | 读挂载的宿主 `/proc/stat` → **真实值**（`mode: host-proc`） | `/proc` 是 WSL2 虚拟机的。容器内 Node 探测到无 `/proc`，改走 `os.cpus()`（`mode: os-cpus`）—— 这是 **Windows 宿主整机**的累计时间，因此也是**真实值**，只是没有 `iowait`/`steal` 细分，`loadAvg` 恒为 0 |
-| 内存 | 读宿主 `/proc/meminfo` → **真实值** | `os.totalmem()` → **Windows 宿主真实值** |
-| 磁盘 | 对挂载进来的宿主目录 `statfs` → **真实值** | 同左（把 `C:`/`D:` 挂进容器） |
-| GPU | 挂 `nvidia-smi` → **真实值** | WSL GPU 直通，挂 `nvidia-smi` 后可读 → **真实值** |
+| 部署方式 | CPU / 内存 | 磁盘 | GPU |
+| --- | --- | --- | --- |
+| **容器化 · Linux / NAS** | 读挂载的宿主 `/proc` → **宿主真实值**（`mode: host-proc`） | 挂宿主目录后 `statfs` → 真实值 | 挂 `nvidia-smi` 后 → 真实值 |
+| **容器化 · Windows（Docker Desktop）** | ⚠ **只能看到 WSL2 虚拟机的资源**（实测：4 线程 / 3.9 GB，而宿主是 20 线程 / 31.6 GB） | 挂 `C:/` 后 `statfs` → **Windows 真实值**（实测 952 GB / 已用 65%，与资源管理器一致） | ❌ 不可用（原因见下） |
+| **原生运行 · Windows（直接 `node`）** | `os.cpus()` / `os.totalmem()` → **Windows 宿主真实值**（实测 20 线程 / 31.63 GB，与任务管理器一致） | 无挂载概念，需通过 `PORTAL_DISK_MOUNTS` 指向本地盘符 | ✅ 直接可读 `nvidia-smi` → 真实值 |
 
-**例外**：若在 Docker Desktop 的 WSL2 里、且**挂载了**宿主 `/proc`
-（`/proc:/host/proc:ro`，这里指的是 WSL 发行版的 `/proc`），
-则 `mode` 会变成 `host-proc`，但读到的其实是 **WSL2 虚拟机**的占用，
-与 Windows 任务管理器对不上。此时应改为**不挂** `/proc`，让代码走 `os-cpus` 路径。
+### 为什么 Windows 容器化拿不到宿主 CPU/内存
 
-界面上的表现：`sources[].mode` 会随响应返回，`SystemPage` 会在卡片上标注
-"数据源：宿主 /proc（真实值）"或"容器视图（受 cgroup 限制）"，
-`SourceNotice` 在降级时显示黄色提示条。**看到黄条说明数据可能有偏差，不是服务坏了。**
+Docker Desktop 把容器跑在一个 WSL2 虚拟机里。容器内可见的只有这个虚拟机的资源：
+
+```
+容器内 os.cpus()          → 4 线程
+容器内挂载 WSL 的 /proc    → 4 线程（同一个来源，挂载也没用）
+原生 node（Windows）      → 20 线程
+```
+
+**实测确认**：WSL2 的 `/proc/cpuinfo` 报告的处理器数与 `os.cpus()` 完全一致
+（都是 4），`/proc/meminfo` 也与 `os.totalmem()` 一致（约 3.9 GB）。
+因此**挂载 `/proc` 无法解决**这个问题 —— 之前文档里"挂 `/proc` 能拿到 Windows 真实值"
+的说法是错误的，已更正。
+
+要想拿到 Windows 宿主真实值，只有两条路：
+
+1. **原生运行**：直接在 Windows 上 `npm run build && node server/dist/index.js`。
+   此时 `DOCKER_ENDPOINT` 需改用 named pipe 写法（见 §3.1），且无需任何挂载。
+   适合"只想看硬件 + 容器"的场景。
+2. **调大 WSL2 资源**：编辑 `C:\Users\<你>\.wslconfig` 并把 WSL2 的资源配额提到接近宿主，
+   再 `wsl --shutdown` 重启 Docker Desktop：
+
+   ```ini
+   [wsl2]
+   processors=20
+   memory=30GB
+   ```
+
+   注意这只是让"虚拟机视图"更接近宿主，**仍是虚拟机口径**，不是 Windows 真实占用。
+
+### 为什么 Windows 容器化拿不到 GPU
+
+- 容器内无法执行 `nvidia-smi.exe`（Linux 容器跑不了 Windows PE 可执行文件）。
+- Docker Desktop 的 WSL GPU 直通路径 `/usr/lib/wsl/lib` **在容器内不可见**
+  （实测：`ls /usr/lib/wsl/lib` → No such file or directory），因此无法从容器内读 GPU。
+
+因此门户在 Windows 容器化部署下会把 GPU 报为"不可用"并给出原因 —— **这是正确行为，不是 bug**。
+需要 GPU 指标请用原生运行方式（见 §3.1 末段）。
+
+### 界面如何呈现
+
+`sources[].mode` 随响应返回，`SystemPage` 会在每张卡片上标注取数来源
+（如"Node os 接口（宿主整机）"或"容器视图（受 cgroup 限制）"）。
+**看到黄色提示条说明取数降级了，不是服务坏了** —— 提示条里会写清原因。
 
 ## 3. 部署矩阵
 
 ### 3.1 Windows 11 + Docker Desktop
 
-`.env`：
+`.env`（**已实测可用**，这是本机部署实际使用的配置）：
 
 ```dotenv
-DOCKER_ENDPOINT=npipe:////./pipe/dockerDesktopLinuxEngine
+# 容器内必须是 unix socket！Docker Desktop 会把 Windows named pipe 转发成容器内的
+# /var/run/docker.sock。写 npipe:// 会报 ENOENT。
+DOCKER_ENDPOINT=unix:///var/run/docker.sock
 DOCKER_SOCKET=//var/run/docker.sock
-PORTAL_DISK_MOUNTS=C:=/host/disk/C,D:=/host/disk/D
-# 不要把 C:\ 直接挂进来（Docker Desktop 文件共享权限问题多），
-# 而是只挂需要的目录并逐个加到 PORTAL_DISK_MOUNTS
+PORTAL_DISK_MOUNTS=C:=/host/disk/C
+PORTAL_TAILSCALE_MODE=api
+PORTAL_TAILSCALE_API_TOKEN=tskey-api-xxxxxxxx
 ```
 
-`docker-compose.yml` 的 `volumes` 需注释掉 `/proc:/host/proc:ro`（原因见 §2），
-并加上磁盘与 tailscale 挂载：
+compose 的 `volumes` 需要有（磁盘盘符**必须**写成 `"C:/"` 并加引号）：
 
 ```yaml
-      - /proc:/host/proc:ro                     # ← Windows 上请注释掉这一行
-      - C:\:/host/disk/C:ro                     # 需要哪个盘就加哪个
-      - "C:\\Program Files\\Tailscale\\tailscale.exe:/usr/local/bin/tailscale:ro"
+      - "C:/:/host/disk/C:ro"
 ```
 
-> **tailscale CLI 挂载**：容器内不能执行 Windows PE 可执行文件。
-> 因此 Windows 上的 CLI 模式实际不可用；请改用 **API 模式**：
-> `PORTAL_TAILSCALE_MODE=api` + `PORTAL_TAILSCALE_API_TOKEN=tskey-api-...`
-> （在 Tailscale 管理后台 → Settings → Keys 生成，只读 scope 即可）。
-> 或者让门户跑在 WSL 内并挂载 WSL 侧的 `tailscale`（若在 WSL 里装了 Tailscale）。
+不要加 `/proc:/host/proc:ro`（WSL2 视图，与任务管理器对不上，挂了也没用，见 §2）。
+
+#### 常见坑（都是实测踩到的）
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `docker.available=false`，detail 为 `ENOENT //./pipe/...` | 在容器里用了 `npipe://` 写法 | 改成 `unix:///var/run/docker.sock` |
+| `docker.available=false`，detail 为 `ENOENT` 且挂载显示为 `<项目目录>/C:` | compose 里盘符写成 `C:`，被当成相对路径 | 写成 `"C:/:/host/disk/C:ro"` |
+| CPU 只显示 4 线程、内存只显示约 4 GB | Docker Desktop 的 WSL2 虚拟机限额 | 见 §2 —— 要么原生运行，要么调 `.wslconfig` |
+| GPU 显示不可用 | 容器内看不到 `/usr/lib/wsl/lib` | 见 §2 —— 需原生运行才能读 GPU |
+| tailnet 显示"未配置 API Token" | Windows 上容器内无法执行 `tailscale.exe` | 配置 `PORTAL_TAILSCALE_API_TOKEN`（只读 scope 即可） |
+
+#### 想拿到 Windows 真实 CPU/内存/GPU：原生运行
+
+```powershell
+npm run build
+$env:DOCKER_ENDPOINT='npipe:////./pipe/dockerDesktopLinuxEngine'  # 原生运行才用 npipe
+$env:PORTAL_DATA_DIR='D:\桌面\sisi_apps\HomePage\data'
+npm start
+```
+
+实测结果：20 线程、31.63 GB 内存（与任务管理器一致）、`nvidia-smi` 可读。
+此时磁盘指标无挂载概念，需用 `PORTAL_DISK_MOUNTS` 指向本地盘符（如 `C:=C:\`）。
 
 ### 3.2 NAS（Synology / QNAP / TrueNAS）
 
@@ -108,25 +162,23 @@ PORTAL_TAILSCALE_BIN=/usr/local/bin/tailscale
       - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro
 ```
 
-### Windows（WSL GPU 直通）
+### Windows（Docker Desktop）—— 容器化部署下不可用
 
-Docker Desktop 的 WSL2 内置 GPU 直通，`nvidia-smi` 位于 `/usr/lib/wsl/lib/`：
+**实测结论：Docker Desktop 的容器内拿不到 GPU 指标**，因此不需要任何挂载配置。
 
-```yaml
-      - /usr/lib/wsl/lib/nvidia-smi:/usr/local/bin/nvidia-smi:ro
-      - /usr/lib/wsl/drivers:/usr/lib/wsl/drivers:ro
-```
+| 尝试过的方案 | 结果 |
+| --- | --- |
+| 挂 `/usr/lib/wsl/lib/nvidia-smi` | ❌ `No such file or directory` —— 该路径在容器内不可见 |
+| 挂 `C:\Windows\System32\nvidia-smi.exe` | ❌ Linux 容器无法执行 Windows PE 可执行文件 |
 
-并在 `.env`：
+门户会把 GPU 报为"不可用"并说明原因 —— 这是**正确行为**，不是缺陷。
 
-```dotenv
-PORTAL_NVIDIA_LD_LIBRARY_PATH=/usr/lib/wsl/lib
-```
+想在 Windows 上看 GPU 指标，请改用**原生运行**方式（§3.1 末段）：
+原生 `node` 进程可直接执行 `C:\Windows\System32\nvidia-smi.exe`，
+实测可读到 RTX 4060 的利用率、显存、温度、功耗与占用进程。
 
-若 `.env` 里 `PORTAL_NVIDIA_LD_LIBRARY_PATH` 为空，`nvidia-smi` 会因找不到
-`libnvidia-ml.so` 而失败，此时 `/api/health` 的 `sources.gpu.detail` 会给出提示。
-
-> **不要**尝试挂载 `C:\Windows\System32\nvidia-smi.exe` —— 容器内执行不了 Windows 可执行文件。
+> 不要为了这个需求去折腾 WSL 内安装 NVIDIA 驱动 —— WSL 的 GPU 支持由 Windows 驱动
+> 通过 `/usr/lib/wsl/lib` 提供，而该目录不会被 Docker Desktop 暴露给容器。
 
 ## 5. 忘记密码怎么办
 

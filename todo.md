@@ -32,7 +32,9 @@
 
 ### F3 系统指标
 - [x] 宿主 `/proc` 读取（CPU/内存/负载/运行时长/CPU 型号）
-- [x] `os.cpus()` 兜底（Windows/macOS，仍是宿主真实值）
+- [x] `os.cpus()` 兜底（用于无 `/proc` 的环境）
+      **实测修正**：该路径在 **Windows 容器化** 下只能看到 WSL2 虚拟机资源
+      （4 线程 / 3.9 GB），不是 Windows 真实值；要拿真实值需原生运行。见 `08-operations.md` §2
 - [x] 采样间隔保护（避免 CPU 读数抖动）
 - [x] 磁盘 `statfs`（可配多挂载点）
 - [x] GPU：`nvidia-smi` 多字段查询 + 占用进程 + WSL 库路径支持
@@ -82,17 +84,25 @@
 
 ### 高优先级（影响可用性）
 
-- [ ] **镜像构建实测**：在 Windows Docker Desktop 与 arm64 环境分别
-      `docker compose up -d --build`，验证原生模块编译与运行时行为
-      - 当前未执行，`Dockerfile` 的正确性只在设计层面验证
-      - 需要确认：`npm ci` 在 alpine 上能编译 better-sqlite3；
-        `npm prune --omit=dev` 后 `better-sqlite3` 的 `.node` 产物仍在
-- [ ] **Windows tailnet 查询体验**：当前需手动切 `PORTAL_TAILSCALE_MODE=api`。
-      可考虑在检测到 `win32` 宿主且 CLI 不可用时，在 UI 上直接提示并提供配置指引链接
-- [ ] **Windows `/proc` 自动判断**：目前若用户挂了 `/proc`，会优先用 `host-proc` 模式，
-      但 Docker Desktop 下那是 WSL2 视图。可按宿主平台自动跳过该挂载
-- [ ] **首次部署引导页**：在 `/api/health` 显示各数据源问题时，于总览页给出
-      "点这里看怎么修"的可展开清单（现在已有 warnings，但缺少操作指引）
+- [x] **镜像构建实测**：Windows Docker Desktop 上 `docker compose up -d --build`
+      首次即成功，容器 `Up (healthy)`，五个数据源状态符合预期（2026-10-16）
+- [x] **工具探测目标主机 bug**：容器内 `localhost` 指向容器自己，导致 8 个工具全报不可用。
+      已改为多目标链（对外主机 → `host.docker.internal` → `127.0.0.1`）并重新验证（2026-10-16）
+- [ ] **arm64（NAS）镜像构建实测**：设计上应可成功（builder 阶段原生编译
+      better-sqlite3），但尚未实跑
+- [ ] **Windows 宿主真实硬件指标**：容器化部署只能看到 WSL2 虚拟机资源。
+      可选方案：
+      1. 补充「原生运行」的部署文档与一键启动脚本（推荐，实测可行）
+      2. 增加 Windows 专用 GPU provider：容器内无法执行 `nvidia-smi.exe`，
+         若坚持容器化则只能放弃 GPU 指标
+      3. 在 UI 上检测到"WSL2 视图"时主动提示用户可改用原生运行
+- [ ] **检测 WSL2 视图并提示**：目前 `os-cpus` 模式下无法区分
+      "macOS 原生（真实值）"与"Windows 容器（WSL2 视图）"。
+      可用 `cgroup` CPU 配额与 `os.cpus().length` 的差异做启发式判断
+- [ ] **Windows tailnet 查询体验**：需要手动切 `PORTAL_TAILSCALE_MODE=api` 并填 Token。
+      可在检测到 CLI 不可用时于设备页直接给出可点击的管理后台链接
+- [ ] **首次部署引导页**：`/api/health` 已能报告各数据源问题，
+      可在总览页把 warnings 变成"点这里看怎么修"的可展开清单
 
 ### 中优先级（增强）
 
@@ -136,9 +146,16 @@
 
 | 项目 | 值 |
 | --- | --- |
-| Docker | 29.8.0，Docker Desktop，endpoint = `npipe:////./pipe/dockerDesktopLinuxEngine` |
-| 现有容器 | 5 个（cs22-backend / cs22-web / cs22-ml-service / sisi-calendar / worldforge） |
+| Docker | 29.8.0，Docker Desktop，容器内 endpoint = `unix:///var/run/docker.sock` |
+| 现有容器 | 6 个（cs22-backend / cs22-web / cs22-ml-service / sisi-calendar / worldforge / homepage-portal 自身） |
 | Tailscale | 1.102.4，本机 `Sisi-Laptop` / `100.72.255.29`，11 台设备 |
-| GPU | RTX 4060 Laptop 8G（宿主可见；容器内需挂载 nvidia-smi） |
+| GPU | RTX 4060 Laptop 8G。**容器化下不可读**（容器内无 `/usr/lib/wsl/lib`）；原生运行可读 |
 | Node | v22.23.2 |
-| 平台 | Windows，`os.cpus()` 兜底路径生效（20 线程） |
+| 平台 | Windows 11，宿主 20 线程 / 31.63 GB；容器内只可见 WSL2 的 4 线程 / 3.9 GB |
+
+部署状态（2026-10-16）：
+
+- 容器 `homepage-portal` 已构建并运行，`Up (healthy)`，映射 `0.0.0.0:8899->8899`
+- 数据卷 `homepage-data` 持久化，重建容器后 admin 账号与偏好保留
+- 登录账号：`admin` / `PortalAdmin2026!`（**建议登录后立即修改**）
+- 访问地址：`http://100.72.255.29:8899`（tailnet）或 `http://localhost:8899`

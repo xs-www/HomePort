@@ -337,6 +337,8 @@ export interface ToolStatusView {
   checkedAt: string | null;
   detail: string | null;
   stale: boolean;
+  /** 实际探测成功的目标主机与端口（与入口主机可能不同） */
+  target: { host: string; port: number } | null;
 }
 
 export interface ToolView {

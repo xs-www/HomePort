@@ -74,37 +74,58 @@ Windows 本机开发时设置 `DOCKER_ENDPOINT=npipe:////./pipe/dockerDesktopLin
 
 ## 指标为什么可能不准
 
-门户跑在容器里，展示的却是宿主资源，这个差异必须说明白：
+门户展示的是**宿主**资源，但它跑在容器里，两者可见范围不同。以下是**实测结论**：
 
-| 宿主 | CPU / 内存 | 磁盘 / GPU |
-| --- | --- | --- |
-| **Linux / NAS** | 挂载宿主 `/proc` → **真实值** | 真实值 |
-| **Windows** | 走 Node 的 `os` 接口 → **Windows 宿主真实值**（任务管理器可对照） | 真实值 |
+| 部署方式 | CPU / 内存 | 磁盘 | GPU |
+| --- | --- | --- | --- |
+| **容器化 · Linux / NAS** | 宿主 `/proc` → **真实值** | 真实值 | 挂 `nvidia-smi` → 真实值 |
+| **容器化 · Windows** | ⚠ **只有 WSL2 虚拟机的资源**（实测 4 线程 / 3.9 GB，宿主其实是 20 线程 / 31.6 GB） | 挂 `C:/` → **真实值**（实测 952 GB，与资源管理器一致） | ❌ 容器内不可用 |
+| **原生运行 · Windows** | `os` 接口 → **真实值**（实测 20 线程 / 31.63 GB，与任务管理器一致） | 需配 `PORTAL_DISK_MOUNTS` | ✅ 真实值 |
 
-界面上每张卡片都会标注数据源（如"宿主 /proc（真实值）"或"容器视图"）。
+**Windows 容器化拿不到宿主 CPU/内存**，原因是 Docker Desktop 把容器跑在 WSL2 虚拟机里，
+容器只能看到这个虚拟机的 4 线程 / 4 GB。我实测确认：**挂载 WSL 的 `/proc` 也没用**
+（它和 `os.cpus()` 是同一个来源，都报 4 线程）。
+
+想在 Windows 上拿到真实硬件数据，两条路：
+
+1. **原生运行**（推荐）：`npm run build` 后直接 `node server/dist/index.js`。
+   实测 20 线程 / 31.63 GB / `nvidia-smi` 可读，全部为真实值。
+   此时 `DOCKER_ENDPOINT` 需用 npipe 写法。
+2. **调大 WSL2 配额**：编辑 `%USERPROFILE%\.wslconfig` 设 `processors` 与 `memory`，
+   再 `wsl --shutdown`。但这仍只是让虚拟机视图更接近宿主，**不是** Windows 真实占用。
+
+GPU 同理：Docker Desktop 的容器内看不到 `/usr/lib/wsl/lib`，也无法执行
+`nvidia-smi.exe`（Linux 容器跑不了 Windows 可执行文件），因此报"不可用"是正确行为。
+需要 GPU 指标请用原生运行。
+
+界面上每张卡片都会标注数据源（如"宿主 /proc（真实值）"或"容器视图（受 cgroup 限制）"）。
 **看到黄色提示条说明取数降级了，不是服务坏了** —— 提示条里会写清原因。
-
-若你在 Windows 的 Docker Desktop 里挂载了 `/proc`，读到的是 **WSL2 虚拟机**的占用，
-与任务管理器对不上。此时请**不要**挂 `/proc`，让门户走 `os` 接口路径。
-详见 [docs/static/08-operations.md](docs/static/08-operations.md)。
+详见 [docs/static/08-operations.md](docs/static/08-operations.md) §2。
 
 ## 平台配置要点
 
 ### Windows 11 + Docker Desktop
 
 ```dotenv
-DOCKER_ENDPOINT=npipe:////./pipe/dockerDesktopLinuxEngine
+# 容器内必须是 unix socket！Docker Desktop 会把 named pipe 转发成 /var/run/docker.sock
+DOCKER_ENDPOINT=unix:///var/run/docker.sock
 DOCKER_SOCKET=//var/run/docker.sock
+PORTAL_DISK_MOUNTS=C:=/host/disk/C
 PORTAL_TAILSCALE_MODE=api
 PORTAL_TAILSCALE_API_TOKEN=tskey-api-xxxxxxxx
-PORTAL_DISK_MOUNTS=C:=/host/disk/C
 ```
 
-- 容器内**无法执行** Windows 可执行文件，所以 tailnet 查询请用 API 模式
-  （Tailscale 管理后台 → Settings → Keys，只读 scope 即可）。
-- compose 里请注释掉 `/proc:/host/proc:ro`（原因见上一节）。
-- GPU 经 WSL 直通可用：挂 `/usr/lib/wsl/lib/nvidia-smi` 并设
-  `PORTAL_NVIDIA_LD_LIBRARY_PATH=/usr/lib/wsl/lib`。
+compose 的 volume 里盘符**必须**写成 `"C:/:/host/disk/C:ro"`（写成 `C:` 会被当相对路径）。
+
+不要加 `/proc:/host/proc:ro` —— 挂进来的是 WSL2 虚拟机视图，与任务管理器对不上。
+
+两个实测踩到的坑：
+
+- **在容器里写 `npipe://` 会报 ENOENT**。npipe 只适用于"在 Windows 上原生跑 Node"。
+- **盘符 `C:` 不加引号和斜杠会被解析成 `<项目目录>/C:`**，导致挂载失败。
+
+Windows 上容器内执行不了 `tailscale.exe`，所以 tailnet 查询必须用 API 模式
+（Tailscale 管理后台 → Settings → Keys，只读 scope 即可）。
 
 ### NAS（Synology / QNAP / TrueNAS）
 
@@ -149,6 +170,23 @@ PORTAL_TOOLS_EXTRA=jellyfin:Jellyfin:8096,immich:Immich:2283
 }
 ```
 
+### 可用性是怎么判定的
+
+门户跑在容器里，而容器内的 `localhost` 指向**容器自己**，不是宿主。
+所以探测会按顺序尝试三个目标，任一成功即判为"可用"：
+
+```
+门户对外主机名  →  host.docker.internal  →  127.0.0.1
+```
+
+命中兜底目标时，工具卡片上的 `detail` 会写明"经 xxx 探测"，
+并显示一个「探测目标 xxx」徽标 —— 避免"端口通但入口链接打不开"这类问题变成一个说不清的红点。
+
+实测案例：本机 DSH 监听 `3080`，容器内只有 `host.docker.internal:3080` 可达
+（`127.0.0.1` 与 tailnet IP 都不通），兜底链覆盖后正确判为"可用 · 4 ms"。
+`docker-compose.yml` 已带 `extra_hosts: host.docker.internal:host-gateway`，
+Linux/NAS 上该域名才会解析。
+
 ## 安全
 
 - 密码：bcrypt cost 12；最少 10 位且至少两类字符。
@@ -185,9 +223,11 @@ PORTAL_TOOLS_EXTRA=jellyfin:Jellyfin:8096,immich:Immich:2283
 
 ## 已知限制
 
-1. Windows 上 tailnet 查询需用 API 模式（容器内无法执行 Windows 可执行文件）。
-2. 未做 TOTP 二次验证，未设置 CSP/HSTS 等安全响应头。
-3. 不提供容器写操作（有意的产品边界）。
-4. 镜像构建与 arm64 部署尚未实测。
+1. **Windows 容器化部署下，CPU/内存只有 WSL2 虚拟机的数（4 线程 / 3.9 GB）**，
+   与宿主（20 线程 / 31.6 GB）不符；GPU 也不可用。需要真实硬件数据请原生运行。
+2. Windows 上 tailnet 查询需用 API 模式（容器内无法执行 Windows 可执行文件）。
+3. 未做 TOTP 二次验证，未设置 CSP/HSTS 等安全响应头。
+4. 不提供容器写操作（有意的产品边界）。
+5. arm64（NAS）镜像构建尚未实测。
 
 详见 [todo.md](todo.md)。

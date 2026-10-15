@@ -10,7 +10,7 @@ import { TtlCache } from '../../util/cache.js';
 import { buildUrl } from '../../util/net.js';
 import type { PortalHostContext } from '../docker/hostContext.js';
 import { loadCatalog, type ToolDefinition } from './catalog.js';
-import { probeTool, type ProbeResult } from './probe.js';
+import { defaultFallbackHosts, probeTool, type ProbeResult } from './probe.js';
 import type { SourceStatus, ToolListResult, ToolListSummary, ToolStatusView, ToolUrlCandidate, ToolView } from './types.js';
 
 export interface ToolsServiceDeps {
@@ -25,6 +25,7 @@ const UNKNOWN_STATUS: ToolStatusView = {
   checkedAt: null,
   detail: null,
   stale: false,
+  target: null,
 };
 
 export class ToolsService {
@@ -122,18 +123,19 @@ export class ToolsService {
     if (tool.port === null) {
       return { ...UNKNOWN_STATUS, detail: '未配置宿主端口，无法探测' };
     }
+    const port = tool.port;
     const key = this.probeKey(tool, hostContext);
     const { value, stale } = await this.probeCache.getStaleWhileRevalidate(
       key,
       () =>
         probeTool({
-          host: hostContext.primaryHost,
-          port: tool.port as number,
+          host: this.deps.config.tools.probeHost || hostContext.primaryHost,
+          port,
           scheme: tool.scheme,
           probePath: tool.probePath,
           expectedStatus: tool.expectedStatus,
           timeoutMs: this.deps.config.tools.probeTimeoutMs,
-          fallbackHost: hostContext.primaryHost === '127.0.0.1' ? null : '127.0.0.1',
+          fallbackHosts: defaultFallbackHosts(),
           logger: this.log,
         }),
       this.deps.config.tools.probeTtlMs,
@@ -147,6 +149,7 @@ export class ToolsService {
       checkedAt: value.checkedAt,
       detail: value.detail,
       stale,
+      target: value.target,
     };
   }
 }

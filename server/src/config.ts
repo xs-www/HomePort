@@ -80,6 +80,14 @@ export interface PortalConfig {
     catalogFile: string | null;
     probeTimeoutMs: number;
     probeTtlMs: number;
+    /**
+     * 是否把探测结果同时展示给前端（预留）。
+     *
+     * 强制指定探测目标主机。为空时用门户的对外主机名，
+     * 失败后自动兜底尝试 `host.docker.internal` 与 `127.0.0.1`。
+     * 容器化部署下宿主服务通常只能经 `host.docker.internal` 连上。
+     */
+    probeHost: string;
     /** 追加的自定义工具，形如 id:label:port 的逗号分隔列表 */
     extra: string[];
   };
@@ -262,6 +270,7 @@ export function loadConfig(overrides: Partial<PortalConfig> = {}): PortalConfig 
       catalogFile: optionalStr('PORTAL_TOOLS_FILE'),
       probeTimeoutMs: num('PORTAL_TOOLS_PROBE_TIMEOUT_MS', 1500, 200, 15000),
       probeTtlMs: num('PORTAL_TOOLS_PROBE_TTL_MS', 10000, 1000, 300000),
+      probeHost: str('PORTAL_TOOLS_PROBE_HOST', ''),
       extra: str('PORTAL_TOOLS_EXTRA', '')
         .split(',')
         .map((s) => s.trim())

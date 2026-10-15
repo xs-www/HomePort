@@ -207,7 +207,7 @@
 | --- | --- | --- | --- |
 | 1 | named pipe 路径归一化错误（`////./pipe/...`） | Windows 上完全读不到 Docker，报 `ENOENT` | 新增 `normalizeNamedPipe()` |
 | 2 | `webDistDir` 用 `process.cwd()` 推导 | 从 `server/` 启动时指向 `server/web/dist`，前端 503 | 改用 `REPO_ROOT`（`import.meta.url` 推导） |
-| 3 | Windows 无 `/proc` 导致 CPU 恒为 `null` | F3 核心指标不可用 | 新增 `osCpusToCpuTimes()` 兜底 + `os-cpus` 模式 |
+| 3 | Windows 无 `/proc` 导致 CPU 恒为 `null` | F3 核心指标不可用 | 新增 `osCpusToCpuTimes()` 兜底 + `os-cpus` 模式。**注**：后续部署实测发现 `os-cpus` 在 Windows *容器化* 下只能看到 WSL2 虚拟机资源，见本文件末尾的部署实测条目 |
 | 4 | 连续快照 CPU 读数抖动（0%/null） | 指标不可信 | `MIN_CPU_SAMPLE_INTERVAL_MS = 500` 内复用上次结果 |
 | 5 | `PORTAL_DISK_MOUNTS` 缺少 `=` 时静默猜测 | statfs 目标错误 | 改为直接抛错 |
 | 6 | `defaultMountLabel` 保留盘符冒号 | 界面显示 `C:` 而非 `C` | 去掉尾部 `:` |
@@ -284,3 +284,165 @@ curl /containers          # SPA 回退 200
 `03-server-modules.md`、`04-api-contract.md`、`05-web-modules.md`、`06-security.md`、
 `07-data-model.md`、`08-operations.md`、`09-changelog.md`（本文件），
 以及仓库根的 `README.md` 与 `todo.md`。
+
+---
+
+## [2026-10-16] 首次容器化部署实测与修正
+
+在 Windows 11 + Docker Desktop 上实跑 `docker compose up -d --build`，
+镜像构建、容器启动、健康检查、登录、各功能接口全部验证通过，
+并纠正了初版文档中关于 Windows 指标可得性的**错误描述**。
+
+### 部署结果（实测）
+
+```
+$ docker compose up -d --build
+ Image homepage-portal:local Built              # 首次构建成功，无编译错误
+ Container homepage-portal Started
+$ docker compose ps
+ homepage-portal  Up (healthy)  0.0.0.0:8899->8899/tcp
+```
+
+`/api/health`：
+
+| 数据源 | 结果 |
+| --- | --- |
+| docker | ✅ available，`mode: socket` |
+| tailscale | ❌ `mode: api`，未配置 Token（预期） |
+| system | ✅ available，`mode: os-cpus` |
+| disk | ✅ available，`mode: statfs` → **952 GB / 已用 65%**，与资源管理器一致 |
+| gpu | ❌ 不可用（预期，原因见下） |
+
+功能区实测：容器 6 个（含门户自身），tailnet 可达 3 / 仅本机 3；
+经 tailnet IP 访问时由 `os.cpus()` 读到 4 线程——见下方修正。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 修改 | `.env.example` | Windows 段落重写：容器内必须用 unix socket；补充 3 个实测坑 |
+| 修改 | `.env`（新增，gitignored） | 本机可用的实际配置 |
+| 修改 | `docker-compose.yml` | 磁盘盘符改为带引号的 `"C:/:..."`；拆出 Windows 磁盘挂载段；修正 DOCKER_ENDPOINT 注释 |
+| 修改 | `README.md` | 「指标为什么可能不准」改为实测结论表；平台配置要点重写；已知限制更新 |
+| 修改 | `docs/static/01-architecture.md` | 部署形态图下补充 Windows 例外说明 |
+| 修改 | `docs/static/08-operations.md` | §2 指标取数边界重写为实测表；§3.1 增加常见坑表与原生运行方案；§4 GPU 章节重写 |
+| 修改 | `todo.md` | 更新已完成项与剩余待办 |
+
+### 逐项明细
+
+#### 修改：`docker-compose.yml`
+
+- **磁盘盘符写法**：`${HOST_DISK_C:-C:}:/host/disk/C:ro` → `"C:/:/host/disk/C:ro"`。
+  **原因**：`C:` 在 compose 变量替换后被当成**相对路径**，解析为
+  `D:\桌面\sisi_apps\HomePage\C:`（实测 `docker compose config` 可见），挂载失败。
+  必须写成 `"C:/"` 且加引号。
+- **`DOCKER_ENDPOINT` 注释**：明确"容器内一律用 unix socket"。
+- 新增说明：Windows 上不要挂 `/proc`，也不要试图挂 `nvidia-smi.exe`。
+
+#### 修改：`docs/static/08-operations.md`（重要更正）
+
+**原文错误**：声称"Windows 上挂载 `/proc` 会读到 WSL2 视图，应改为不挂让代码走 `os-cpus`"，
+暗示 `os-cpus` 能拿到 Windows 真实值。
+
+**实测结论**：两者**是同一个来源**，都只报 4 线程 / 3.9 GB：
+
+```
+容器内 os.cpus()              → 4 线程
+容器内挂载 WSL 的 /proc        → 4 线程（grep -c ^processor /host/proc/cpuinfo）
+原生 node（Windows）          → 20 线程 / 31.63 GB
+```
+
+因此挂载 `/proc` **无法**解决 Windows 的指标问题。已把该节重写为按部署方式
+（容器化·Linux / 容器化·Windows / 原生·Windows）划分的实测表，
+并给出两条可行路径：原生运行、或调大 `.wslconfig` 的 WSL2 配额。
+
+同时新增「常见坑」表，收录本次实测踩到的所有问题及处理方式。
+
+#### 修改：`README.md`
+
+- 指标表改为实测数据（含具体数字对比），避免"应该准确"这类无法验证的表述。
+- Windows 配置示例改为实测可用的版本，并标注两个必踩的坑（npipe、盘符）。
+- 已知限制首条改为 Windows 容器化的指标局限。
+
+#### 修改：`docs/static/01-architecture.md`
+
+在部署形态图后加「实测修正」引用块，说明 Windows 下 `/proc` 与 GPU 两个例外，
+并明确容器化部署在 Windows 上的定位是"容器入口 + 磁盘 + tailnet"。
+
+### 本次实测确认的行为（非缺陷）
+
+| 现象 | 判定 | 说明 |
+| --- | --- | --- |
+| 容器墙里出现 `homepage-portal` 自身 | ✅ 正确 | 它就是本机的一个容器，且 `0.0.0.0:8899` 绑定，因此判为 tailnet 可达 |
+| 从 `localhost` 访问时入口显示 `http://localhost:3000/` | ✅ 正确 | URL 按**访问者视角**生成 |
+| 从 `100.72.255.29` 访问时同一容器显示 `http://100.72.255.29:3000/` | ✅ 正确 | 同一份缓存服务不同访问者，这是两层 URL 生成设计的预期效果 |
+| 磁盘显示 952 GB | ✅ 正确 | Docker Desktop 的 `statfs` 能读到 Windows 真实分区容量 |
+| GPU 报不可用 | ✅ 正确 | 容器内看不到 `/usr/lib/wsl/lib`；不应伪造数字 |
+| tailnet 报"未配置 API Token" | ✅ 正确 | 给出了明确指引而非静默失败 |
+
+### 验证方式
+
+```bash
+docker compose up -d --build                  # 构建 + 启动，首次即成功
+docker compose ps                             # Up (healthy)
+curl http://127.0.0.1:8899/api/health         # 五个数据源状态符合预期
+# 经 tailnet IP 访问并逐项核对容器/磁盘/工具数据
+docker run --rm -v /proc:/host/proc:ro alpine:3.20 \
+  sh -c "grep -c ^processor /host/proc/cpuinfo"   # → 4，证实与 os.cpus() 同源
+```
+
+### 剩余待办（已记入 todo.md）
+
+- arm64（NAS）镜像构建实测
+- 若确实需要 Windows 宿主真实硬件指标，考虑增加"原生运行"的部署文档与启动脚本
+
+---
+
+### 部署后的第一轮回归修复
+
+首次部署跑通后立刻暴露了 3 个只有真跑才会发现的问题，已全部修复并重新验证。
+
+#### 缺陷 15：工具探测在容器内选错了目标主机（**功能性 bug**）
+
+- **现象**：8 个工具全部报"不可用"，但 DSH 实际正在 `3080` 监听。
+- **根因**：探测用的是"门户的对外主机名"，从 `localhost` 访问门户时那就是 `localhost`
+  —— 而容器内的 `localhost` 指向**容器自己**，不是宿主。
+  实测确认：容器内 `127.0.0.1:3080` 与 `100.72.255.29:3080` 都不可达，
+  只有 `host.docker.internal:3080` 可达。
+- **修复**：
+  - `probeTool` 改为**目标链**：首选主机 → `host.docker.internal` → `127.0.0.1`，任一成功即判 `up`
+  - 新增 `defaultFallbackHosts()`；命中兜底时 `detail` 明确说明"经 xxx 探测"
+  - `ToolStatusView` 新增 `target: { host, port }`，前端工具卡显示「探测目标 xxx」徽标
+  - 新增环境变量 `PORTAL_TOOLS_PROBE_HOST` 供特殊拓扑强制指定
+  - `docker-compose.yml` 增加 `extra_hosts: host.docker.internal:host-gateway`
+    （Docker Desktop 自带该域名，Linux/NAS 需要这行）
+- **验证**：修复后 DSH 正确显示 `up`（4ms，经 `host.docker.internal`），
+  其余 7 个仍为 `down` 且原因为"连接被拒绝（端口未监听）"—— 与宿主实际监听状态一致。
+
+#### 缺陷 16：磁盘文件系统类型显示为原始魔数
+
+- **现象**：磁盘卡片 `fsType` 显示 `0x1021997`。
+- **根因**：`describeFsType` 的已知魔数表未包含 WSL2/DrvFs 的 `9p`。
+- **修复**：补齐常见魔数（`9p`/`virtiofs`/`overlayfs`/`fuse`/`sysfs`/`proc`/`devpts` 等）。
+- **验证**：现显示 `fsType=9p`，与容器内 `df -T` 的实际输出一致。
+  已加单测断言。
+
+#### 缺陷 17：`docker-compose.yml` 磁盘盘符写法导致挂载失败
+
+- **现象**：`docker compose config` 显示 source 为 `D:\桌面\sisi_apps\HomePage\C:`。
+- **根因**：`C:` 在 compose 变量替换后被当成**相对路径**。
+- **修复**：改为硬编码且带引号的 `"C:/:/host/disk/C:ro"`，并在注释里写明原因。
+- **验证**：`docker compose config` 现在解析为 `C:/`，容器内 `df` 读到真实 952 GB。
+
+### 本轮验证方式
+
+```bash
+docker compose up -d --build        # 重建（卷持久化，admin 账号与配置保留）
+docker compose ps                   # Up (healthy)
+curl /api/auth/login                # 登录成功（证明数据卷持久化生效）
+curl /api/system/snapshot           # disk C: 618.9/952 GB = 65%, fsType=9p
+curl /api/tools                     # dsh=up(4ms, host.docker.internal)，其余 7 个 down 且原因正确
+curl /api/overview                  # warnings 仅剩 tailscale(未配 Token) 与 GPU(容器内不可用) 两条预期项
+```
+
+`typecheck` 两个 workspace 均 0 error，129 个测试用例通过。

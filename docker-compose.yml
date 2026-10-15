@@ -40,7 +40,9 @@ services:
       PORTAL_SETUP_TOKEN: "${PORTAL_SETUP_TOKEN:-}"
 
       # ---- Docker 数据源（只读）
-      # Docker Desktop on Windows 必须用 named pipe；Linux/NAS 用 unix socket
+      # 容器内一律用 unix socket。Docker Desktop 会把 Windows named pipe 转发为
+      # 容器内的 /var/run/docker.sock，所以 Windows 容器化部署**也**用这个值。
+      # npipe:// 写法只用于「在 Windows 上原生跑 Node」的开发场景。
       DOCKER_ENDPOINT: "${DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
 
       # ---- tailnet 数据源
@@ -79,12 +81,32 @@ services:
       # Docker 引擎（只读）。Windows 上若下面那行报错，改用：
       #   - //var/run/docker.sock:/var/run/docker.sock
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
-      # 前端可选的挂载（用不到的会被忽略）
-      # - /proc:/host/proc:ro                      # Linux/NAS：宿主真实 CPU/内存
-      # - /volume1:/host/volume1:ro                # NAS：磁盘占用
+
+      # ---- 宿主磁盘（按需增删，并在 .env 的 PORTAL_DISK_MOUNTS 里同步登记）----
+      # 注意：盘符必须写成 "C:/"（带斜杠）并加引号。若写成 C: ，Compose 会把
+      # 它当成相对路径，解析成 <项目目录>/C: 而挂载失败。
+      # Windows：把 C: 挂进来，门户用 statfs 读取真实占用（实测可读到 952G 真实值）
+      - "C:/:/host/disk/C:ro"
+      # 其它盘按需追加： - "D:/:/host/disk/D:ro"
+      # NAS 示例：     - /volume1:/host/volume1:ro
+
+      # ---- 以下挂载默认注释，按平台启用 ----
+      # Linux/NAS：宿主 /proc（拿真实 CPU/内存）
+      # - /proc:/host/proc:ro
+      #
+      # Linux/NAS：宿主 tailscale（CLI 模式）
       # - /usr/bin/tailscale:/usr/local/bin/tailscale:ro
       # - /var/run/tailscale:/var/run/tailscale:ro
-      # - C:\Windows\System32\nvidia-smi.exe:/usr/local/bin/nvidia-smi:ro   # 见 README 的 GPU 说明
+      #
+      # 注意：Windows 上**不要**挂 /proc（那是 WSL2 虚拟机视图，与任务管理器对不上），
+      # 也不要试图挂 nvidia-smi.exe（Linux 容器执行不了 Windows 可执行文件）。
+      # 详见 docs/static/08-operations.md 的「指标取数边界」。
+
+    # 让容器内的 host.docker.internal 指向宿主。
+    # Docker Desktop（Windows/macOS）自带这个域名；Linux/NAS 需要这行才会生效。
+    # 用途：工具可用性探测需要从容器内访问宿主上的服务（Ollama/ComfyUI 等）。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     # NAS 上 Docker 组 ID 常为 998/100/0，出现 EACCES 时在 .env 里设置
     # DOCKER_GID=998

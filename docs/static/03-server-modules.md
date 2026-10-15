@@ -266,12 +266,23 @@ SQLite 连接与迁移。
 | --- | --- | --- |
 | `types.ts` | `ToolStatusView` `ToolUrlCandidate` `ToolView` `ToolListSummary` `ToolListResult` `SourceStatus` | F4 契约类型 |
 | `catalog.ts` | `ToolDefinition` `ToolCategory` `BUILTIN_TOOLS` `ToolsFileConfig` `loadCatalog` `normalizeTool` `parseExtraTools` `LoadCatalogResult` | 目录加载与校验 |
-| `probe.ts` | `ProbeState` `ProbeResult` `probeTool` `tcpConnect` `httpStatus` `describeNetError` | 两级探测 |
+| `probe.ts` | `ProbeState` `ProbeResult` `probeTool` `tcpConnect` `httpStatus` `describeNetError` `defaultFallbackHosts` | 多目标探测 |
 | `service.ts` | `ToolsService` `buildToolUrls` `summarizeTools` `ToolUrls` | 业务出口 |
 
-**探测策略**：先 TCP 连接 → 再按 `probePath` 发 HTTP GET。
+**探测目标链**（`probeTool`）：门户跑在容器里，`localhost` 在容器内指向容器自己，
+因此宿主服务必须走特殊域名。按顺序尝试，任一成功即判 `up`：
+
+```
+1. options.host（门户的对外主机名）
+2. host.docker.internal   ← 容器化部署下宿主服务的可靠目标
+3. 127.0.0.1              ← 门户原生运行时的宿主
+```
+
+命中兜底主机时 `detail` 会写明"经 xxx 探测"，`ProbeResult.target` 返回实际成功的主机与端口
+（`ToolStatusView.target` 透出给前端显示徽标）。
+
+探测策略：先 TCP 连接 → 再按 `probePath` 发 HTTP GET。
 TCP 通但 HTTP 不通仍判 `up`（服务可能是纯 TCP 或需鉴权跳转），只在 `detail` 说明。
-首选主机失败时用 `127.0.0.1` 复测一次，用于区分"服务没起来"与"从门户这条路不通"。
 
 ### `src/modules/auth/`
 

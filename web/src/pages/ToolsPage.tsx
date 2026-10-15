@@ -182,6 +182,14 @@ function ToolCard({ tool, probing, onProbe }: { tool: ToolView; probing: boolean
         {tool.hostPort ? <Badge tone="idle">端口 {tool.hostPort}</Badge> : <Badge tone="warn">未配置端口</Badge>}
         {tool.status.latencyMs !== null ? <Badge tone="idle">{formatLatency(tool.status.latencyMs)}</Badge> : null}
         {tool.status.stale ? <Badge tone="warn">缓存</Badge> : null}
+        {tool.status.target ? (
+          <Badge
+            tone="idle"
+            title={`可用性是从门户侧对 ${tool.status.target.host}:${tool.status.target.port} 探测得出的`}
+          >
+            探测目标 {tool.status.target.host}
+          </Badge>
+        ) : null}
       </div>
 
       {tool.status.detail ? (

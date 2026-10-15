@@ -129,6 +129,28 @@
 | `PORTAL_TOOLS_EXTRA` | 空 | 快速追加：`id:名称:端口`，逗号分隔 |
 | `PORTAL_TOOLS_PROBE_TTL_MS` | `10000` | 探测结果缓存时长 |
 | `PORTAL_TOOLS_PROBE_TIMEOUT_MS` | `1500` | 单次 TCP/HTTP 探测超时 |
+| `PORTAL_TOOLS_PROBE_HOST` | 空 | 强制指定探测目标主机。**一般不需要**，见下方探测目标链 |
+
+### 探测目标链（重要）
+
+门户跑在容器里，而"宿主上的服务"在容器内**不能**用 `localhost` 访问
+（那指向容器自己）。因此探测按以下顺序尝试，任一成功即判定为 `up`：
+
+```
+1. 门户的对外主机名（访问者用的那个：tailnet IP / MagicDNS / localhost）
+2. host.docker.internal      ← 容器化部署下宿主服务的可靠目标
+3. 127.0.0.1                 ← 门户原生运行时的宿主
+```
+
+命中兜底主机时，`status.detail` 会明确写出"经 xxx 探测"，`status.target`
+返回实际探测成功的主机和端口，前端工具卡片上显示为「探测目标 xxx」徽标 ——
+这样"端口通但入口链接打不开"这类问题可以被直接看到，而不是变成一个说不清的红点。
+
+实测案例：本机 DSH 监听 `3080`，容器内 `127.0.0.1:3080` 与 tailnet IP 都连不上，
+只有 `host.docker.internal:3080` 可达（4ms）。兜底链覆盖后正确判为"可用"。
+
+`extra_hosts: host.docker.internal:host-gateway` 已写入 `docker-compose.yml`，
+Linux/NAS 上该域名才会解析（Docker Desktop 自带）。
 
 ### 目录 JSON 结构
 
@@ -189,16 +211,24 @@
 
 ## 7. 部署矩阵速查
 
-| | Windows 11 + Docker Desktop | NAS（Synology / QNAP / TrueNAS） |
+| | Windows 11 + Docker Desktop（容器化） | NAS（Synology / QNAP / TrueNAS） |
 | --- | --- | --- |
-| `DOCKER_ENDPOINT` | `npipe:////./pipe/dockerDesktopLinuxEngine` | `unix:///var/run/docker.sock` |
+| `DOCKER_ENDPOINT` | **`unix:///var/run/docker.sock`**（见下方警告） | `unix:///var/run/docker.sock` |
 | `DOCKER_SOCKET` | `//var/run/docker.sock` | `/var/run/docker.sock` |
 | `DOCKER_GID` | `0` | 常为 `998`（群晖），遇 `EACCES` 时设置 |
-| CPU / 内存 | `os-cpus`：Node 读 Windows 性能计数器，**宿主真实值** | `host-proc`：读宿主 `/proc`，真实值 |
-| 磁盘 | 挂 `C:`/`D:`，`statfs` 取真实值 | 挂 `/volume1` 等 |
-| GPU | 需把 `nvidia-smi.exe` 与其依赖库挂进容器（见 README） | 多数 NAS 无独显；有则可挂 `nvidia-smi` |
-| tailnet | CLI 模式：挂 `tailscale.exe` | CLI（挂 `tailscale` + `tailscaled.sock`）或 API |
+| CPU / 内存 | ⚠ **只有 WSL2 虚拟机的资源**（实测 4 线程 / 3.9 GB，宿主是 20 线程 / 31.6 GB）。挂 `/proc` 也无法改善 | `host-proc`：读宿主 `/proc`，**真实值** |
+| 磁盘 | 挂 `"C:/:/host/disk/C:ro"`，`statfs` → **Windows 真实值**（实测 952 GB） | 挂 `/volume1` 等 |
+| GPU | ❌ 容器内不可用（看不到 `/usr/lib/wsl/lib`，也无法执行 `nvidia-smi.exe`） | 多数 NAS 无独显；有则可挂 `nvidia-smi` |
+| tailnet | 必须 API 模式（容器内执行不了 `tailscale.exe`） | CLI（挂 `tailscale` + `tailscaled.sock`）或 API |
 | 门户访问 | `http://<宿主tailnet IP>:8899` | 同左 |
+
+> **Windows 上容器化部署的 `DOCKER_ENDPOINT` 不能用 `npipe://`**。
+> Docker Desktop 会把 Windows named pipe **转发**成容器内的 `/var/run/docker.sock`，
+> 在容器里写 `npipe://` 会报 `ENOENT`。
+> `npipe:////./pipe/dockerDesktopLinuxEngine` 只适用于**在 Windows 上原生运行 Node** 的开发场景。
+>
+> **需要 Windows 宿主真实 CPU/内存/GPU 指标时，请原生运行门户**（`node server/dist/index.js`），
+> 实测可拿到 20 线程 / 31.63 GB 与 `nvidia-smi`。原因详见 `08-operations.md` §2。
 
 ## 8. 相关文档
 

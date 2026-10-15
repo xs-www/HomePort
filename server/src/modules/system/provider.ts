@@ -482,11 +482,21 @@ export function describeStatfsError(error: unknown, mount: MountConfig): string 
   return `读取 ${mount.statPath} 失败：${error instanceof Error ? error.message : String(error)}`;
 }
 
-/** 由 statfs 的 `type` 魔数粗判文件系统名（仅用于展示）。 */
+/**
+ * 由 statfs 的 `type` 魔数粗判文件系统名（仅用于展示）。
+ *
+ * 魔数常量来自各内核的 `include/uapi/linux/magic.h`。
+ * `9p` 与 `virtiofs` 是 WSL2 / Docker Desktop 访问 Windows 盘时的实际类型
+ * （实测：挂载 `C:/` 后 statfs 报 `0x01021997`，`df -T` 显示 `9p`）。
+ */
 export function describeFsType(type: number | undefined): string | null {
   if (type === undefined) return null;
   const known: Record<number, string> = {
     0x01021994: 'tmpfs',
+    0x01021997: '9p', // WSL2 / DrvFs：Windows 盘挂进 Linux 时的类型
+    0x65735546: 'fuse',
+    0x65735543: 'fusectl',
+    0x794c7630: 'overlayfs',
     0x58465342: 'xfs',
     0x9123683e: 'btrfs',
     0xef53: 'ext4',
@@ -495,6 +505,14 @@ export function describeFsType(type: number | undefined): string | null {
     0x4d44: 'fat',
     0x5346544e: 'ntfs',
     0x2fc12fc1: 'zfs',
+    0xde5e81e4: 'vfat',
+    0x1cd1: 'devpts',
+    0xf97cff8c: 'selinux',
+    0x6e736673: 'nsfs',
+    0x62656572: 'sysfs',
+    0x9fa0: 'proc',
+    0x01021996: 'hugetlbfs',
+    0x958458f6: 'virtiofs',
   };
   return known[type] ?? `0x${type.toString(16)}`;
 }
