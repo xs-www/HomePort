@@ -157,5 +157,5 @@
 
 - 容器 `homepage-portal` 已构建并运行，`Up (healthy)`，映射 `0.0.0.0:8899->8899`
 - 数据卷 `homepage-data` 持久化，重建容器后 admin 账号与偏好保留
-- 登录账号：`admin` / `PortalAdmin2026!`（**建议登录后立即修改**）
+- 登录账号：`admin` / `********`（**建议登录后立即修改**）
 - 访问地址：`http://100.72.255.29:8899`（tailnet）或 `http://localhost:8899`

@@ -180,27 +180,69 @@ PORTAL_TAILSCALE_BIN=/usr/local/bin/tailscale
 > 不要为了这个需求去折腾 WSL 内安装 NVIDIA 驱动 —— WSL 的 GPU 支持由 Windows 驱动
 > 通过 `/usr/lib/wsl/lib` 提供，而该目录不会被 Docker Desktop 暴露给容器。
 
-## 5. 忘记密码怎么办
+## 5. 密码相关
 
-1. 若还有另一个 admin 账号：用它登录 → 「账号管理」→ 目标用户「重置密码」。
-2. 若唯一的 admin 密码丢了：
+### 先看清有哪些账号
+
+门户**不提供**"查看密码"功能 —— 数据库只存 bcrypt 哈希（不可逆），这是有意的安全设计。
+忘记密码只能重置，不能找回。先确认账号现状：
+
+```bash
+docker compose exec homepage node -e "
+const D=require('/app/node_modules/better-sqlite3');
+const db=new D('/data/portal.sqlite',{readonly:true});
+console.log(db.prepare('SELECT id,username,display_name,role,disabled,last_login_at FROM users ORDER BY id').all());
+"
+```
+
+### 重置密码
+
+1. **还有另一个 admin 账号**（推荐）：用它登录 → 「账号管理」→ 目标用户「重置密码」。
+   这会自动吊销该用户全部会话。
+2. **唯一的 admin 密码丢了**：在容器内直接改哈希。
+   把下面命令里的 `新密码` 与 `admin` 换成你要的：
+
    ```bash
    docker compose exec homepage node -e "
      const D=require('/app/node_modules/better-sqlite3');
      const b=require('/app/node_modules/bcryptjs');
      const db=new D('/data/portal.sqlite');
-     const hash=b.hashSync('TempReset2026!', 12);
-     db.prepare('UPDATE users SET password_hash=? WHERE username=?').run(hash,'admin');
-     db.prepare('UPDATE sessions SET revoked_at=? WHERE revoked_at IS NULL').run(new Date().toISOString());
-     console.log('已重置 admin 密码为 TempReset2026!，请立即登录后修改');
+     const hash=b.hashSync('新密码', 12);
+     const n=db.prepare('UPDATE users SET password_hash=?, updated_at=? WHERE username=?')
+                .run(hash, new Date().toISOString(), 'admin').changes;
+     const revoked=db.prepare('UPDATE sessions SET revoked_at=? WHERE revoked_at IS NULL')
+                .run(new Date().toISOString()).changes;
+     console.log('已更新账号数:', n, '| 已吊销会话数:', revoked);
    "
    ```
-3. 全部账号都不可用时，删除数据卷重新初始化（**会丢失全部账号与审计**）：
-   ```bash
-   docker compose down
-   docker volume rm homepage-data
-   docker compose up -d
-   ```
+
+   注意：密码仍需满足策略（≥10 位、至少两类字符），但直接改库**不会**校验 ——
+   写进去什么就是什么，所以请自觉用强口令。
+
+3. **登录成功后立即自查**：右上角 → 「账号管理」→「安全与偏好」可自助改密，
+   改密后除当前会话外的其它会话都会失效。
+
+### 首启令牌在哪里（与登录密码无关）
+
+首次启动时用于创建管理员的那个令牌，和登录密码是两回事：
+
+- `docker compose logs homepage | grep 初始化令牌`
+- 容器内文件 `/data/setup-token.txt`
+- 或部署时由 `PORTAL_SETUP_TOKEN` 环境变量指定
+
+系统初始化完成后该令牌即失效（再调用 `/api/auth/bootstrap` 会返回 `ALREADY_INITIALIZED`），
+可以留着备查或删除。
+
+### 全部账号都不可用
+
+删除数据卷重新初始化（**会丢失全部账号与审计日志**）：
+
+```bash
+docker compose down
+docker volume rm homepage-data
+docker compose up -d
+# 然后从日志重新取首启令牌
+```
 
 ## 6. 排障
 
