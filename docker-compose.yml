@@ -1,0 +1,114 @@
+# ==============================================================================
+# HomePage 门户 — 一键启动
+#
+#   docker compose up -d --build
+#
+# 设计原则：**同一份 compose 在 Windows（Docker Desktop）与 NAS（Linux）上都能跑**，
+# 平台差异全部通过 `.env` 变量表达（见 .env.example 的「部署矩阵」）。
+#
+# 首次启动后从日志取初始化令牌：
+#   docker compose logs homepage | Select-String "初始化令牌"     # Windows
+#   docker compose logs homepage | grep 初始化令牌                 # Linux/NAS
+# ==============================================================================
+
+services:
+  homepage:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: homepage-portal:local
+    container_name: homepage-portal
+    restart: unless-stopped
+
+    ports:
+      # 绑定地址：默认 0.0.0.0（tailnet + 局域网均可访问）；
+      # 只想经 tailnet 访问时改成宿主 tailnet IP，如 100.72.255.29:8899:8899
+      - "${PORTAL_BIND_ADDR:-0.0.0.0}:${PORTAL_HOST_PORT:-8899}:8899"
+
+    environment:
+      NODE_ENV: production
+      PORTAL_PORT: "8899"
+      PORTAL_HOST: "0.0.0.0"
+      PORTAL_DATA_DIR: /data
+      PORTAL_LOG_LEVEL: "${PORTAL_LOG_LEVEL:-info}"
+      # 门户对外的公开主机名（MagicDNS 名或 tailnet IP）。
+      # 留空时按访问者请求头推导，通常无需设置。
+      PORTAL_PUBLIC_HOST: "${PORTAL_PUBLIC_HOST:-}"
+      # 部署在 HTTPS 反代之后时置 1，会话 Cookie 会带上 Secure
+      PORTAL_SECURE_COOKIES: "${PORTAL_SECURE_COOKIES:-0}"
+      # 首启令牌：留空则自动生成并写入 /data/setup-token.txt，同时打印到日志
+      PORTAL_SETUP_TOKEN: "${PORTAL_SETUP_TOKEN:-}"
+
+      # ---- Docker 数据源（只读）
+      # Docker Desktop on Windows 必须用 named pipe；Linux/NAS 用 unix socket
+      DOCKER_ENDPOINT: "${DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
+
+      # ---- tailnet 数据源
+      # auto：有 API Token 就用 API，否则用 CLI
+      PORTAL_TAILSCALE_MODE: "${PORTAL_TAILSCALE_MODE:-auto}"
+      PORTAL_TAILSCALE_BIN: "${PORTAL_TAILSCALE_BIN:-/usr/local/bin/tailscale}"
+      PORTAL_TAILSCALE_SOCKET: "${PORTAL_TAILSCALE_SOCKET:-/var/run/tailscale/tailscaled.sock}"
+      PORTAL_TAILSCALE_API_TOKEN: "${PORTAL_TAILSCALE_API_TOKEN:-}"
+
+      # ---- 宿主 /proc（Linux 宿主必挂；Windows 上可忽略，见注释）
+      PORTAL_HOST_PROC: "${PORTAL_HOST_PROC:-/host/proc}"
+
+      # ---- 磁盘挂载点（宿主路径=容器内路径[|标签|statfs 路径]）
+      # Linux/NAS 示例： /volume1=/host/volume1, /volume2=/host/volume2
+      # Windows 示例：   C:=/host/disk/C
+      PORTAL_DISK_MOUNTS: "${PORTAL_DISK_MOUNTS:-}"
+
+      # ---- GPU
+      PORTAL_NVIDIA_SMI: "${PORTAL_NVIDIA_SMI:-/usr/local/bin/nvidia-smi}"
+      PORTAL_NVIDIA_LD_LIBRARY_PATH: "${PORTAL_NVIDIA_LD_LIBRARY_PATH:-}"
+
+      # ---- 工具目录
+      PORTAL_TOOLS_FILE: "${PORTAL_TOOLS_FILE:-}"
+      PORTAL_TOOLS_EXTRA: "${PORTAL_TOOLS_EXTRA:-}"
+      PORTAL_TOOLS_PROBE_TTL_MS: "${PORTAL_TOOLS_PROBE_TTL_MS:-10000}"
+
+      # ---- 指标与缓存
+      PORTAL_METRICS_INTERVAL_MS: "${PORTAL_METRICS_INTERVAL_MS:-3000}"
+      PORTAL_SESSION_TTL_HOURS: "${PORTAL_SESSION_TTL_HOURS:-12}"
+
+      TZ: "${TZ:-Asia/Shanghai}"
+
+    volumes:
+      # 门户数据（SQLite + 首启令牌）—— 必须持久化，否则每次重建都要重新初始化
+      - homepage-data:/data
+      # Docker 引擎（只读）。Windows 上若下面那行报错，改用：
+      #   - //var/run/docker.sock:/var/run/docker.sock
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      # 前端可选的挂载（用不到的会被忽略）
+      # - /proc:/host/proc:ro                      # Linux/NAS：宿主真实 CPU/内存
+      # - /volume1:/host/volume1:ro                # NAS：磁盘占用
+      # - /usr/bin/tailscale:/usr/local/bin/tailscale:ro
+      # - /var/run/tailscale:/var/run/tailscale:ro
+      # - C:\Windows\System32\nvidia-smi.exe:/usr/local/bin/nvidia-smi:ro   # 见 README 的 GPU 说明
+
+    # NAS 上 Docker 组 ID 常为 998/100/0，出现 EACCES 时在 .env 里设置
+    # DOCKER_GID=998
+    group_add:
+      - "${DOCKER_GID:-0}"
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8899/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # 日志轮转，避免长期运行撑爆 NAS 磁盘
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  homepage-data:
+    name: homepage-data

@@ -1,0 +1,168 @@
+@import 'tailwindcss';
+
+/* 暗色模式由 <html class="dark"> 控制（ThemeProvider 负责切换） */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-ink-950: #07090f;
+  --color-ink-900: #0b0f18;
+  --color-ink-850: #101623;
+  --color-ink-800: #151d2e;
+  --color-ink-700: #1e2839;
+  --color-ink-600: #2a3648;
+  --color-ink-400: #64748b;
+  --color-ink-300: #94a3b8;
+  --color-ink-200: #cbd5e1;
+  --color-brand-400: #38bdf8;
+  --color-brand-500: #0ea5e9;
+  --color-brand-600: #0284c7;
+  --font-sans: 'Inter', 'Segoe UI', 'Microsoft YaHei', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+}
+
+@layer base {
+  html {
+    scrollbar-color: var(--color-ink-600) transparent;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    background-color: #f4f6fb;
+    color: #0f172a;
+  }
+
+  .dark body {
+    background-color: var(--color-ink-950);
+    color: var(--color-ink-200);
+    background-image:
+      radial-gradient(1100px 520px at 12% -8%, rgba(14, 165, 233, 0.16), transparent 60%),
+      radial-gradient(900px 460px at 100% 0%, rgba(56, 189, 248, 0.09), transparent 55%);
+    background-attachment: fixed;
+  }
+
+  *:focus-visible {
+    outline: 2px solid var(--color-brand-400);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}
+
+@layer components {
+  /* 玻璃拟态卡片：暗色下用于主要信息容器 */
+  .card {
+    @apply rounded-2xl border border-slate-200/80 bg-white/90 shadow-sm backdrop-blur;
+  }
+
+  .dark .card {
+    @apply border-white/8 bg-white/4 shadow-none;
+  }
+
+  .card-hover {
+    @apply transition duration-150 hover:border-brand-400/50 hover:shadow-md;
+  }
+
+  .dark .card-hover:hover {
+    @apply border-brand-400/40 bg-white/6;
+  }
+
+  .btn {
+    @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl px-3.5 py-2 text-sm font-medium transition
+      disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-primary {
+    @apply bg-brand-600 text-white hover:bg-brand-500 active:bg-brand-600;
+  }
+
+  .btn-ghost {
+    @apply border border-slate-300 bg-white text-slate-700 hover:bg-slate-100;
+  }
+
+  .dark .btn-ghost {
+    @apply border-white/12 bg-white/5 text-ink-200 hover:bg-white/10;
+  }
+
+  .btn-danger {
+    @apply border border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100;
+  }
+
+  .dark .btn-danger {
+    @apply border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20;
+  }
+
+  .input {
+    @apply w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900
+      placeholder:text-slate-400 focus:border-brand-500 focus:outline-none;
+  }
+
+  .dark .input {
+    @apply border-white/12 bg-ink-900/70 text-ink-200 placeholder:text-ink-400;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-medium tracking-wide text-slate-600;
+  }
+
+  .dark .label {
+    @apply text-ink-300;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium whitespace-nowrap;
+  }
+
+  .muted {
+    @apply text-slate-500;
+  }
+
+  .dark .muted {
+    @apply text-ink-400;
+  }
+
+  /* 细滚动条 */
+  .scroll-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background: color-mix(in oklab, var(--color-ink-600) 70%, transparent);
+    border-radius: 9999px;
+  }
+  .scroll-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@keyframes hp-pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(16, 185, 129, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+  }
+}
+
+.pulse-online {
+  animation: hp-pulse-ring 2.4s infinite;
+}
+
+@keyframes hp-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.fade-in {
+  animation: hp-fade-in 0.18s ease-out both;
+}

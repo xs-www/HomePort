@@ -1,0 +1,22 @@
+node_modules/
+dist/
+build/
+coverage/
+*.log
+npm-debug.log*
+.env
+.env.local
+data/
+# 本地开发/冒烟测试产生的数据目录（含 SQLite 与首启令牌）
+.devdata/
+.devdata*/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.tsbuildinfo

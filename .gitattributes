@@ -1,0 +1,20 @@
+# 统一换行符处理，避免 Windows / Linux 协作出噪声 diff
+#
+# - 源码与文档一律以 LF 存入仓库，工作区在 Windows 上检出为 CRLF
+# - shell 脚本与 Dockerfile 必须是 LF（否则容器内执行失败）
+* text=auto eol=lf
+
+*.sh    text eol=lf
+Dockerfile text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# 二进制文件不做转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.sqlite binary
