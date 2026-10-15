@@ -606,3 +606,133 @@ PowerShell 5.1 按 ANSI（GBK）解码了 UTF-8 文件，导致**中文全部变
    当前单机场景风险可忽略，已记入 todo。
 4. `restart` 级项在界面上是只读的，但**没有**提供"一键生成新 compose"之类的能力，
    仍需手工编辑 `docker-compose.yml`。
+
+---
+
+## [2026-10-16] 支持 `tailscale serve` 路由（修复 F1 的判定盲区）
+
+### 背景
+
+用户反馈：HomePage 看不到 `tailscale serve` 暴露的路由，而 TsController 能看到。
+用户提供了 serve 路由截图，`/calendar`、`/worldforge`、`/salecapitai`、`/dsh` 等
+都不在门户的容器墙里。
+
+### 根因（两层）
+
+1. **判定模型有盲区**：门户只按 Docker 的宿主端口绑定判定可达性。
+   但 `tailscale serve` 能把**只绑在宿主 `127.0.0.1` 的服务**以路径形式暴露到 tailnet。
+   实测确认这正是用户的场景：
+   - `sisi-calendar` 的宿主端口 `443` 绑的是 `127.0.0.1` → 门户判为"仅本机、无入口"
+   - 但经 serve 它其实在 `https://host.tailnet.ts.net/calendar` **tailnet 可达**
+   - `/dsh → 3081` 更是宿主服务，完全没有对应的已发布容器端口
+
+   也就是说：**只看端口映射会把一整类可达服务判成不可达**，这是功能性缺陷，
+   不是显示问题。
+
+2. **`withSocket()` 参数位置错误**（潜在 bug）：`--socket` 是 tailscale 的**全局** flag，
+   必须放在子命令**之前**。原实现追加在之后，会报
+   `flag provided but not defined: -socket`。
+   Windows 用默认 socket 路径所以没暴露；但 **Linux/NAS 上显式配置 socket 是常规做法**，
+   这个 bug 会在最终部署目标上直接让 tailnet 查询失效。
+
+### 用户选择的范围
+
+用户明确选择：**只做 Linux/NAS 主线**，Windows 先不管（后续可选让 TsController 暴露接口）。
+本实现据此设计 —— Windows 上会如实报告不可用原因，而不是静默为空。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 新增 | `server/src/modules/tailscale/serveProvider.ts` | `ServeProvider` + `parseServeStatus` 等纯函数 |
+| 新增 | `server/tests/serve.test.ts` | 15 个单测（含真实 serve 输出的快照） |
+| 修改 | `server/src/modules/tailscale/provider.ts` | **修复** `withSocket()` 的参数位置 |
+| 修改 | `server/src/modules/docker/types.ts` | `ServeRouteView` / `ServeStatusView`；`ContainerSummary` 增加 `servePaths` / `servedUrl` |
+| 修改 | `server/src/modules/docker/service.ts` | 接入 `ServeRoutesProvider`；`buildServeView()` / `attachServePaths()` |
+| 修改 | `server/src/app.ts` | 装配 `ServeProvider` 并注入 `ContainerService` |
+| 修改 | `web/src/api/types.ts` | 对应类型 |
+| 修改 | `web/src/pages/ContainersPage.tsx` | `ServeRoutesCard` + 容器卡 serve 标记与入口 |
+| 修改 | `server/tests/modules.test.ts` | 把旧测试里编码了错误顺序的断言改为正确顺序 |
+| 修改 | `docs/static/{01,02,03,04,09}.md`、`README.md` | 文档回归 |
+
+### 逐项明细
+
+#### 新增：`server/src/modules/tailscale/serveProvider.ts`
+
+- `parseServeStatus(json, allowHosts)` — 把
+  `Web["<host>:<port>"].Handlers["<path>"] = { Proxy }` 展开为**每个路径一条路由**。
+  **刻意不按端口合并**：同一端口常挂多个路径（`/`、`/calendar`、`/calendar.ics` 都在 443），
+  按端口合并会丢掉路径信息。
+- `parseHostPort` / `parseProxyTarget` / `normalizePath` — 解析小工具，
+  兼容 IPv6 方括号、缺省端口按协议补全。
+- `describeServeFailure(result, bin)` — 把命令失败翻译为可操作原因；成功返回 `null`。
+- `ServeProvider` — `cliAvailable` getter 与 `fetchRoutes(allowHosts)`。
+  与设备查询分开实现，因为**可用性不一致**（Windows 上设备可走 API，serve 只有 CLI 能读），
+  分开才能给出准确原因。
+
+#### 修改：`server/src/modules/docker/service.ts`
+
+新增 `buildServeView()` 与 `attachServePaths()`：
+
+| 处理 | 目的 |
+| --- | --- |
+| 用 `allowHosts` 限定本机 tailnet 名 | 排除别的节点或历史残留路由 |
+| 按目标端口匹配回容器 | 让 UI 显示"这条 serve 指向哪个容器" |
+| 计算 `coveredByContainerPort` | 目标端口已作为可达端口展示过时不重复列独立入口，改为在容器卡打标记 |
+| 写回 `servePaths` / `servedUrl` | 容器卡展示 serve 标记与首选入口 |
+
+`ServeRoutesProvider` 通过接口注入（而非直接 import），避免 `docker → tailscale` 模块环 ——
+与既有的 `HostInfoProvider` 同一手法。
+
+#### 修改：`server/src/modules/tailscale/provider.ts`
+
+`withSocket()` 由**追加**改为**前插**：
+
+```diff
+- return [...args, '--socket', socket];
++ return ['--socket', socket, ...args];
+```
+
+### 接口影响
+
+`GET /api/containers` 新增 `serve` 字段与 `items[].servePaths` / `items[].servedUrl`。
+契约见 `04-api-contract.md` §3。**向后兼容**：只是新增字段。
+
+### 验证方式
+
+```bash
+npm test                      # 179 passed (5 files)，新增 15 个 serve 单测
+
+# 单元层面：用实测抓取的真实 serve 输出做快照
+#   —— 8 条路由、443 省略端口 / 8443 保留、同端口多路径不合并、
+#      主机过滤、无 Proxy 的 Text handler 跳过、非法 key 跳过
+
+# 端到端（在容器内用假 tailscale 二进制喂真实 JSON）
+docker compose exec homepage node /tmp/serve-e2e.mjs
+# → available=true, routes=8
+#   归属匹配与去重判定：
+#     /                owner=homepage-portal   covered=true
+#     /salecapitai     owner=cs22-web          covered=true
+#     /worldforge      owner=worldforge        covered=true
+#     /calendar        owner=sisi-calendar     covered=false  ← 独立入口（关键修复）
+#     /calendar.ics    owner=sisi-calendar     covered=false
+#     /api/addSchedule owner=sisi-calendar     covered=false
+#     /dsh             owner=宿主服务            covered=false
+#     / (8443)         owner=homepage-portal   covered=true
+
+# Windows 上的预期行为（如实报告而非静默为空）
+curl /api/containers | jq .serve
+# → available=false, mode=api,
+#   detail="serve 配置是节点本地状态，Tailscale REST API 不提供。需要读取 serve 路由请改用 CLI 模式（挂载宿主 tailscale 与 tailscaled.sock）"
+```
+
+### 已知限制 / 后续
+
+1. **Windows 容器化下读不到 serve 路由**（用户已确认先不处理）。
+   可选方案：让 TsController 暴露一个本地 HTTP 接口，门户作为 host-agent 读取。
+   接口设计已预留（`ServeRoutesProvider` 是注入的，换实现即可）。
+2. **funnel（公网暴露）与 serve 无法区分**：在 1.102.4 上 `serve status --json` 与
+   `funnel status --json` 输出相同，因此 `ServeRoute.funnel` 恒为 `false`。
+   如需区分要另行调用 `tailscale funnel status`。
+3. serve 的 `Text` handler（静态文案）不生成入口，会被跳过。
+4. 未实现 `tailscale serve` 的**写操作**（配置/取消路径）—— 与"只读展示"的产品边界一致。

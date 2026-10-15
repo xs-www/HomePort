@@ -320,6 +320,8 @@ describe('docker/service · 容器映射', () => {
       ports: [],
       urlCandidates: [],
       tailscaleSidecar: false,
+      servePaths: [],
+      servedUrl: null,
       stats: null,
     };
     const summary = summarize([
@@ -487,9 +489,19 @@ describe('tailscale/provider · 设备映射', () => {
     expect(status.source.mode).toBe('api');
   });
 
-  it('自定义 socket 时才追加 --socket 参数', () => {
+  it('自定义 socket 时把 --socket 插到子命令之前（全局 flag）', () => {
+    // 默认路径 → 不插入参数
     expect(withSocket(['status', '--json'], '/var/run/tailscale/tailscaled.sock')).toEqual(['status', '--json']);
-    expect(withSocket(['status', '--json'], '/custom.sock')).toEqual(['status', '--json', '--socket', '/custom.sock']);
+    // 非默认路径 → --socket 必须在子命令**之前**，否则 tailscale 报
+    // "flag provided but not defined: -socket"（实测确认）
+    expect(withSocket(['status', '--json'], '/custom.sock')).toEqual(['--socket', '/custom.sock', 'status', '--json']);
+    expect(withSocket(['serve', 'status', '--json'], '/custom.sock')).toEqual([
+      '--socket',
+      '/custom.sock',
+      'serve',
+      'status',
+      '--json',
+    ]);
   });
 });
 

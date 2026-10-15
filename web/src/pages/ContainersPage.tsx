@@ -13,7 +13,7 @@ import { useAsync } from '../hooks/useAsync.js';
 import { Shell } from '../layout/Shell.js';
 import { useLocalState } from '../hooks/useAsync.js';
 import { describeContainerState, describeHealth, describeReachability, truncate } from '../lib/format.js';
-import type { ContainerSummary, Reachability } from '../api/types.js';
+import type { ContainerSummary, Reachability, ServeRouteView, ServeStatusView } from '../api/types.js';
 
 type ReachabilityFilter = Reachability | 'all';
 
@@ -123,6 +123,9 @@ export function ContainersPage(): ReactNode {
         </Card>
       ) : null}
 
+      {/* tailscale serve 路由：这类服务可能完全没有发布宿主端口 */}
+      {data?.serve ? <ServeRoutesCard serve={data.serve} /> : null}
+
       {loading && !data ? (
         <Card>
           <Skeleton rows={5} />
@@ -155,6 +158,7 @@ function ContainerCard({ container }: { container: ContainerSummary }): ReactNod
   const reach = describeReachability(container.reachability);
   const reachablePorts = container.ports.filter((port) => port.url !== null);
   const localhostPorts = container.ports.filter((port) => port.reachability === 'localhost-only' || port.note !== null);
+  const hasServe = container.servePaths.length > 0;
 
   return (
     <article className="card card-hover flex flex-col px-4 py-4">
@@ -192,6 +196,11 @@ function ContainerCard({ container }: { container: ContainerSummary }): ReactNod
           </Badge>
         ) : null}
         {container.tailscaleSidecar ? <Badge tone="brand">tailscale</Badge> : null}
+        {hasServe ? (
+          <Badge tone="brand" title={`经 tailscale serve 暴露：${container.servePaths.join('、')}`}>
+            serve {container.servePaths.join(' ')}
+          </Badge>
+        ) : null}
       </div>
 
       {/* 可选占用 */}
@@ -214,6 +223,22 @@ function ContainerCard({ container }: { container: ContainerSummary }): ReactNod
 
       {/* 入口 */}
       <div className="mt-3 flex-1 space-y-1.5">
+        {hasServe && container.servedUrl ? (
+          <a
+            href={container.servedUrl}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="flex items-center justify-between gap-2 rounded-xl bg-sky-500/15 px-3 py-2 text-xs ring-1 ring-sky-500/30 transition hover:bg-sky-500/25"
+            title={container.servedUrl}
+          >
+            <span className="min-w-0 truncate">
+              <span className="muted mr-1.5">tailnet</span>
+              <span className="font-mono">{container.servedUrl}</span>
+            </span>
+            <Icon name="external" className="size-3.5 shrink-0 opacity-60" />
+          </a>
+        ) : null}
+
         {reachablePorts.length > 0 ? (
           reachablePorts.slice(0, 3).map((port) => (
             <a
@@ -247,10 +272,144 @@ function ContainerCard({ container }: { container: ContainerSummary }): ReactNod
       {/* 底部信息 */}
       <footer className="mt-3 flex items-center justify-between border-t border-slate-200/70 pt-2.5 dark:border-white/6">
         <span className="muted font-mono text-[10px]">{container.shortId}</span>
-        <Link to={`/containers/${encodeURIComponent(container.name)}`} className="text-[11px] text-sky-600 hover:underline dark:text-sky-400">
+        <Link
+          to={`/containers/${encodeURIComponent(container.name)}`}
+          className="text-[11px] text-sky-600 hover:underline dark:text-sky-400"
+        >
           详情与日志 →
         </Link>
       </footer>
     </article>
+  );
+}
+
+/**
+ * `tailscale serve` 路由卡片。
+ *
+ * 为什么需要独立卡片：serve 是个**路径级**反向代理，多个路径常常指向同一个
+ * 宿主端口（例如 `/`、`/calendar`、`/calendar.ics` 都在 443）。按"宿主端口"展示
+ * 会把它们压成一条，丢掉路径信息；这里按「主机:端口」分组、逐路径列出。
+ *
+ * 与容器卡片的去重规则：若某条 serve 的目标端口已经作为可达端口出现在容器卡上
+ * （例如 worldforge 的 4173 已发布到宿主），就不再重复列为"独立入口"，
+ * 但仍会在 `covered` 分组里展示，保证信息完整。
+ */
+function ServeRoutesCard({ serve }: { serve: ServeStatusView }): ReactNode {
+  const independent = serve.routes.filter((route) => !route.coveredByContainerPort);
+
+  // 按 主机:端口 分组
+  const groups = useMemo(() => {
+    const map = new Map<string, ServeRouteView[]>();
+    for (const route of serve.routes) {
+      const key = `${route.host}:${route.port}`;
+      const list = map.get(key) ?? [];
+      list.push(route);
+      map.set(key, list);
+    }
+    return [...map.entries()];
+  }, [serve.routes]);
+
+  const title = 'tailnet 路由（tailscale serve）';
+
+  if (!serve.available) {
+    return (
+      <Card title={title} subtitle="读取不到 serve 配置 —— 这类服务没有发布宿主端口，因此不会出现在按端口判定的容器墙里">
+        <p className="muted text-xs leading-relaxed">{serve.detail}</p>
+        <div className="muted mt-2 text-[11px] leading-relaxed">
+          <p>
+            读取 serve 路由需要容器内能执行 <code className="font-mono">tailscale serve status</code>：
+          </p>
+          <p className="mt-1">
+            · <strong>Linux / NAS</strong>：在 compose 里挂载宿主的{' '}
+            <code className="font-mono">tailscale</code> 与{' '}
+            <code className="font-mono">/var/run/tailscale</code>，并把{' '}
+            <code className="font-mono">PORTAL_TAILSCALE_MODE</code> 设为 <code className="font-mono">cli</code> 或{' '}
+            <code className="font-mono">auto</code>。
+          </p>
+          <p className="mt-1">
+            · <strong>Windows（容器化）</strong>：暂不支持 —— 容器是 Linux 环境，无法执行{' '}
+            <code className="font-mono">tailscale.exe</code>，且 Windows 的 tailscaled 走 named pipe。
+            Tailscale 的 REST API 也不提供 serve 配置。
+          </p>
+        </div>
+      </Card>
+    );
+  }
+
+  if (serve.routes.length === 0) {
+    return (
+      <Card title={title}>
+        <EmptyState
+          title="当前没有 serve 路由"
+          description="用 tailscale serve 把本机服务挂到 tailnet 域名后，这里会列出路径映射"
+          icon={<Icon name="devices" className="size-7" />}
+        />
+      </Card>
+    );
+  }
+
+  return (
+    <Card
+      title={title}
+      subtitle={`共 ${serve.routes.length} 条路径映射 · 独立入口 ${independent.length} 条 · 与容器端口重复 ${serve.routes.length - independent.length} 条`}
+    >
+      <div className="space-y-4">
+        {groups.map(([hostPort, routes]) => (
+          <div key={hostPort}>
+            <p className="mb-2 font-mono text-xs font-medium">{hostPort}</p>
+            <ul className="space-y-1.5">
+              {routes.map((route) => (
+                <li
+                  key={`${route.host}:${route.port}${route.path}`}
+                  className={`flex flex-wrap items-center justify-between gap-2 rounded-xl px-3 py-2 text-xs ring-1 ${
+                    route.coveredByContainerPort
+                      ? 'bg-slate-500/6 ring-slate-400/15'
+                      : 'bg-sky-500/8 ring-sky-500/20'
+                  }`}
+                >
+                  <span className="flex min-w-0 flex-wrap items-center gap-2">
+                    <a
+                      href={route.url}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      className="flex min-w-0 items-center gap-1.5 hover:text-sky-500"
+                      title={route.url}
+                    >
+                      <span className="font-mono font-medium">{route.path}</span>
+                      <Icon name="external" className="size-3 shrink-0 opacity-60" />
+                    </a>
+                    <span className="muted font-mono text-[10px]">→ {route.proxy}</span>
+                  </span>
+                  <span className="flex shrink-0 flex-wrap items-center gap-1.5">
+                    {route.containerName ? (
+                      <Link to={`/containers/${encodeURIComponent(route.containerName)}`}>
+                        <Badge tone="idle" title="该 serve 路由指向的容器">
+                          {route.containerName}
+                        </Badge>
+                      </Link>
+                    ) : (
+                      <Badge tone="idle" title="目标是宿主上的服务，不属于任何容器">
+                        宿主服务
+                      </Badge>
+                    )}
+                    {route.coveredByContainerPort ? (
+                      <Badge tone="idle" title="该端口已作为可达端口显示在容器卡上，此处仅作完整记录">
+                        与容器端口重复
+                      </Badge>
+                    ) : null}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+
+      <p className="muted mt-3 text-[11px] leading-relaxed">
+        serve 路由本身就是"已暴露到 tailnet"的声明，因此这里列出的入口在 tailnet 内可直接打开。
+        没有发布宿主端口的服务（如只在宿主 <code className="font-mono">127.0.0.1</code> 上监听的服务）
+        只能通过这种方式访问。
+      </p>
+    </Card>
   );
 }

@@ -119,7 +119,18 @@
 | 网络 | 不需要外网 | 需要访问 `api.tailscale.com` |
 | 数据新鲜度 | 与宿主一致，延迟低 | 有云端延迟（数十秒） |
 | 中转信息 | 有 `Relay` / `CurAddr`（可判直连/中继） | 无 |
+| **`tailscale serve` 路由** | ✅ 可读 | ❌ **读不到**（serve 是节点本地状态，REST API 不提供） |
 | 适用 | NAS 上已装 Tailscale | 无法挂载宿主二进制、或想统一走云端 |
+
+> **选模式的关键区别**：如果你用 `tailscale serve` 把服务以路径形式暴露到 tailnet
+> （例如把只绑 `127.0.0.1` 的服务挂到 `/calendar`），**必须用 CLI 模式**才能在门户里
+> 看到这些路由。API 模式只能查设备状态，看不到 serve 配置。
+> 见 `01-architecture.md` §5.1。
+
+> **`--socket` 参数位置**：`PORTAL_TAILSCALE_SOCKET` 非默认值时，门户会把
+> `--socket <path>` 插在**子命令之前**（`tailscale --socket X status --json`）。
+> 这是 tailscale 的全局 flag，放在子命令之后会报
+> `flag provided but not defined: -socket`。
 
 ## 5. 系统指标（F3）
 

@@ -231,10 +231,20 @@ export function unavailableStatus(mode: string, detail: string): TailnetStatus {
   };
 }
 
-/** 追加 `--socket` 参数（若配置了非默认 socket）。 */
+/**
+ * 若配置了非默认 socket，则插入**全局** `--socket` 参数。
+ *
+ * ⚠ 位置很重要：`--socket` 是 tailscale 的**全局** flag，必须放在**子命令之前**
+ * （`tailscale --socket X status --json`）。放在后面会报
+ * `flag provided but not defined: -socket`。
+ * 在 Linux/NAS 上显式配置 socket 路径是常规做法，因此这个顺序不能错。
+ *
+ * @param args 子命令及参数，如 `['status', '--json']`
+ * @param socket tailscaled socket 路径
+ */
 export function withSocket(args: readonly string[], socket: string): string[] {
   if (!socket || socket === '/var/run/tailscale/tailscaled.sock') return [...args];
-  return [...args, '--socket', socket];
+  return ['--socket', socket, ...args];
 }
 
 /** CLI 数据源。 */

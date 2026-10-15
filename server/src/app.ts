@@ -28,6 +28,7 @@ import { SettingsService } from './modules/settings/service.js';
 import { SystemProvider } from './modules/system/provider.js';
 import { SystemService } from './modules/system/service.js';
 import { selectTailscaleProvider } from './modules/tailscale/provider.js';
+import { ServeProvider } from './modules/tailscale/serveProvider.js';
 import { defaultCommandRunner, TailscaleService } from './modules/tailscale/service.js';
 import { ToolsService } from './modules/tools/service.js';
 import { UsersService } from './modules/users/service.js';
@@ -92,10 +93,20 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
   const tailscaleProvider = await selectTailscaleProvider(config, logger, defaultCommandRunner);
   const tailscale = new TailscaleService({ provider: tailscaleProvider, config, logger });
 
+  // `tailscale serve` 路由：与设备查询独立，因为可用性不一致
+  // （Windows 上设备查询可走 API，但 serve 配置只有 CLI 能读）
+  const serveRoutes = new ServeProvider({ config, logger });
+
   const dockerProvider = new DockerProvider({ config, logger });
   // 让 provider 跟随可变的 config（includeStopped / statsTimeout 每次读取取最新值）
   dockerProvider.bindConfig(config);
-  const containers = new ContainerService({ provider: dockerProvider, hostInfo: tailscale, config, logger });
+  const containers = new ContainerService({
+    provider: dockerProvider,
+    hostInfo: tailscale,
+    serveRoutes,
+    config,
+    logger,
+  });
 
   const systemProvider = new SystemProvider({ config, logger });
   const system = new SystemService({ provider: systemProvider, config, logger });

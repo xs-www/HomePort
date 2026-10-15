@@ -153,14 +153,53 @@
       { "label": "magicdns", "url": "http://sisi-laptop.tail921448.ts.net:8080/" },
       { "label": "localhost", "url": "http://localhost:8080/" }
     ],
+    "tailscaleSidecar": false,
+    "servePaths": ["/salecapitai"],
+    "servedUrl": "https://sisi-laptop.tail921448.ts.net/salecapitai",
     "health": "healthy",
     "stats": { "cpuPercent": 0.4, "memUsedBytes": 1, "memLimitBytes": 2 }
   }],
   "total": 5,
   "summary": { "total": 5, "running": 5, "tailnetReachable": 2, "localhostOnly": 1, "stopped": 0 },
-  "source": { "available": true, "mode": "socket", "detail": null }
+  "source": { "available": true, "mode": "socket", "detail": null },
+  "serve": {
+    "available": true,
+    "mode": "cli",
+    "detail": null,
+    "routes": [{
+      "host": "sisi-laptop.tail921448.ts.net",
+      "port": 443,
+      "scheme": "https",
+      "path": "/calendar",
+      "url": "https://sisi-laptop.tail921448.ts.net/calendar",
+      "proxy": "http://127.0.0.1:443/calendar",
+      "targetHost": "127.0.0.1",
+      "targetPort": 443,
+      "containerName": "sisi-calendar",
+      "containerId": "f1e2d3...",
+      "coveredByContainerPort": false
+    }]
+  }
 }
 ```
+
+### `serve` 字段（`tailscale serve` 路由）
+
+**为什么需要它**：`tailscale serve` 是**路径级**反向代理，它能把**只绑定在宿主
+`127.0.0.1` 的服务**暴露到 tailnet。这类服务仅按 Docker 端口绑定判定会得到
+"仅本机、无入口"，但经 serve 实际是可达的 —— 只看端口映射会漏掉它们。
+
+| 字段 | 说明 |
+| --- | --- |
+| `serve.available` | 能否读到 serve 配置。**CLI 模式才有**：serve 是节点本地状态，Tailscale REST API 不提供 |
+| `serve.detail` | 不可用原因（含解决方式），非空时前端展示指引 |
+| `routes[].url` | 可直接点击的 tailnet 入口（HTTPS） |
+| `routes[].proxy` | serve 的代理目标（宿主视角），用于诊断 |
+| `routes[].containerName` | 该路由指向的容器（能按目标端口匹配到时）；`null` 表示目标是宿主服务 |
+| `routes[].coveredByContainerPort` | 该目标端口已作为可达端口出现在容器卡上。为 `true` 时前端**不重复**列为独立入口，仅在完整列表中标注 |
+| `items[].servePaths` | 该容器被 serve 暴露的路径，用于在容器卡上打 `serve` 标记 |
+| `items[].servedUrl` | 该容器经 serve 的入口 URL（卡片优先展示） |
+
 `stats` 仅在 `?stats=1` 时返回（`docker stats` 有额外开销，容器详情页单独取）。
 
 ### `GET /api/containers/:id`

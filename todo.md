@@ -17,6 +17,10 @@
 - [x] endpoint 解析：npipe / unix / tcp / http / https（含 named pipe 归一化）
 - [x] 容器列表（list + 有限并发 inspect，8 路并发）
 - [x] **tailnet 可达性判定**：按宿主端口绑定地址分类
+- [x] **`tailscale serve` 路由**：路径级反向代理单独成源，修复"只看端口映射会漏掉
+      只绑 127.0.0.1 但经 serve 暴露的服务"这个判定盲区（`serveProvider.ts`）
+- [x] **修复 `withSocket()` 参数位置**：`--socket` 是全局 flag，必须在子命令之前
+      （Linux/NAS 上显式配置 socket 时会直接失效）
 - [x] 入口 URL 生成：两层设计（缓存算可达性，响应阶段按访问者算 URL）
 - [x] 多候选入口（tailnet IP / MagicDNS / localhost）
 - [x] 容器详情：实时占用、端口表、挂载、脱敏环境变量、日志
@@ -100,6 +104,10 @@
       首次即成功，容器 `Up (healthy)`，五个数据源状态符合预期（2026-10-16）
 - [x] **工具探测目标主机 bug**：容器内 `localhost` 指向容器自己，导致 8 个工具全报不可用。
       已改为多目标链（对外主机 → `host.docker.internal` → `127.0.0.1`）并重新验证（2026-10-16）
+- [ ] **Windows 上读取 serve 路由**：容器化下读不到（无法执行 `tailscale.exe`，
+      tailscaled 走 named pipe，REST API 也不提供 serve 配置）。
+      可选方案：让 TsController 暴露本地 HTTP 接口，门户作为 host-agent 读取。
+      `ServeRoutesProvider` 是注入式接口，换实现即可，无需改容器模块
 - [ ] **arm64（NAS）镜像构建实测**：设计上应可成功（builder 阶段原生编译
       better-sqlite3），但尚未实跑
 - [ ] **Windows 宿主真实硬件指标**：容器化部署只能看到 WSL2 虚拟机资源。

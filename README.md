@@ -58,7 +58,11 @@ Windows 本机开发时设置 `DOCKER_ENDPOINT=npipe:////./pipe/dockerDesktopLin
 
 ## 判定"tailnet 可达"的逻辑
 
-这是 F1 的核心。门户读取每个容器在宿主上的**实际端口绑定地址**：
+这是 F1 的核心。门户有**两条通路**，只看第一条会漏掉一整类服务。
+
+### 通路一：容器发布的宿主端口
+
+门户读取每个容器在宿主上的**实际端口绑定地址**：
 
 | 绑定地址 | 判定 | 是否给可点击入口 |
 | --- | --- | --- |
@@ -67,6 +71,23 @@ Windows 本机开发时设置 `DOCKER_ENDPOINT=npipe:////./pipe/dockerDesktopLin
 | 宿主局域网 IP | 仅局域网 | ✅ 用该 IP |
 | `127.0.0.1` / `::1` | **仅本机** | ❌ 标注"需 SSH 隧道或改绑定地址" |
 | 未发布到宿主 | 无入口 | ❌ 标注"仅在容器网络内可见" |
+
+### 通路二：`tailscale serve` 路由（路径级）
+
+`tailscale serve` 能把**只绑在宿主 `127.0.0.1` 的服务**以路径形式暴露到 tailnet：
+
+```
+tailscale serve --bg --https=443 --set-path=/calendar http://127.0.0.1:443/calendar
+→ https://你的主机.tailnet.ts.net/calendar    ← tailnet 内可达
+```
+
+这类服务按通路一判定会得到"仅本机、无入口" —— **判断是错的**。
+所以门户额外读取 `tailscale serve status`，把这些路径作为独立入口列出，
+并在对应容器卡上打 `serve` 标记；与容器端口重复的会去重，不会出现两遍。
+
+> **重要**：读 serve 路由**必须用 CLI 模式**（serve 是节点本地状态，REST API 不提供）。
+> Linux/NAS 上挂载 `tailscale` + `tailscaled.sock` 即可；Windows 容器化下读不到，
+> 界面会明确说明原因。
 
 容器卡片上会显示判定结果与依据，避免"点了打不开"的困惑。
 每个可达端口还会给出**多个候选入口**（tailnet IP / MagicDNS / localhost），

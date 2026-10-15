@@ -32,6 +32,8 @@ import {
   type ContainerPortView,
   type ContainerStatsView,
   type ContainerSummary,
+  type ServeRouteView,
+  type ServeStatusView,
   type SourceStatus,
   type UrlCandidate,
 } from './types.js';
@@ -56,9 +58,31 @@ export interface HostContextRequest {
   headers: Record<string, string | string[] | undefined>;
 }
 
+/** 提供 serve 路由的依赖（由 tailscale 模块满足）。 */
+export interface ServeRoutesProvider {
+  fetchRoutes(allowHosts: readonly string[]): Promise<{
+    available: boolean;
+    mode: string;
+    detail: string | null;
+    routes: Array<{
+      host: string;
+      port: number;
+      scheme: 'https';
+      path: string;
+      url: string;
+      proxy: string;
+      targetHost: string | null;
+      targetPort: number | null;
+      funnel: boolean;
+    }>;
+  }>;
+}
+
 export interface ContainerServiceDeps {
   provider: DockerProvider;
   hostInfo: HostInfoProvider;
+  /** `tailscale serve` 路由读取（可选；不传则不展示 serve 路由） */
+  serveRoutes?: ServeRoutesProvider;
   config: PortalConfig;
   logger: Logger;
 }
@@ -118,6 +142,8 @@ export class ContainerService {
     const hostContext = this.buildHost(request);
 
     let items = this.attachHostContext(cached.items, hostContext);
+    const serve = await this.buildServeView(cached.items, hostContext);
+    items = this.attachServePaths(items, serve.routes);
 
     if (query.reachability) {
       items = items.filter((item) => item.reachability === query.reachability);
@@ -146,7 +172,99 @@ export class ContainerService {
       total: items.length,
       summary: summarize(items),
       source: cached.source,
+      serve,
     };
+  }
+
+  /**
+   * 组装 serve 路由视图。
+   *
+   * 关键处理：
+   * 1. 把路由的监听主机限定为"本机 tailnet 名"（serve 配置里的 key 就是它），
+   *    避免把别的节点或历史残留的路由混进来。
+   * 2. 把目标端口匹配回容器，便于 UI 显示"这条 serve 指向哪个容器"。
+   * 3. 标记 `coveredByContainerPort`：若该目标端口已经作为可达端口展示过
+   *    （例如 worldforge 的 4173 已发布到宿主），就不再单独列一条，
+   *    改为在容器卡上打 serve 标记，避免同一入口出现两次。
+   */
+  private async buildServeView(
+    containers: readonly ContainerSummary[],
+    hostContext: PortalHostContext,
+  ): Promise<ServeStatusView> {
+    const provider = this.deps.serveRoutes;
+    if (!provider) {
+      return { available: false, mode: 'none', detail: '未接入 serve 路由读取', routes: [] };
+    }
+
+    const allowHosts = [this.deps.hostInfo.getTailscaleDnsName(), hostContext.primaryHost].filter(
+      (host): host is string => typeof host === 'string' && host.trim() !== '',
+    );
+
+    let result;
+    try {
+      result = await provider.fetchRoutes(allowHosts);
+    } catch (error) {
+      this.log.warn('读取 serve 路由失败', { error });
+      return {
+        available: false,
+        mode: 'cli',
+        detail: `读取 serve 路由失败：${error instanceof Error ? error.message : String(error)}`,
+        routes: [],
+      };
+    }
+
+    // 已作为可达端口展示过的宿主端口（用于去重）
+    const reachableHostPorts = new Set<number>();
+    for (const container of containers) {
+      for (const port of container.ports) {
+        if (port.reachability === 'tailnet' || port.reachability === 'lan') {
+          if (port.hostPort !== null) reachableHostPorts.add(port.hostPort);
+        }
+      }
+    }
+
+    const routes: ServeRouteView[] = result.routes.map((route) => {
+      const owner =
+        route.targetPort === null
+          ? null
+          : (containers.find((container) =>
+              container.ports.some((port) => port.hostPort === route.targetPort),
+            ) ?? null);
+      return {
+        host: route.host,
+        port: route.port,
+        scheme: route.scheme,
+        path: route.path,
+        url: route.url,
+        proxy: route.proxy,
+        targetHost: route.targetHost,
+        targetPort: route.targetPort,
+        containerName: owner?.name ?? null,
+        containerId: owner?.id ?? null,
+        coveredByContainerPort: route.targetPort !== null && reachableHostPorts.has(route.targetPort),
+      };
+    });
+
+    return { available: result.available, mode: result.mode, detail: result.detail, routes };
+  }
+
+  /** 把 serve 路径写到对应容器上（卡片标记用）。 */
+  private attachServePaths(
+    items: readonly ContainerSummary[],
+    routes: readonly ServeRouteView[],
+  ): ContainerSummary[] {
+    return items.map((item) => {
+      const matched = routes.filter((route) => route.containerId === item.id);
+      if (matched.length === 0) {
+        return { ...item, servePaths: [], servedUrl: null };
+      }
+      return {
+        ...item,
+        servePaths: matched.map((route) => route.path),
+        // 优先给容器自身的 serve 入口；没有则给第一条
+        servedUrl: matched.find((route) => route.targetPort !== null)?.url ?? matched[0]?.url ?? null,
+      };
+    });
   }
 
   /** 单个容器详情（`:id` 支持完整 ID / 短 ID / 名称）。 */
@@ -375,6 +493,8 @@ export function mapContainer(
     ports,
     urlCandidates: buildCandidates(ports, hostContext),
     tailscaleSidecar,
+    servePaths: [],
+    servedUrl: null,
     stats: null,
   };
 

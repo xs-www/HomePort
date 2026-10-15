@@ -215,7 +215,27 @@ SQLite 连接与迁移。
 | `types.ts` | `TailnetDevice` `TailnetSummary` `TailnetStatus` `TailnetStatusLite` `SourceStatus` | F2 契约类型 |
 | `hostInfoCache.ts` | `CachedTailnetInfo` `setCachedTailnetInfo` `getCachedTailnetInfo` `cachedTailnetInfoAgeMs` `resetCachedTailnetInfo` | 解 `docker ↔ tailscale` 模块环的单向寄存器 |
 | `provider.ts` | `TailscaleProvider` `CliTailscaleProvider` `ApiTailscaleProvider` `DisabledTailscaleProvider` `selectTailscaleProvider` `mapCliStatus` `mapCliPeer` `mapApiDevice` `mapApiDevices` `summarizePeers` `unavailableStatus` `splitIps` `normalizeDnsName` `withSocket` `CommandRunner` | 两种数据源 |
+| `serveProvider.ts` | `ServeProvider` `ServeRoute` `ServeStatusResult` `ServeStatusJson` `parseServeStatus` `parseHostPort` `parseProxyTarget` `normalizePath` `describeServeFailure` | `tailscale serve` 路由读取 |
 | `service.ts` | `TailscaleService` `defaultCommandRunner` `createUnavailableTailscaleService` | 缓存 + 同步读接口 |
+
+**`ServeProvider`** —— 读取 `tailscale serve status --json`。
+
+为什么与设备查询分开：**可用性不一致**。Windows 上设备查询可走 REST API，
+但 serve 配置是节点本地状态、API 不提供，只有 CLI 能读。分开实现才能给出准确原因。
+
+| 方法 / 函数 | 说明 |
+| --- | --- |
+| `ServeProvider.cliAvailable` | 当前模式是否为 CLI（`api` 与 `off` 返回 false） |
+| `ServeProvider.fetchRoutes(allowHosts)` | 拉取并解析；`allowHosts` 用于把路由限定为本机 tailnet 名 |
+| `parseServeStatus(json, allowHosts)` | 把 `Web[host:port].Handlers[path]` 展开为**每个路径一条路由**，排序为 主机→端口→路径（`/` 优先） |
+| `parseProxyTarget(proxy)` | 解析 `http://127.0.0.1:443/calendar` → `{host, port, path}`；缺省端口按协议补全 |
+| `describeServeFailure(result, bin)` | 命令失败翻译成可展示原因；成功返回 `null` |
+
+> **踩过的坑**：`withSocket()` 原先把 `--socket` 追加到**子命令之后**，而它是
+> tailscale 的**全局** flag，必须放在子命令**之前**，否则报
+> `flag provided but not defined: -socket`。
+> Windows 用默认 socket 路径所以没暴露，但 Linux/NAS 上显式配置 socket 是常规做法
+> —— 这个 bug 会在 NAS 上直接让 tailnet 查询失效。
 
 **`TailscaleService` 方法**
 

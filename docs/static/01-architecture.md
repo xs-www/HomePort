@@ -143,6 +143,32 @@ Fastify
 
 判定为 `tailnet` / `lan` 的端口才会渲染成可点击入口；`localhost-only` 容器在 UI 上以灰色卡片展示并给出提示，避免"点了打不开"的困惑。
 
+## 5.1 `tailscale serve` 路由（端口映射之外的第二条通路）
+
+只按 Docker 端口绑定判定会**漏掉一整类可达服务**：`tailscale serve` 能把
+**只绑定在宿主 `127.0.0.1` 的服务**以路径形式暴露到 tailnet。例如：
+
+```
+tailscale serve --bg --https=443 --set-path=/calendar http://127.0.0.1:443/calendar
+→ https://host.tailnet.ts.net/calendar   （tailnet 内可达）
+```
+
+而 Docker 里该服务只绑 `127.0.0.1:443`，按端口判定会得到"仅本机、无入口" —— **判断是错的**。
+
+因此门户额外读取 `tailscale serve status --json`，把它作为**独立数据源**并入容器视图：
+
+| 处理 | 说明 |
+| --- | --- |
+| 解析 | `Web["<host>:<port>"].Handlers["<path>"] = { Proxy }`，每个路径 handler 一条路由（**不按端口合并**，否则会丢掉路径信息） |
+| 归属 | 按代理目标的端口匹配回容器，卡片上可显示"这条 serve 指向哪个容器" |
+| 去重 | 若目标端口已作为可达端口展示过（如 worldforge 的 4173），标记 `coveredByContainerPort`，容器卡上打 `serve` 标记而不重复列一条 |
+| 可用性 | serve 是节点**本地**状态，只有 CLI 模式能读；Tailscale REST API 不提供 |
+
+**平台限制**：Linux/NAS 上挂载 `tailscale` 与 `tailscaled.sock` 即可；
+Windows 容器化下不可用（容器是 Linux 环境，执行不了 `tailscale.exe`，
+且 Windows 的 tailscaled 走 named pipe）。此时 UI 会展示**具体原因与解决方式**，
+而不是静默为空。
+
 ## 6. 为什么 v1 用入口链接而非反向代理
 
 内嵌其它 Web 应用需要处理：绝对路径资源、WebSocket、Cookie 域名、CSP、以及每个应用不同的 base path 要求。逐个适配的维护成本远高于价值。v1 采用**新标签页跳转**，保持零适配成本；文档在 `08-operations.md` 保留后续引入可选反代的方案位置。

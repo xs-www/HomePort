@@ -85,6 +85,10 @@ export interface ContainerSummary {
   urlCandidates: UrlCandidate[];
   /** 是否像 tailscale sidecar（含 TS_* 环境变量或 tailscale 相关镜像） */
   tailscaleSidecar: boolean;
+  /** 该容器被 `tailscale serve` 暴露的路径（如 ['/worldforge']） */
+  servePaths: string[];
+  /** 经 serve 暴露的入口 URL（取第一个匹配路由） */
+  servedUrl: string | null;
   stats: ContainerStatsView | null;
 }
 
@@ -116,6 +120,34 @@ export interface ContainerListResult {
   total: number;
   summary: ContainerListSummary;
   source: SourceStatus;
+  /** `tailscale serve` 暴露的路由；CLI 不可用时 available=false 并说明原因 */
+  serve: ServeStatusView;
+}
+
+/** serve 路由的视图（含与容器的关联）。 */
+export interface ServeRouteView {
+  host: string;
+  port: number;
+  scheme: 'https';
+  path: string;
+  /** 可直接点击的 tailnet 入口 URL */
+  url: string;
+  /** serve 的代理目标（宿主视角） */
+  proxy: string;
+  targetHost: string | null;
+  targetPort: number | null;
+  /** 提供该服务的容器名（能匹配到时） */
+  containerName: string | null;
+  containerId: string | null;
+  /** 是否被某个已展示的可达端口覆盖（这类不再单独列出，改在容器卡上打标记） */
+  coveredByContainerPort: boolean;
+}
+
+export interface ServeStatusView {
+  available: boolean;
+  mode: string;
+  detail: string | null;
+  routes: ServeRouteView[];
 }
 
 export interface ContainerListQuery {

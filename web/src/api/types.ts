@@ -157,6 +157,10 @@ export interface ContainerSummary {
   ports: ContainerPortView[];
   urlCandidates: UrlCandidate[];
   tailscaleSidecar: boolean;
+  /** 该容器被 `tailscale serve` 暴露的路径 */
+  servePaths: string[];
+  /** 经 serve 暴露的入口 URL */
+  servedUrl: string | null;
   stats: ContainerStatsView | null;
 }
 
@@ -187,6 +191,34 @@ export interface ContainerListResponse {
   total: number;
   summary: ContainerListSummary;
   source: SourceStatus;
+  /** `tailscale serve` 暴露的路由（独立于容器端口映射） */
+  serve: ServeStatusView;
+}
+
+/** 一条 `tailscale serve` 路由。 */
+export interface ServeRouteView {
+  host: string;
+  port: number;
+  scheme: 'https';
+  path: string;
+  /** 可直接点击的 tailnet 入口 */
+  url: string;
+  /** serve 的代理目标（宿主视角） */
+  proxy: string;
+  targetHost: string | null;
+  targetPort: number | null;
+  /** 提供该服务的容器名（能匹配到时） */
+  containerName: string | null;
+  containerId: string | null;
+  /** 该目标端口已作为可达端口展示过（这类不重复列出） */
+  coveredByContainerPort: boolean;
+}
+
+export interface ServeStatusView {
+  available: boolean;
+  mode: string;
+  detail: string | null;
+  routes: ServeRouteView[];
 }
 
 export interface ContainerDetailResponse {
