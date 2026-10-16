@@ -1,0 +1,113 @@
+# ==============================================================================
+# 在 GitHub 的机器上构建镜像并推送到 GHCR
+#
+# 产物：ghcr.io/xs-www/homeport
+#   - latest   （默认分支 master）
+#   - master   （分支名）
+#   - sha-<短> （每次提交，便于回滚到具体版本）
+#   - v1.2.3   （打 tag 时，配合 semver）
+#
+# 为什么只构建 linux/arm64：目标部署机是 NAS（family-nas）。
+# 需要 amd64 时把下面的 PLATFORMS 改成 linux/amd64,linux/arm64 即可。
+#
+# 为什么关掉 provenance / sbom：
+#   这两项会产出 attestation manifest。较老的 Docker（如 NAS 上的 20.10，
+#   containerd 镜像存储未启用）拉取时会报 "no match for platform in manifest"。
+#   本镜像的消费方正是这类设备，故默认关闭；如需溯源可改为 true。
+# ==============================================================================
+
+name: Build & Push Image
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  # 允许在 Actions 页面手动触发（换架构/临时出图时不必空提交）
+  workflow_dispatch:
+
+# 同一分支上新的推送会取消仍在跑的旧构建，避免排队等待
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # 注意：Docker 镜像引用必须全小写。仓库名是 HomePort，但镜像名只能是 homeport，
+  # 因此不能直接用 ${{ github.repository }}（会得到 xs-www/HomePort 而报
+  # "repository name must be lowercase"）。
+  IMAGE_NAME: ${{ github.repository_owner }}/homeport
+  # 目标架构。多架构写成 linux/amd64,linux/arm64
+  PLATFORMS: linux/arm64
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # 推 GHCR 必需。若仓库 Settings → Actions → General → Workflow permissions
+      # 被设为只读，则此处无法生效，推送会 403（见 README/文档说明）。
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # arm64 镜像要在 amd64 runner 上构建，必须注册 QEMU 模拟。
+      # 代价：better-sqlite3 的原生编译在模拟下较慢（实测本机 QEMU 约 77s）。
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 跨构建缓存，避免每次都在 QEMU 下重编 better-sqlite3
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### 镜像已推送 :whale:"
+            echo ""
+            echo "平台：\`${{ env.PLATFORMS }}\`"
+            echo ""
+            echo "标签："
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "NAS 上拉取："
+            echo '```bash'
+            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,39 @@
+# 构建上下文排除项。
+# Dockerfile 只显式 COPY package.json / server/ / web/，本来就不会把下列内容装进镜像，
+# 但排除后能显著减小发往构建守护进程的上下文（本机 node_modules 约 144 MB），
+# 并且避免 .env 这类本地机密被上传到构建器。
+
+# 依赖与产物（镜像内部会自己 npm ci / 构建）
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# 版本控制与 CI
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# 本地机密与数据
+.env
+.env.local
+data/
+.devdata/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# 文档与编辑器（不影响构建产物）
+docs/
+todo.md
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
