@@ -63,6 +63,13 @@
 - [x] 登录限流 10 次/分钟/IP
 - [x] 用户枚举防护（统一报错 + 耗时抹平）
 - [x] 自助改密（保留当前会话，吊销其它）
+- [x] **两步验证 TOTP（S0-03，服务端）**：纯函数核心 `modules/auth/totp.ts`（RFC 6238，
+      兼容 HMAC-SHA1/6 位/30 秒）、恢复码与登录挑战仓储 `db/totp.ts`（`TOTP_CHALLENGE_MAX_ATTEMPTS=5`）、
+      迁移 v3（`users.totp_secret/totp_enabled/totp_confirmed_at/totp_last_counter` +
+      `totp_recovery_codes` + `totp_challenges`）；密码通过后**不签发会话**、只给挑战令牌，
+      两个登录接口共用限流；防重放 `totp_last_counter` **只作用于登录路径**（有意取舍）；
+      恢复码 10 个 `XXXX-XXXX`（剔除 `0O1IL`）只存 sha256 摘要、一次性核销；
+      管理员强制重置（清绑定 + 吊销全部会话 + 审计）；前端同批交付（见下）
 
 ### F6 运行时设置（界面内改配置，免重建容器）
 - [x] 迁移 v2 `settings` 表 + `SettingsRepository`
@@ -73,6 +80,11 @@
 - [x] `GET/PATCH /api/settings`、`POST /api/settings/reset`
 - [x] `POST /api/settings/test/tailscale`：**先测再存**，401/403/超时给出可操作提示
 - [x] 敏感值打码读取、占位符写入 = 不修改、审计只记键名
+- [x] **敏感设置加密存储（S0-03）**：注册表标 `sensitive` 的键 AES-256-GCM 落库
+      （`enc:v1:` 密文）、读出解密；旧明文照常可读并在下次写入时自动升级，
+      首启 `reencryptAll()` 一次性升级存量（幂等、返回条数）；
+      `previousKeys` 支持密钥轮换；解密失败降级为「未设置」且不崩进程；
+      非敏感键保持明文；日志/审计只记键名（`secretStore.ts`）
 - [x] 前端「账号管理 → 系统设置」面板：分组展示 + 生效级别徽标 + 来源徽标 + 测试连接
 - [x] 明确标注硬边界（需重建容器的项不给编辑控件）
 
@@ -90,10 +102,17 @@
 ### 容器化与文档
 - [x] 四阶段 Dockerfile（alpine、非 root、tini、healthcheck）
 - [x] `docker-compose.yml`（Windows 与 NAS 同一份）
+- [x] **容器最小权限（S0-04）**：`docker.sock` 改为 **`:ro`** 挂载，新增
+      `cap_drop: ALL` 与 `no-new-privileges:true`；**去掉**硬编码的 Windows `C:/` 磁盘挂载
+      （默认全部注释，需要时显式启用并同步 `PORTAL_DISK_MOUNTS`）；
+      另提供**可选**的只读 socket 代理覆盖文件 `docker-compose.socket-proxy.yml`
+      （只放行 CONTAINERS/INFO/VERSION/PING，不 publish 到宿主）——
+      **代理仍是可选增强，不是默认部署方式**
 - [x] `.env.example`（含分平台部署矩阵）
 - [x] `docs/static/` 9 个静态文档
 - [x] `README.md`
-- [x] 129 个测试用例（3 个文件）全部通过
+- [x] 单测：`npm test` 覆盖 `server` 与 `web` 两个工作区（Vitest），
+      另有 Playwright E2E 冒烟 `npm run test:e2e`
 - [x] 真实环境实测（Docker + Tailscale + 硬件，逐项交叉验证）
 
 ### 品牌与命名
@@ -142,14 +161,26 @@
 
 ### 中优先级（增强）
 
-- [ ] **敏感项加密存储**：当前 API Token 在数据库中明文保存（需回读调用外部 API）。
-      可用宿主环境变量保存主密钥，对 `sensitive` 项做 AES-GCM 加密。
+- [x] **敏感项加密存储**：API Token 等在数据库中已是 AES-256-GCM 密文
+      （`secretStore.ts`；主密钥来自 `PORTAL_SECRET_KEY` 或 `<dataDir>/secret.key`）。
       见 `06-security.md` §7
 - [ ] **工具目录可视化编辑**：现在只能填 JSON 文件路径，不能增删改单条工具
 - [ ] **设置并发冲突检测**：两个管理员同时改会后者覆盖前者。可用 `updated_at` 做乐观锁
-- [ ] **TOTP 二次验证**：为 admin 账号增加可选的两步验证
-      （需要二维码生成 + 恢复码管理，见 `06-security.md` §9.1）
-- [ ] **安全响应头**：引入 `@fastify/helmet`，配置 CSP（当前无 CSP/HSTS）
+- [x] **TOTP 二次验证（前端部分，S0-03）**：登录第二步（`totpRequired` → `/api/auth/login/totp`）、
+      自助绑定 / 一次性恢复码 / 重新生成 / 关闭（`SecurityTab`）、管理员强制重置（`UsersTab`）、
+      `web/tests/totp.test.tsx` 14 个用例；`challengeToken` 只存组件状态、不落 Web Storage。
+      后端接口同批实现（`server/src/modules/auth/totp.ts`）；契约差异见 `09-changelog.md` S0-03 前端一节
+- [x] **TOTP 收尾**：二维码展示已决定**不**引入二维码库（用密钥文本 + `otpauth://` 链接替代，
+      文案里已说明）；唯一管理员丢失设备的离线重置流程已归档到 `08-operations.md` §5
+      （管理员强制重置 + `docker compose exec` 改库两条路径，含可直接执行的 SQL 与列含义）
+- [x] **安全响应头（S0-03）**：**未引入** `@fastify/helmet`，改为手写
+      `server/src/http/securityHeaders.ts` —— 理由：需要精确控制 HSTS 的 HTTPS 判定
+      （只在确为 HTTPS 时下发，且不带 `includeSubDomains`，宿主是共享域名）与 SSE 分支，
+      同时少一个运行时依赖。默认 CSP（`DEFAULT_CSP`，`PORTAL_CSP` 可覆盖）+ 六个固定头，
+      `/api/*` 加 `cache-control: no-store`；SSE 端点手动补头
+      （`reply.raw.writeHead` 绕过 `onRequest` 钩子）；E2E 有对应断言。
+      见 `06-security.md` §8
+- [ ] **CSP 违规上报**：目前没有 `report-uri` / `report-to`，策略改严后违规是静默的
 - [ ] **容器 list 性能**：容器数 >50 时，list+inspect 的耗时可能超过缓存 TTL。
       可改为增量：先 list 比对 ID，只对新容器 inspect
 - [ ] **历史趋势图**：目前只有瞬时值。可加环形缓冲区记录最近 N 分钟 CPU/内存，
@@ -168,22 +199,36 @@
 - [ ] 主题自定义色板
 - [ ] 导出审计日志为 CSV
 - [ ] 支持 PostgreSQL（当前 SQLite 足够，仅在多实例部署时才有必要）
-- [ ] **补 `LICENSE` 文件**：`package.json` 已声明 `"license": "MIT"`，但没有 LICENSE 文件，
-      默认等于"保留所有权利"，与声明不一致（公开仓库尤其明显）
+- [x] **补 `LICENSE` 文件**：已加根 `LICENSE`（MIT，Copyright (c) 2026 xs-www），
+      与 `package.json`/各工作区的 `"license": "MIT"` 一致
 - [x] CI：GitHub Actions 构建多架构（amd64 + arm64）镜像并推送 GHCR（`ghcr.io/xs-www/homeport`）
 
 ## 技术债
 
-- [ ] `server/src/modules/docker/service.ts` 已 559 行，映射逻辑（`mapPorts` 等）
-      可拆到独立的 `mapper.ts`
-- [ ] `web/src/pages/AdminPage.tsx` 已 651 行，三个标签页应各自拆文件
-- [ ] 前端缺测试（当前只有后端 129 个用例）。建议至少为
-      `api/client.ts`（CSRF 注入、错误转换）与 `lib/format.ts` 加单测
+- [x] `server/src/modules/docker/service.ts` 映射逻辑已拆到 `mapper.ts`（S0-05）：
+      700 → 370 行（只留缓存/数据源/契约装配），纯函数层 430 行；
+      `service.ts` 保留全部同名 re-export；新增 `server/tests/dockerMapper.test.ts`（24 个入口解析用例）。
+      顺带修掉双栈绑定的重复入口（真实 inspect 里 `0.0.0.0` 与 `::` 同端口会出现两条一样的入口，
+      去重抽成独立纯函数 `dedupeIdenticalBindings`）
+- [x] `web/src/pages/AdminPage.tsx` 已拆分（S0-05）：655 → 89 行，只保留路由级取数、
+      标签页骨架与 props 分发；三个标签页各自成文件 ——
+      `web/src/pages/admin/UsersTab.tsx`、`AuditTab.tsx`、`SecurityTab.tsx`
+      （`SettingsPanel.tsx` 原已独立）
+- [x] 前端已补测试：`web/tests/` 下 `client.test.ts`（CSRF 注入、错误转换、401 语义）、
+      `format.test.ts`、`components.test.tsx`、`totp.test.tsx`（两步登录与自助管理）；
+      `web/vitest.config.ts` 提供 jsdom + RTL 环境，根 `npm test` 会同时跑 server 与 web
 - [ ] `TtlCache` 的 `evictIfNeeded` 每次都全量遍历，条目数大时是 O(n)。
       当前 maxEntries=200，暂不构成问题
-- [ ] 无 E2E 测试（Playwright）。关键路径：首启初始化 → 登录 → 各页面加载
-- [ ] **CI 尚未覆盖测试**：`.github/workflows/docker-publish.yml` 只做镜像构建与推送，
-      还没跑 `typecheck` + `test`。建议补一个在 push/PR 上跑的校验 job
+- [x] E2E 已补（Playwright）：`e2e/smoke.spec.ts` + `e2e/security-headers.spec.ts` +
+      `e2e/start-server.mjs` + `playwright.config.ts`；覆盖首启初始化 → 登录/登出 →
+      关键页面降级提示 → 权限边界 → 安全响应头。默认端口 8988（`PORTAL_E2E_PORT` 可覆盖），
+      启动前跑完整生产构建、每次清空 `.e2e-data`。见 `08-operations.md` §12
+- [x] CI 已覆盖测试（S0-02）：新增 `.github/workflows/ci.yml`（PR 与 master push：
+      typecheck + 单测 + 构建 + E2E，**无 paths-ignore**）；
+      `docker-publish.yml` 新增 `quality` job 且 `build-and-push` 依赖它。
+      **注意**：E2E 不是发布前置 —— `build-and-push` 只依赖同文件的 `quality`；
+      要让它卡住发布需在该文件里也定义 `e2e` job 并把依赖写成 `needs: [quality, e2e]`
+      （`needs` 不能跨工作流引用）
 
 ## 环境备忘
 

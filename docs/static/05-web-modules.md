@@ -42,6 +42,14 @@ web/src/
 `TailnetDevice` `TailnetStatusResponse` `SystemSnapshotResponse` `SystemMetricsFrame`
 `ToolView` `ToolListResponse` `OverviewResponse` `AuditEntry`
 
+两步验证（TOTP）相关：`LoginSuccessResponse` / `LoginTotpChallengeResponse` 与其判别联合
+`LoginResponse`（用导出的类型守卫 `isTotpChallenge()` 分支）、`LoginTotpRequest`、
+`TotpSetupResponse`、`TotpEnableRequest` / `TotpEnableResponse`、
+`TotpDisableRequest` / `TotpDisableResponse`、`TotpRecoveryCodesRequest` /
+`RecoveryCodesResponse`、`TotpResetResponse`。`SessionUser` 新增
+`totpEnabled: boolean` 与可选 `totpConfirmedAt?: string | null`（后端已返回，用于显示"启用时间"；
+契约只承诺前者，所以声明为可选、缺失时界面显示 `—`）。
+
 ## 3. `api/client.ts`
 
 ### `ApiError`
@@ -63,7 +71,8 @@ class ApiError extends Error {
 | `request`（私有） | `<T>(path, RequestOptions) => Promise<T>` | 统一 fetch。`credentials: 'same-origin'`；变更类请求自动加 `X-CSRF-Token`；超时用 `AbortController`（默认 20s，慢接口 45s）；`204` 返回 `undefined` |
 | `health` | `() => Promise<HealthResponse>` | 跳过 401 回调 |
 | `session` | `() => Promise<SessionView>` | 跳过 401 回调 |
-| `login` | `({username,password,remember}) => Promise<LoginResponse>` | 跳过 401 回调（否则登录失败会触发"会话失效"逻辑） |
+| `login` | `({username,password,remember}) => Promise<LoginResponse>` | 跳过 401 回调（否则登录失败会触发"会话失效"逻辑）。返回**判别联合**：可能是"需要第二步" |
+| `loginTotp` | `({challengeToken,code,remember}) => Promise<LoginTotpResponse>` | 登录第二步；在**建立会话之前**调用，故跳过 401 回调、不假设已有 CSRF |
 | `logout` / `bootstrap` / `changePassword` / `sessionActivity` | — | 认证 |
 | `overview` | `() => Promise<OverviewResponse>` | 慢接口超时 |
 | `containers` / `container` / `containerLogs` | — | 容器 |
@@ -71,8 +80,16 @@ class ApiError extends Error {
 | `systemSnapshot` | — | 系统 |
 | `tools` / `probeTool` | — | 工具 |
 | `me` / `updatePreferences` / `users` / `createUser` / `updateUser` / `deleteUser` / `resetUserPassword` / `revokeUserSessions` / `auditLog` | — | 用户 |
+| `totpSetup` / `totpEnable` / `totpDisable` / `totpRegenerateRecoveryCodes` | — | 两步验证自助管理（需登录 + CSRF） |
+| `resetUserTotp` | `(id) => Promise<TotpResetResponse>` | admin 强制重置：清绑定 + 吊销全部会话，返回 `revokedSessions` |
 
 `toApiError(payload, status)` 把后端错误体转成 `ApiError`；无法识别时按状态码给中文兜底文案。
+
+**401 的语义细分（S0-03 修正）**：`request()` 在 `401` 时只有当错误码**不属于**
+`CREDENTIAL_FAILURE_CODES = { TOTP_INVALID, TOTP_CHALLENGE_EXPIRED, INVALID_CREDENTIALS }`
+才触发 `onUnauthorized`。原因是这三个码表示"这次提交的凭据/验证码不对"，
+改造前会把"输错一次 TOTP 验证码（或当前密码）"直接变成强制登出；
+真正的会话失效仍是 `UNAUTHORIZED`，照旧跳登录页。
 
 ## 4. `auth/AuthProvider.tsx`
 
@@ -85,7 +102,19 @@ class ApiError extends Error {
 | `applyTheme` | `(theme: 'dark'\|'light'\|'system') => void` | 切换 `<html class="dark">` 与 `color-scheme` |
 
 `AuthContextValue`：`api` `ready` `user` `preferences` `setupRequired` `apiVersion`
-`login` `bootstrap` `logout` `refresh` `updatePreferences` `isAdmin`
+`login` `completeTotpLogin` `bootstrap` `logout` `refresh` `updatePreferences` `isAdmin`
+
+**两步验证登录（S0-03）**
+
+- `login()` 返回判别联合 `LoginOutcome = { status: 'ok' } | { status: 'totp'; challengeToken; expiresAt }`：
+  后端第一步返回 `totpRequired` 时**没有**会话 Cookie，`AuthProvider` 只把
+  `challengeToken` 交给登录页，自身不保存。
+- `completeTotpLogin({ challengeToken, code, remember })` 调 `/api/auth/login/totp`，
+  成功后与普通登录走同一条收尾逻辑（`establishSession()`：写 CSRF、用户、偏好）。
+- **`challengeToken` 只存在组件状态里**，不写 localStorage/sessionStorage：刷新即失效，
+  与后端 5 分钟 TTL 配合，避免半途凭据留在浏览器里。
+- `bootstrap()` 在首启流程里仍直接调 `login()`；若意外收到 `totp` 分支则抛错，
+  不假装登录成功。
 
 **关键设计**
 
@@ -148,7 +177,7 @@ class ApiError extends Error {
 
 | 页面 | 路由 | 数据来源 | 要点 |
 | --- | --- | --- | --- |
-| `LoginPage` | `/login` | `useAuth().login` | 不做"忘记密码"（本地账号体系无邮件通道），明确提示联系管理员 |
+| `LoginPage` | `/login` | `useAuth().login` / `completeTotpLogin` | **两步登录**（见下）；不做"忘记密码"（本地账号体系无邮件通道），明确提示联系管理员 |
 | `SetupPage` | `/setup` | `useAuth().bootstrap` | 需首启令牌；密码二次确认；已初始化时显示引导而非报错 |
 | `OverviewPage` | `/` | `/api/overview` + SSE | 四张指标卡、硬件进度条、在线设备、featured 工具、数据源告警 |
 | `ContainersPage` | `/containers` | `/api/containers` | 容器墙；搜索 + 可达性过滤 + 含已停止 + 实时占用开关（筛选条件持久化） |
@@ -158,6 +187,40 @@ class ApiError extends Error {
 | `ToolsPage` | `/tools` | `/api/tools` | 工具卡；状态过滤、分类过滤、单工具强制探测、多候选入口折叠 |
 | `AdminPage` | `/admin` | `/api/users*` | **四个标签页**：用户与权限、审计日志、安全与偏好、系统设置 |
 | `NotFoundPage` | `*` | — | 404 |
+
+### 两步验证界面（S0-03）
+
+**`LoginPage`** — 由第一步的响应决定形态，两种形态是同一个组件的两个分支：
+
+| 分支 | 触发 | 要点 |
+| --- | --- | --- |
+| 第一步 · 账号密码 | 默认 | 提交后 `login()` 返回 `ok` 直接进门户；返回 `totp` 则切第二步 |
+| 第二步 · 两步验证 | 后端 `totpRequired` | 标题"两步验证"；`inputMode="numeric"`、`autoComplete="one-time-code"`、`maxLength=9`（兼容 `XXXX-XXXX` 恢复码）；"返回上一步"；提示本次验证的失效时间 |
+
+第二步的错误处理（两条路径必须分开）：
+
+- `TOTP_INVALID` → 就地 `role="alert"` 报"验证码不正确，请重试"，**保留已输入的验证码**；
+- `TOTP_CHALLENGE_EXPIRED` → 清空挑战与密码、保留用户名，退回第一步并提示"验证已过期，请重新登录"。
+
+无障碍：`<label htmlFor>` 关联、`aria-invalid`、`aria-describedby` 指向错误文案（`totp-code-error`）、
+提交中 `disabled`、验证码不足 6 位时禁用提交、错误用 `role="alert"`、过期提示用 `role="status"`。
+
+**`SecurityTab` 的「两步验证（TOTP）」区块** — 自助管理，刻意不引入二维码库：
+
+- **未启用**：`启用两步验证` → `totpSetup()` → 展示 `secret`（可选中复制 + 复制按钮）与
+  `otpauthUri` 文本，说明"在验证器 App 里手动输入密钥或粘贴 otpauth 链接"；再输入 6 位码
+  → `totpEnable()` → **一次性恢复码弹窗**（等宽、逐条、明确"这些码只显示这一次，请立即保存"、
+  可复制全部、必须勾选"我已保存恢复码"才能关闭）。
+- **已启用**：显示状态与"启用时间"（`totpConfirmedAt`，缺失显示 `—`）；`重新生成恢复码`
+  （需当前动态码，旧码立即作废）；`关闭两步验证`（需密码 **+ 当前验证码或恢复码**，
+  后端缺验证码时以 `fieldErrors.code` 返回，界面就地显示）。
+- `setup` 重复调用会重新生成**未确认**的种子：界面明确提示"会使上一次未确认的种子立即失效"，
+  且"重新生成密钥"要二次确认。
+- 绑定/关闭成功后调用 `refresh()` 同步 `user.totpEnabled`。
+
+**`UsersTab`** — 对 `totpEnabled` 的用户显示 `两步验证已启用` 徽标，并提供
+`重置两步验证`：`window.confirm` 写明"清除绑定 + 吊销全部会话 → 用户会掉线、需重新登录并重新绑定"，
+成功后提示带 `revokedSessions` 的文案并刷新列表（`act()` 的第三个参数支持传入函数以使用响应数据）。
 
 ### 系统设置面板 `pages/admin/SettingsPanel.tsx`
 
@@ -193,6 +256,16 @@ class ApiError extends Error {
 | `npm run dev:web` | Vite dev server（`:5273`），`/api` 代理到 `PORTAL_DEV_API`（默认 `http://127.0.0.1:8899`） |
 | `npm run build:web` | 产出 `web/dist`，由后端 `@fastify/static` 托管（同源，无 CORS） |
 | `npm run typecheck` | 前后端类型检查 |
+
+**测试**（`web/tests/`，`npm run test:web`，Vitest + jsdom，全部用
+`vi.stubGlobal('fetch', …)` 造假响应、不发真实请求）：
+
+| 文件 | 覆盖 |
+| --- | --- |
+| `client.test.ts` | CSRF 注入、错误体转换、非 JSON 响应、401 回调、超时与网络失败 |
+| `components.test.tsx` | 原子组件文案/类名/`aria-*`/回调 |
+| `format.test.ts` | 展示格式化 |
+| `totp.test.tsx` | 两步登录切换与挑战令牌不落存储、`TOTP_INVALID` 就地报错、`TOTP_CHALLENGE_EXPIRED` 退回第一步、启用流程的一次性恢复码、管理员强制重置、TOTP 接口契约与 401 语义 |
 
 **缓存策略**：`/assets/*`（文件名含 hash）长缓存 `immutable`；
 `index.html` 强制 `no-cache`，保证发版后立即生效。

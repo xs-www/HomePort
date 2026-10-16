@@ -33,6 +33,28 @@
 界面改的值存在 SQLite 的 `settings` 表（`/data/portal.sqlite`），
 随数据卷持久化，重建容器不丢失。备份与恢复见 [07-data-model.md](./07-data-model.md) §4。
 
+### 敏感值加密主密钥（AES-256-GCM）
+
+标了 `sensitive` 的设置项（当前是 `PORTAL_TAILSCALE_API_TOKEN`）**在数据库里是密文**
+（`enc:v1:<base64(iv|tag|cipher)>`），主密钥按下列优先级取得：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORTAL_SECRET_KEY` | 空 | 显式主密钥：64 位十六进制或 base64 的 32 字节（`openssl rand -base64 32`）。空 = 用密钥文件 |
+| `PORTAL_SECRET_KEY_FILE` | `<dataDir>/secret.key` | 密钥文件路径。文件不存在时**自动生成**（权限 `0600`）并打印告警 |
+| `PORTAL_SECRET_KEY_PREVIOUS` | 空 | 轮换期间保留的旧密钥（逗号分隔），**只用于解密** |
+
+- **作用范围**：`settings` 表里标了 `sensitive` 的设置项 **+ 用户的 TOTP 种子**
+  （`users.totp_secret`，见 [07-data-model.md](./07-data-model.md) §2）——
+  两处共用同一个 `secretBox`（`server/src/app.ts` 装配时构造一次）。
+- **什么都不配也能加密**：默认自动生成密钥文件。但此时主密钥与数据库同卷，
+  只防"数据库文件被单独拷走"，**不防主机失陷**；需要更强隔离请显式设 `PORTAL_SECRET_KEY`。
+- **主密钥丢失 = 已加密的敏感值永久解不开**：界面会显示为"未设置"（服务不会崩），
+  在界面重填一次即可恢复；**备份数据卷时请一并备份密钥文件**。
+- **换密钥**：新密钥写 `PORTAL_SECRET_KEY`，旧密钥写 `PORTAL_SECRET_KEY_PREVIOUS`
+  （启动时的新旧密文都能读），确认 `reencryptAll()` 已把老密文升级完毕后再移除 previous。
+  详见 [06-security.md](./06-security.md) §7。
+
 ## 1. 规则与约定
 
 - 所有变量都可省略，**最小可用配置是空 `.env`**。
@@ -53,13 +75,30 @@
 | `PORTAL_PUBLIC_PORT` | `0` | 对外端口；`0` = 跟随请求 |
 | `PORTAL_PUBLIC_SCHEME` | `http` | `http` / `https` |
 | `PORTAL_SECURE_COOKIES` | `0` | 部署在 HTTPS 反代之后时置 `1`，会话 Cookie 带 `Secure` |
-| `PORTAL_TRUST_PROXY` | `1` | 是否信任 `X-Forwarded-*`（反代后需要） |
+| `PORTAL_TRUST_PROXY` | `loopback` | 可信代理范围。默认**只信任本机反代**，见下方说明 |
 | `PORTAL_SETUP_TOKEN` | 空 | 首启令牌；空 = 自动生成并写入 `/data/setup-token.txt` + 打印到日志 |
 | `PORTAL_DATA_DIR` | `/data`（镜像内） | SQLite 与令牌目录 |
 | `PORTAL_DB_PATH` | `<dataDir>/portal.sqlite` | 数据库文件路径 |
 | `PORTAL_VERSION` | `0.1.0` | 展示用版本号 |
 | `PORTAL_BUILD_REVISION` | `dev` | 展示用构建号/提交号（CI 里可注入） |
 | `TZ` | `Asia/Shanghai` | 日志与界面时区 |
+
+> **为什么 `PORTAL_TRUST_PROXY` 默认是 `loopback`**：本项目的标准部署是
+> **`tailscale serve` → `127.0.0.1:8899`**，代理连接必然来自回环地址。
+> 只信回环时，`X-Forwarded-For` 里的真实客户端 IP 会被采纳（登录限流
+> `10 次/分钟/IP` 的计数桶才是对的），而 tailnet 直连客户端**自带**的伪造头会被忽略。
+> 若默认 `1`/`true`，任何人都能靠改 `X-Forwarded-For` **换桶绕过登录限流**，
+> 还能伪造 `X-Forwarded-Proto: https` 让门户误以为自己在 HTTPS 后面。
+>
+> `1`/`true`/`on`/`yes` 仍可显式开启（= 无条件相信 `X-Forwarded-*`），但这是**危险**配置，
+> **仅在门户前面确有一个不可绕过的反代、且该反代是重写而不是追加这些头时才用**；
+> `0`/`false`/`off`/`no` 完全不信任；也可直接写 IP/CIDR 列表（`127.0.0.1/8,::1`）
+> 或 proxy-addr 预置名（`loopback`/`linklocal`/`uniquelocal`）。
+> 非法值**启动即报错**，不会静默退化成"信任所有人"（`parseTrustProxy()`，`server/src/config.ts`）。
+>
+> 相邻变量 `PORTAL_FORWARDED_PROTO_TRUSTED`（默认 `1`，本文件此前未收录）只影响
+> **入口链接的 scheme 推导**：置 `0` 时忽略 `X-Forwarded-Proto`，一律用 Fastify 判定的协议
+> （`buildHostContext()`，`server/src/modules/docker/hostContext.ts`）。
 
 ### 会话
 
@@ -76,6 +115,73 @@
 | `PORTAL_METRICS_INTERVAL_MS` | `3000` | SSE 指标推送间隔 |
 | `PORTAL_CACHE_CONTAINERS_TTL_MS` | `2000` | 容器列表缓存。容器多（>30）时可调到 5000 降低 inspect 压力 |
 | `PORTAL_CACHE_TAILSCALE_TTL_MS` | `5000` | tailnet 状态缓存，避免频繁 fork `tailscale` 进程 |
+
+### 安全响应头（S0-03）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORTAL_SECURITY_HEADERS` | `1` | 总开关。关闭后**一个安全头都不发**（仅排障时用，启动会打 warn） |
+| `PORTAL_CSP` | 空（= 用内置默认策略） | `Content-Security-Policy` 内容。**留空不是"关掉 CSP"**，而是回落到内置默认策略 |
+| `PORTAL_HSTS` | `1` | 是否允许下发 HSTS。**只在请求确为 HTTPS 时才真正下发** |
+| `PORTAL_HSTS_MAX_AGE` | `15552000`（180 天） | HSTS `max-age`（秒）；`0` 等于不下发 |
+
+内置默认 CSP（`DEFAULT_CSP`，`server/src/config.ts`）：
+
+```
+default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self';
+style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self';
+connect-src 'self'; form-action 'self'; frame-ancestors 'none'
+```
+
+- `style-src` 里的 `'unsafe-inline'` 是**必要**的：React 组件会用 `style` **属性**写少量
+  内联样式（进度条宽度等），属性级内联无法用 nonce 覆盖。`script-src` 则保持 `'self'`，
+  因为前端产物全部是本地静态文件、没有内联脚本（React 19 + Vite 产物满足该约束）。
+- `connect-src 'self'` 同时覆盖同源 `fetch` 与 **SSE** 长连接 —— 改 CSP 时若漏掉它，
+  概览页的实时指标会直接断掉。
+- 想彻底关掉安全头（例如排障时被 CSP 挡住）请用 `PORTAL_SECURITY_HEADERS=0`，
+  **不要**靠把 `PORTAL_CSP` 置空 —— 空值会被 `str()` 回落到默认策略
+  （`server/src/config.ts` 的 `str()`：空串一律取 fallback）。
+
+**HSTS 只在 HTTPS 时下发**（`securityHeadersFor()`，`server/src/http/securityHeaders.ts`）：
+`tailscale serve` 在节点上终止 TLS 后回源到 `http://127.0.0.1:8899`，
+只有 `X-Forwarded-Proto: https` 才能说明浏览器那一侧确实是 HTTPS；
+**直连 HTTP（含 tailnet 直连 `http://<tailnet IP>:8899`）自动忽略**。
+内网 HTTP 下发 HSTS 会把用户浏览器锁死在一个不存在的 HTTPS 站点上，是真实的可用性事故。
+下发的头形如 `max-age=15552000`，**刻意不带 `includeSubDomains`，也不带 `preload`**：
+生产主机名形如 `family-nas.tail585599.ts.net`，带 `includeSubDomains` 会波及同域下的其它名字，
+那不是门户能替用户做的决定。
+
+除 CSP/HSTS 外还会固定下发 `x-content-type-options: nosniff`、`x-frame-options: DENY`、
+`referrer-policy: no-referrer`、`cross-origin-opener-policy` / `cross-origin-resource-policy: same-origin`、
+`x-permitted-cross-domain-policies: none` 与一份全关的 `permissions-policy`（`STATIC_SECURITY_HEADERS`）；
+`/api/*` 额外补 `cache-control: no-store`（响应可能含容器环境变量快照、设备清单等敏感内容）。
+
+### 两步验证（TOTP，S0-03）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PORTAL_TOTP_ENABLED` | `1` | 是否允许**新绑定**两步验证；已绑定账号不受影响，见下方说明 |
+| `PORTAL_TOTP_ISSUER` | `HomePort` | `otpauth://totp/...` URI 里的签发者名，即验证器 App 里显示的分组名 |
+| `PORTAL_TOTP_WINDOW` | `1` | 校验允许的时间窗：±N 个 30 秒周期（取值 `0`~`5`） |
+| `PORTAL_TOTP_CHALLENGE_TTL_SECONDS` | `300` | 登录第二步挑战令牌的有效期（取值 `60`~`1800`） |
+
+- 算法固定为 **HMAC-SHA1 + 6 位 + 30 秒**（Google Authenticator / 1Password / Aegis 等主流 App
+  的默认兼容档），这三项**不提供配置项**。
+- **关掉开关只关"新绑定"**：`POST /api/users/me/totp/setup` 与 `/enable` 返回
+  `400 TOTP_UNAVAILABLE`（文案「服务端已关闭两步验证功能，暂时无法绑定新设备」），
+  由 `assertTotpEnrollmentAllowed()`（`modules/auth/service.ts`）在这两个入口拦截。
+- **已绑定的账号无论如何都会继续走第二步**：`login()` 刻意不看 `config.totp.enabled`，
+  否则关掉开关就等于把所有账号**静默降级成仅密码**，而用户毫不知情。
+  同理 `disable`（关闭两步验证）与 `recovery-codes`（重生成恢复码）**不受该开关影响** ——
+  不能因为管理员关了开关，就让已绑定的人连"关掉它"都做不到。
+- **各变量的生效时机**：`PORTAL_TOTP_WINDOW` 在 `verifySecondFactor()`（登录第二步、关闭、
+  重生成恢复码都走它）与 `enableTotp()` 的绑定校验里读取；`PORTAL_TOTP_CHALLENGE_TTL_SECONDS`
+  在 `login()` 里传给 `challenges.create()`；`PORTAL_TOTP_ISSUER` 只在 `beginTotpSetup()`
+  拼 `otpauth://` URI 时读取。
+- 挑战 TTL 只决定"输码的时间预算"，与登录会话有效期（`PORTAL_SESSION_TTL_HOURS`）无关；
+  有效期内同一个挑战只能用一次，且累计 5 次输错即作废（见 [07-data-model.md](./07-data-model.md) §2）。
+- 本节（安全响应头 / TOTP）的所有变量都是**引导期读取**（`config.ts` 在启动时构造一次配置），
+  改完需重启容器，且**不在**「界面设置」里 —— 与 §0 的 `restart` 级项同类。
 
 ## 3. Docker 数据源（F1）
 

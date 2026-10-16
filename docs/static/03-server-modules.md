@@ -181,7 +181,25 @@ SQLite 连接与迁移。
 | `types.ts` | `SourceStatus` `UrlCandidate` `ContainerPortView` `ContainerNetworkView` `ContainerMountView` `ContainerStatsView` `ContainerSummary` `ContainerDetail` `ContainerListSummary` `ContainerListResult` `ContainerListQuery` `ContainerLogsResult` `TAILSCALE_IMAGE_RE` | F1 契约类型 |
 | `hostContext.ts` | `HostCandidate` `PortalHostContext` `splitHostPort` `buildHostContext` `portalUrl` | 门户对外主机推导 |
 | `provider.ts` | `DockerProvider` `resolveDockerEndpoint` `normalizeNamedPipe` `endpointMode` `computeCpuPercent` `normalizeStats` `mapWithConcurrency` `withTimeout` `firstName` `isNotFound` `describeDockerError` | dockerode 封装（**只读 API**） |
-| `service.ts` | `ContainerService` `summarize` `cleanName` `mapContainer` `mapNetworks` `mapMounts` `mapPorts` `pickPrimaryUrl` `buildCandidates` `detectTailscaleSidecar` `joinCommand` `normalizeCommandList` `HostInfoProvider` `HostContextRequest` | 业务出口 |
+| `service.ts` | `ContainerService` `HostInfoProvider` `HostContextRequest` `ServeRoutesProvider`（并 re-export `mapper.ts` 的全部映射函数） | 业务出口：缓存 / 数据源编排 / 契约装配 |
+| `mapper.ts` | `summarize` `cleanName` `mapContainer` `mapNetworks` `mapMounts` `mapPorts` `dedupeIdenticalBindings` `urlForBinding` `rebuildPortUrls` `attachHostContext` `pickPrimaryUrl` `buildCandidates` `detectTailscaleSidecar` `joinCommand` `normalizeCommandList` `collectReachableHostPorts` `mapServeRoutes` `attachServePaths` `ServeRouteInput` | 「Docker inspect → 门户契约」**纯函数层**（S0-05 拆分自 `service.ts`） |
+
+**分层铁律（S0-05）**：`mapper.ts` 只做纯计算 —— 不构造/调用 dockerode（仅 `import type` 引用
+inspect 形状）、不发请求、不读文件、**不读全局配置**（`PortalConfig` 只经 `PortalHostContext` 传入）。
+因此入口解析可用固定输入直接断言，不需要真实 Docker；有状态的编排全部留在 `service.ts`。
+`service.ts` 保留全部同名 re-export，旧的 `import { mapPorts } from './docker/service.js'` 写法不受影响。
+
+**入口解析关键函数**
+
+| 函数 | 说明 |
+| --- | --- |
+| `mapPorts(inspect, hostContext, tailscaleIps, name)` | 以 `NetworkSettings.Ports` 为准（缺失回退 `HostConfig.PortBindings`）判定可达性 + 生成 URL；排序为「可达性优先 → 宿主端口升序」；去重交给 `dedupeIdenticalBindings` |
+| `dedupeIdenticalBindings(entries)` | 去掉「除 `hostIp` 外渲染结果完全一致」的重复绑定（真实 `docker inspect` 的 `0.0.0.0` + `::` 双栈形态），保留先出现的一条；判定键含协议/容器端口/宿主端口/可达性/URL/提示，**可达性不同不合并** |
+| `attachHostContext(items, hostContext)` | 缓存条目 + 当前访问者 → 重算 `ports[].url` / `reachability` / `primaryUrl` / `urlCandidates` |
+| `buildCandidates(ports, hostContext)` | 多候选入口（MagicDNS / tailnet IP / LAN / localhost），按 URL 去重 |
+| `collectReachableHostPorts(containers)` | 已作为 tailnet/lan 端口展示过的宿主端口集合（serve 去重依据） |
+| `mapServeRoutes(routes, containers)` | serve 路由 → 视图：回填所属容器 + 标记 `coveredByContainerPort`（逐字段构造，`funnel` / `targetPath` 不进契约） |
+| `attachServePaths(items, routes)` | 把 serve 路径写到容器卡上（`servePaths` / `servedUrl`） |
 
 **`DockerProvider` 方法**（全部只读）
 
@@ -207,6 +225,7 @@ SQLite 连接与迁移。
 **两层 URL 生成**（重要）：`mapContainer` 在缓存阶段用 `skipUrls: true`
 只算**可达性**（与访问者无关），URL 由 `attachHostContext` 在响应阶段按当前请求生成。
 这样一份缓存可以服务不同访问者（localhost / tailnet IP / MagicDNS）。
+（两者都在 `mapper.ts`，属纯函数，可单测；见 `server/tests/dockerMapper.test.ts`。）
 
 ### `src/modules/tailscale/`
 
@@ -341,7 +360,9 @@ TCP 通但 HTTP 不通仍判 `up`（服务可能是纯 TCP 或需鉴权跳转）
 | 文件 | 导出 | 说明 |
 | --- | --- | --- |
 | `registry.ts` | `SettingDefinition` `SettingEffect` `SettingValueType` `SettingGroup` `SettingView` `SETTING_GROUPS` `MASK_TOKEN` `buildSettingDefinitions` `resolveSettings` `settingsToMap` `applyTo` `validateSettingValue` `parseSettingValue` `serializeSettingValue` `maskSecret` `ApplyResult` `ResolvedSetting` | 三层解析 + 校验 + 写回 config |
-| `service.ts` | `SettingsService` `SettingsView` `UpdateSettingsInput` `UpdateSettingsResult` | 业务出口（含热重建编排） |
+| `service.ts` | `SettingsService` `SettingsView` `UpdateSettingsInput` `UpdateSettingsResult` | 业务出口（含热重建编排、敏感值加解密接入） |
+| `secretBox.ts` | `createSecretBox` `loadOrCreateKey` `parseKey` `parsePreviousKeys` `encodeKey` `SecretBoxError` `ENCRYPTED_PREFIX` `KEY_BYTES` | AES-256-GCM 加密盒（密文 `enc:v1:…`）+ 主密钥装载 |
+| `secretStore.ts` | `SecretSettingsStore` `collectSensitiveKeys` `ReencryptUpgrade` | 敏感键**写库前加密 / 读出后解密**的仓储装饰层 + 存量明文一次性升级 |
 | `tailscaleProbe.ts` | `probeTailscale` `effectiveMode` `summarizeApiDevices` `TailscaleProbeInput` `CommandExecutor` | 连通性测试（可注入 fetch/命令执行器） |
 | `types.ts` | `TailscaleTestResult` `TailscaleDeviceSummary` | 契约类型 |
 
@@ -377,11 +398,39 @@ TCP 通但 HTTP 不通仍判 `up`（服务可能是纯 TCP 或需鉴权跳转）
 | 方法 | 说明 |
 | --- | --- |
 | `initialize()` | 启动时应用数据库覆盖值（**必须在数据源被使用前调用**） |
+| `reencryptAll()` | 一次性把库里仍是明文（或旧密钥）的敏感值升级为当前密钥的密文；**幂等**，返回升级条数；未注入 `secretBox` 时返回 0。启动装配时调用一次 |
 | `ensureApplied(force?)` | 惰性幂等应用；以 settings 表的 `版本 = 条数:最新updatedAt` 判断是否需要重跑 |
 | `view()` | 全部设置项视图（敏感项打码、含来源与生效级别） |
 | `update(input)` | 部分成功语义：合法项写入、`restart` 级拒绝、非法项报告原因 |
 | `reset(keys \| null, actor, ip)` | 删除覆盖值（恢复默认），单事务 |
 | `testTailscale(candidateToken?)` | 连通性测试，支持尚未保存的候选 Token |
+
+**敏感设置加密存储（S0-03）**
+
+构造函数多了一个**可选**依赖 `secretBox`（`createSecretBox({ key, previousKeys })`）：
+
+- 不传 → 完全保持明文行为（无密钥场景与既有测试不受影响）；
+- 传入 → 注册表里 `sensitive: true` 的键，经 `SecretSettingsStore` 装饰层
+  **写库前加密、读库后解密**。`resolveSettings()` 读到的仍是明文，
+  因此 `applyTo()` 写回 `config` 的 Token 可直接用于调用外部 API。
+  `registry.ts` 的 `ResolveOptions.repository` 因此改为依赖 `SettingsStore` 接口
+  （`db/settings.ts` 抽出），而不是带 `private` 成员的类。
+- **旧明文兼容**：无 `enc:v1:` 前缀即视为迁移前的旧明文，原样读取；
+  下一次写入该键时自动升级为密文（惰性迁移），`reencryptAll()` 负责存量兜底。
+- **密钥轮换**：`previousKeys` 只用于解密，`isCurrentKey()` 判断是否需要升级。
+- **解密失败不崩**：该键按"未设置"处理（剔出读取结果 → 回退环境变量/默认），
+  记一条**只含键名**的告警，绝不把解不开的值当有效 Token 传给外部 API。
+- **不泄露**：日志与审计只记键名；审计里敏感项写成 `键=***`。
+
+装配方接线点（`app.ts`，本次未改）：
+
+```ts
+const { key } = loadOrCreateKey({ explicit: config.secrets.key, keyFile: config.secrets.keyFile, logger });
+const secretBox = createSecretBox({ key, previousKeys: config.secrets.previousKeys.map(parseKey) });
+const settings = new SettingsService({ /* …原有依赖… */, secretBox });
+await settings.reencryptAll();   // 存量明文一次性升级（幂等；失败只告警不中断）
+await settings.initialize();
+```
 
 ### `src/modules/overview/service.ts`
 

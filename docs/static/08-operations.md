@@ -129,11 +129,22 @@ PORTAL_TAILSCALE_MODE=api
 PORTAL_TAILSCALE_API_TOKEN=tskey-api-xxxxxxxx
 ```
 
-compose 的 `volumes` 需要有（磁盘盘符**必须**写成 `"C:/"` 并加引号）：
+compose 的 `volumes` 里磁盘挂载**默认是注释掉的**（Sprint 0 起）。
+默认挂 `C:/` 会让 Linux/NAS 上的 `docker compose` 直接报错（宿主没有该路径，
+个别版本还会悄悄建出目录），因此改成按需启用。要读磁盘指标就把下面这行
+**取消注释**，并同步 `.env` 的 `PORTAL_DISK_MOUNTS`：
 
 ```yaml
+      # Windows（Docker Desktop）：盘符必须写成 "C:/"（带斜杠）并加引号
       - "C:/:/host/disk/C:ro"
 ```
+
+```dotenv
+PORTAL_DISK_MOUNTS=C:=/host/disk/C
+```
+
+盘符写成 `C:` 会被 Compose 当成相对路径，解析成 `<项目目录>/C:` 而挂载失败。
+**挂载与登记两边都写了，门户才会展示该磁盘**（只写一边等于没配）。
 
 不要加 `/proc:/host/proc:ro`（WSL2 视图，与任务管理器对不上，挂了也没用，见 §2）。
 
@@ -321,6 +332,99 @@ console.log(db.prepare('SELECT id,username,display_name,role,disabled,last_login
 3. **登录成功后立即自查**：右上角 → 「账号管理」→「安全与偏好」可自助改密，
    改密后除当前会话外的其它会话都会失效。
 
+### 两步验证（TOTP）：设备丢了怎么办
+
+按"先试不动数据库的办法"排序，三种情况选一种。
+
+#### 情况一：还有动态码或恢复码
+
+- 验证器还在（换手机前迁移过、或另一台设备也配了）→ 直接用动态码登录。
+- 验证器丢了但**保存过恢复码** → 在登录第二步输入 `XXXX-XXXX` 形式的恢复码即可
+  （每个只能用一次）。登录后到「账号管理 → 安全与偏好 → 两步验证」可以**重新生成**
+  10 个新恢复码，重新生成会让**旧码全部作废**。
+- 两步验证是**可选**的：没绑定的账号一直只用密码，不受影响。
+
+#### 情况二：让另一个管理员帮忙重置（推荐路径）
+
+用另一个 admin 账号登录 →「账号管理」→ 目标用户 →「重置两步验证」。
+语义是**清绑定 + 删除全部恢复码 + 吊销该用户全部会话**：
+
+- 目标用户会立刻掉线，需要用密码重新登录（此时不再要求第二步）；
+- 重新登录后可在「安全与偏好」里重新绑定验证器；
+- 操作会写审计 `auth.totp_reset`，并记录吊销的会话数（界面提示里也会显示）。
+
+#### 情况三：唯一的管理员自己丢了设备（离线兜底）
+
+没有别的 admin 能帮你，只能直接在数据库里清除绑定。
+**先按 §10 备份数据卷（密钥与数据库必须一起备）**，然后：
+
+```bash
+# 1) 先看清账号现状：id / 角色 / 是否绑定两步验证
+docker compose exec homeport node -e "
+const D=require('/app/node_modules/better-sqlite3');
+const db=new D('/data/portal.sqlite',{readonly:true});
+console.log(db.prepare('SELECT id,username,role,disabled,totp_enabled,totp_confirmed_at FROM users ORDER BY id').all());
+"
+
+# 2) 清除目标账号的两步验证绑定并吊销其会话（把 'admin' 换成你的用户名）
+docker compose exec homeport node -e "
+const D=require('/app/node_modules/better-sqlite3');
+const db=new D('/data/portal.sqlite');
+const now=new Date().toISOString();
+const u=db.prepare('SELECT id,username FROM users WHERE username_ci=?').get('admin');
+if(!u){ console.log('未找到该账号'); process.exit(1); }
+db.prepare('UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_confirmed_at=NULL, totp_last_counter=NULL, updated_at=? WHERE id=?').run(now,u.id);
+db.prepare('DELETE FROM totp_recovery_codes WHERE user_id=?').run(u.id);
+db.prepare('DELETE FROM totp_challenges WHERE user_id=?').run(u.id);
+const revoked=db.prepare('UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL').run(now,u.id).changes;
+console.log('已清除', u.username, '的两步验证绑定，吊销会话数:', revoked);
+"
+```
+
+等价的 SQL（容器内/宿主上有 `sqlite3` 时）。**注意两点**：
+用户名要按 `username_ci`（即 `username.toLowerCase()`）比较，直接比 `username` 会漏；
+时间戳用 `strftime('%Y-%m-%dT%H:%M:%fZ','now')` 生成 ISO-8601 UTC，
+与应用（`new Date().toISOString()`）写的格式保持一致：
+
+```sql
+UPDATE users
+   SET totp_secret = NULL, totp_enabled = 0, totp_confirmed_at = NULL,
+       totp_last_counter = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+ WHERE username_ci = 'admin';
+
+DELETE FROM totp_recovery_codes
+ WHERE user_id = (SELECT id FROM users WHERE username_ci = 'admin');
+
+DELETE FROM totp_challenges
+ WHERE user_id = (SELECT id FROM users WHERE username_ci = 'admin');
+
+UPDATE sessions SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+ WHERE user_id = (SELECT id FROM users WHERE username_ci = 'admin')
+   AND revoked_at IS NULL;
+```
+
+改完后 `docker compose restart homeport`（让进程内的用户缓存失效），再用密码登录
+并重新绑定验证器。
+
+相关列（表 `users`，由迁移 v3 `totp_two_factor` 添加）：
+
+| 列 | 含义 |
+| --- | --- |
+| `totp_secret` | 种子**密文**（`enc:v1:…`，AES-256-GCM），不是明文 Base32 |
+| `totp_enabled` | `1` = 已确认启用；`setup` 阶段会先写种子但保持 `0`（"扫了码没输码"不算启用） |
+| `totp_confirmed_at` | 确认启用的时间（界面显示"启用时间"） |
+| `totp_last_counter` | 最后成功使用的 30 秒时间步，用于**登录**防重放 |
+
+恢复码与挑战分别在 `totp_recovery_codes`（只存 sha256 摘要、`used_at` 标记核销）与
+`totp_challenges`（只存令牌摘要、带 `attempts`/`consumed_at`/`expires_at`）两张表里。
+清绑定时一并删掉恢复码；残留的挑战行不会挡住后续登录（登录时会新建挑战），
+但留着既无用又扩大了令牌摘要的暴露面，所以顺手清掉。
+
+> ⚠️ 直接改库**不会**写审计、也不经过"最后一个管理员"之类的应用层保护 —— 这是最后手段。
+> 另外 `docker compose exec` 要求容器在跑；容器起不来时，用
+> `docker run --rm -v homeport-data:/data -v "$PWD:/backup" alpine ...` 之类的方式
+> 挂同一个卷来操作，或先按 §10 恢复备份。
+
 ### 首启令牌在哪里（与登录密码无关）
 
 首次启动时用于创建管理员的那个令牌，和登录密码是两回事：
@@ -473,3 +577,160 @@ server {
 ```
 
 同时设置 `PORTAL_SECURE_COOKIES=1` 与 `PORTAL_PUBLIC_HOST=portal.example.com`。
+
+反代不在回环地址上时，还要显式配 `PORTAL_TRUST_PROXY`（默认 `loopback`），
+否则登录限流会把所有请求归到同一个 IP 桶。设成 `1` 等于"相信任何来源的转发头"，
+只有确认反代**不可绕过**时才这么配（安全侧理由见 `06-security.md` §5）。
+
+## 10. 主密钥与备份（Sprint 0 起必读）
+
+**加密的东西只有配对的密钥才能读回。** 主密钥默认由门户自己生成在数据卷里：
+
+```
+/data/portal.sqlite      # 业务数据（敏感设置项与 TOTP 种子在里面是 enc:v1:… 密文）
+/data/secret.key         # 主密钥（0600），与数据库同一个卷
+/data/setup-token.txt    # 首启令牌（初始化后可删）
+```
+
+| 项 | 说明 |
+| --- | --- |
+| 密钥来源优先级 | `PORTAL_SECRET_KEY`（宿主环境变量）→ `PORTAL_SECRET_KEY_FILE`（默认 `/data/secret.key`，文件存在即读取）→ 自动生成并写入该文件（`0600`） |
+| 加密范围 | `settings` 表里标 `sensitive` 的键（如 Tailscale API Token）**+ 用户的 TOTP 种子** |
+| 轮换密钥 | 把**旧**密钥填进 `PORTAL_SECRET_KEY_PREVIOUS`（逗号分隔，只用于解密），再换主密钥；启动时 `reencryptAll()` 会把老密文升级到新密钥，升级完成后日志里会有一条 `info`（含条数），确认无误再摘掉 `PORTAL_SECRET_KEY_PREVIOUS` |
+| 密钥丢失 | 已加密值**不可逆**：敏感设置按"未设置"处理（重填一次即恢复）；已绑定 TOTP 的账号动态码校验不通过 —— 但**恢复码仍可用**（它走 sha256 摘要校验，不经过主密钥），否则走 §5 的重置流程重新绑定 |
+| 底线 | 未启用两步验证的账号照旧用密码登录，门户不会整体锁死 |
+
+### 备份
+
+**必须把密钥与数据库一起备份**（分开备份 = 恢复时读不出敏感字段）：
+
+```bash
+# 备份到当前目录（Linux/NAS/macOS）
+docker run --rm -v homeport-data:/data -v "$PWD:/backup" alpine \
+  tar czf /backup/homeport-data-$(date +%Y%m%d-%H%M%S).tgz -C /data .
+```
+
+Windows（PowerShell）：
+
+```powershell
+docker run --rm -v homeport-data:/data -v "${PWD}:/backup" alpine `
+  tar czf /backup/homeport-data-$(Get-Date -Format yyyyMMdd-HHmmss).tgz -C /data .
+```
+
+恢复：`docker compose down` → 把压缩包解回卷 → `docker compose up -d`：
+
+```bash
+# 先确认要恢复的是哪个归档（<时间戳> 换成实际值）
+docker run --rm -v homeport-data:/data -v "$PWD:/backup" alpine \
+  sh -c 'rm -rf /data/* && tar xzf /backup/homeport-data-<时间戳>.tgz -C /data'
+docker compose up -d
+```
+
+换机器恢复时确认 `secret.key` 也在包里，否则 Token 需要重填、TOTP 需要重新绑定。
+
+> 需要更强隔离时，显式提供 `PORTAL_SECRET_KEY`（宿主环境变量或 compose 的 `secrets`），
+> 把密钥与数据卷**分开**存放 —— 这样"数据库卷被拷走"也不足以解密。
+> 注意：改用显式密钥后，原来的 `/data/secret.key` 就作废了，迁移期间要先用
+> `PORTAL_SECRET_KEY_PREVIOUS` 过渡。
+
+## 11. 容器最小权限（`docker.sock`）
+
+门户要读 Docker 才能展示容器墙，所以必须碰到 socket。Sprint 0 起默认 compose 已收紧：
+
+| 措施 | 作用 |
+| --- | --- |
+| `docker.sock` 以 **`:ro`** 挂载 | 容器内进程无法改写 socket 文件本身 |
+| `cap_drop: ALL` | 去掉全部 Linux capability（门户不需要任何一项） |
+| `security_opt: no-new-privileges:true` | 禁止通过 setuid/setgid 提权 |
+| 非 root `node` 用户 + 只读展示 | 门户在类型层面就不存在 Docker 写方法 |
+| 宿主磁盘挂载**默认全部注释** | 默认挂 `C:/` 会让 Linux/NAS 起不来；按需启用并同步 `PORTAL_DISK_MOUNTS`（见 §3.1） |
+
+### 为什么 `:ro` 不够
+
+`:ro` 只是**挂载层面**的只读：Docker 的 HTTP API 完全看不到挂载选项，
+容器内的进程依然可以对 socket 发 `POST /containers/{id}/stop` 这类**写请求**。
+也就是说，`:ro` 挡得住"改写 socket 文件"，挡不住"通过 socket 指挥 Docker 守护进程"。
+
+### 可选的只读 socket 代理（推荐给"门户进程可能被攻破"的场景）
+
+仓库提供了覆盖文件 `docker-compose.socket-proxy.yml`：门户不再直连 socket，
+而是连一个只放行读取接口的 HAProxy 代理（`tecnativa/docker-socket-proxy`）。
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.socket-proxy.yml up -d --build
+```
+
+- 放行清单按代码实际用到的接口列：`CONTAINERS` / `INFO` / `VERSION` / `PING`
+  （即 list / inspect / logs / stats / info / 探活）；`POST` / `EXEC` / `BUILD` /
+  `SECRETS` / `SYSTEM` 等写接口显式关闭。
+- 代理**不 publish 到宿主端口**（只在 compose 网络内 `expose: 2375`），
+  门户通过服务名 `tcp://docker-socket-proxy:2375` 访问。
+- 收益：任何写操作在代理层被拒，与门户代码是否有漏洞**无关** —— 这是结构性保证。
+- 代价：多一个约 20MB 的容器，每次 Docker API 调用多一跳 HTTP（同 compose 网络内，<1ms）。
+- 以后门户需要展示镜像/网络/卷的**额外**信息时，再把对应开关置 `1`（如 `IMAGES: 1`），
+  不要图省事全开。
+
+### 没有默认开启的：只读根文件系统
+
+`docker-compose.yml` 里 `read_only: true` 与 `tmpfs: /tmp` 是**注释示例**，默认不开。
+原因：NAS 上的 Docker/Compose 版本差异较大，个别版本对
+`read_only` + 命名卷 + `group_add` 的组合处理不一致，而它带来的额外收益
+小于"部署直接起不来"的风险。要开就按注释里那两行开（`/data` 必须保持可写：
+SQLite、首启令牌与主密钥都写在那里），并在验证过版本后再用于生产。
+
+## 12. CI 质量门与本地 E2E
+
+### 12.1 两个工作流的分工
+
+| 工作流 | 触发 | 做什么 | 权限 |
+| --- | --- | --- | --- |
+| `.github/workflows/ci.yml` | 所有 `pull_request`、`master` 的 push、手动 `workflow_dispatch` | `quality`（typecheck → `npm test` → `npm run build` → 校验构建产物存在）+ `e2e`（Playwright 冒烟，`needs: quality`） | 仅 `contents: read`，**不引用任何 secret** |
+| `.github/workflows/docker-publish.yml` | `master` 的 push、`v*` tag、手动 | `quality`（同样的 typecheck / test / build）+ `build-and-push`（多架构镜像推 GHCR） | `quality` 为 `contents: read`；`build-and-push` 另需 `packages: write` |
+
+- **`ci.yml` 刻意没有 `paths-ignore`**：如果 CI 只在代码变动时跑，纯文档 PR 就不产生任何
+  check；一旦分支保护要求"check 必须通过"，这类 PR 会永久停在 pending。宁可多跑一次。
+- `docker-publish.yml` **有** `paths-ignore`（`**.md` / `docs/**` / `LICENSE` /
+  `docker-compose*.yml`），因为纯文档与 compose 改动不影响镜像内容。
+- 发布门禁**重复**了 `ci.yml` 的步骤而不是复用它：两个工作流触发条件不同，
+  且门禁必须**自证**（依赖另一个工作流的结论会引入"那个工作流被跳过或改名后门禁静默失效"
+  的风险）。`server/tests/ciWorkflow.test.ts` 会在两边步骤不一致时打红。
+- 权限边界：`docker-publish.yml` 没有 `pull_request` 触发，外部 fork 的 PR 拿不到
+  `secrets.GITHUB_TOKEN` 与 `packages: write`。
+
+### 12.2 E2E 是不是发布前置？
+
+- 在 `ci.yml` 里 `e2e` 依赖同文件的 `quality`，因此 PR 上是**必过检查**（配合分支保护）。
+- 在 `docker-publish.yml` 里 `build-and-push` **只**依赖同文件的 `quality`：
+  **E2E 目前不是发布依赖** —— 镜像发布只被"类型检查 + 单测 + 构建"卡住。
+- 想让 E2E 也成为发布前置，需要两步：①在 `docker-publish.yml` 里也定义一个 `e2e` job；
+  ②把依赖改成一行：
+
+  ```yaml
+    build-and-push:
+      needs: [quality, e2e]
+  ```
+
+  ⚠️ `needs` 只能引用**同一个工作流文件内**的 job —— 不能写 `needs: e2e` 去引用 `ci.yml`
+  的 job（GitHub Actions 不支持跨工作流依赖）。所以只改这一行而不加 job 会让工作流直接失效。
+
+### 12.3 本地跑 E2E
+
+```bash
+npm run test:e2e          # = playwright test
+```
+
+| 项 | 值 | 原因 |
+| --- | --- | --- |
+| 默认端口 | **8988**，`PORTAL_E2E_PORT` 可覆盖（PowerShell：`$env:PORTAL_E2E_PORT='9001'; npm run test:e2e`） | 刻意避开生产端口 **8899**：开发机上常跑着 `homeport-portal` 容器占着 8899，而配置要求 `reuseExistingServer: false`（绝不复用可能在跑的旧代码），两者相撞会直接报端口已被占用 |
+| 启动方式 | `npm run e2e:serve`（= `node e2e/start-server.mjs`），由 Playwright 的 `webServer` 拉起 | 启动脚本**先跑完整生产构建**（`npm run build`），保证被测的就是生产产物，而不是某次遗留的旧 dist |
+| 数据目录 | 每次启动前**清空** `.e2e-data`（已在 `.gitignore`） | 「首启初始化」这条流程必须能反复运行，否则第二次会撞上"系统已初始化" |
+| 数据源 | `DOCKER_ENDPOINT=/nonexistent/docker.sock`、`PORTAL_TAILSCALE_MODE=off` | 冒烟要验证的正是"数据源不可用时显示降级提示而不是白屏"，所以不连真 Docker |
+| 首启令牌 | 固定测试值 `E2E-TEST-TOKEN-0000-0000`（`PORTAL_E2E_SETUP_TOKEN` 可覆盖） | 不是任何真实密钥 |
+| 执行方式 | 串行（`workers: 1`、`fullyParallel: false`） | 所有用例共用同一个 SQLite 库与同一个服务进程，首启初始化只能执行一次 |
+| 首次耗时 | 数十秒到数分钟 | 先完成完整生产构建，`webServer.timeout` 给到 5 分钟，单用例 60 秒 |
+| 失败产物 | `playwright-report/`、`test-results/`（均被忽略） | CI 上失败会自动上传 `playwright-report/` |
+
+覆盖范围（**不写具体用例数**，数字会随迭代变化）：首启初始化（错误令牌被拒 / 正确令牌
+创建管理员）→ 登录与登出、受保护路由回跳 → 关键页面在 Docker 与 tailnet 均不可用时显示
+降级提示而非白屏 → viewer/admin 权限边界 → 安全响应头（首页带 CSP 与 `nosniff`，
+且 CSP 不阻断门户自身前端产物）。用例见 `e2e/smoke.spec.ts` 与 `e2e/security-headers.spec.ts`。

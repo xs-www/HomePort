@@ -23,6 +23,9 @@
 | `VALIDATION_FAILED` | 400 | 请求体/查询参数不合法，`details.fieldErrors` 给出字段错误 |
 | `UNAUTHENTICATED` | 401 | 未登录或会话过期 |
 | `INVALID_CREDENTIALS` | 401 | 用户名或密码错误 |
+| `TOTP_INVALID` | 401 | 两步验证的动态码/恢复码不正确 → 前端**就地重试**（不是会话失效，不应登出） |
+| `TOTP_CHALLENGE_EXPIRED` | 401 | 登录第二步的挑战已过期/已消费/尝试次数超限 → 退回第一步重新登录 |
+| `TOTP_UNAVAILABLE` | 400 | 服务端未启用两步验证能力（未配置主密钥或功能被关闭） |
 | `FORBIDDEN` | 403 | 角色不足 |
 | `CSRF_MISMATCH` | 403 | CSRF token 缺失或不匹配 |
 | `SETUP_REQUIRED` | 409 | 尚未初始化管理员，需先调用 `/api/auth/bootstrap` |
@@ -62,19 +65,49 @@
   "setupRequired": false,
   "authenticated": true,
   "csrfToken": "b7f1...",
-  "user": { "id": 1, "username": "admin", "displayName": "管理员", "role": "admin" },
+  "user": { "id": 1, "username": "admin", "displayName": "管理员", "role": "admin", "totpEnabled": false, "totpConfirmedAt": null },
   "expiresAt": "2026-03-01T12:00:00.000Z"
 }
 ```
-未登录时 `authenticated=false`、`user=null`（`csrfToken` 仍下发，供登录请求使用 —— 登录接口是唯一豁免 CSRF 的变更接口）。
+未登录时 `authenticated=false`、`user=null`（`csrfToken` 仍下发，供登录请求使用 ——
+`/api/auth/login`、`/api/auth/login/totp`、`/api/auth/bootstrap` 是仅有的三个豁免 CSRF 的变更接口，
+见 `server/src/http/guards.ts` 的 `CSRF_EXEMPT_PATHS`）。
 
 ### `POST /api/auth/login`
-无需登录、豁免 CSRF、限流 10/min/IP。
+无需登录、豁免 CSRF。限流 **10 次/分钟/IP**，与下面的 `login/totp` **共用同一个计数桶**
+（`LOGIN_RATE_LIMIT`，`server/src/api/auth.ts`）。
 ```json
 { "username": "admin", "password": "••••••", "remember": true }
 ```
-→ `200 { "user": {...}, "csrfToken": "..." }`（同时 `Set-Cookie`）
-错误：`INVALID_CREDENTIALS` / `SETUP_REQUIRED` / `RATE_LIMITED`
+→ 账号未启用两步验证：`200 { "user": {...}, "csrfToken": "...", "expiresAt": "..." }`（同时 `Set-Cookie`）
+
+→ 账号已启用两步验证：`200 { "totpRequired": true, "challengeToken": "...", "expiresAt": "..." }`
+**不设置会话 Cookie** —— `challengeToken` 只是一次性凭据（TTL 默认 300s），
+前端拿它去调下一步；因为挑战尚未构成会话，前端**不得**把它写进 localStorage/sessionStorage。
+
+错误：`INVALID_CREDENTIALS` / `SETUP_REQUIRED` / `RATE_LIMITED` / `TOTP_UNAVAILABLE`
+
+### `POST /api/auth/login/totp`
+无需登录、豁免 CSRF（会话尚未建立）、限流同上（与 `login` 共用 `LOGIN_RATE_LIMIT` 的桶）。
+
+> **为什么两条路由必须共用限流**：挑战内部只有 5 次尝试上限，
+> 真正的暴力尝试是"重新登录换一个新挑战、再来 5 次"。
+> 两条路由各算一个桶的话，拿到密码的人可以对 6 位码无限重试（`server/src/api/auth.ts`）。
+
+```json
+{ "challengeToken": "...", "code": "123456", "remember": true }
+```
+`code` 既接受 6 位动态码，也接受恢复码（形如 `XXXX-XXXX`，每码只能用一次）。
+
+→ `200 { "user": {...}, "csrfToken": "...", "expiresAt": "..." }`（同时 `Set-Cookie`）
+错误：`TOTP_INVALID`（就地重试）/ `TOTP_CHALLENGE_EXPIRED` / `VALIDATION_FAILED`
+
+`TOTP_CHALLENGE_EXPIRED` 覆盖**四种**情况，语义都是"这个挑战不能再用了，退回第一步重新登录"：
+挑战不存在、已过期、已消费（此前已用它换过会话）、以及在这个挑战上**尝试次数已达 5 次**
+（文案"尝试次数过多，请重新登录"；常量 `TOTP_CHALLENGE_MAX_ATTEMPTS`，`server/src/db/totp.ts`）。
+
+> **前端语义**：`TOTP_INVALID` 是"这次输错了"，不是"会话失效"；
+> 客户端**不**因它触发全局登出回调。
 
 ### `POST /api/auth/logout`
 需登录。销毁当前会话 → `204`
@@ -322,7 +355,7 @@ data: {}
 需登录。`{ "theme"?: "dark|light|system", "defaultPage"?: string, "density"?: "comfortable|compact" }` → `200`
 
 ### `GET /api/users` （admin）
-`{ "items": [{ "id":1, "username":"admin", "displayName":"管理员", "role":"admin", "createdAt":"...", "lastLoginAt":"..." }], "total": 1 }`
+`{ "items": [{ "id":1, "username":"admin", "displayName":"管理员", "role":"admin", "totpEnabled": true, "totpConfirmedAt":"2026-10-16T02:00:00.000Z", "createdAt":"...", "lastLoginAt":"..." }], "total": 1 }`
 
 ### `POST /api/users` （admin）
 `{ "username": "...", "password": "...", "displayName": "...", "role": "viewer" }` → `201`
@@ -339,6 +372,50 @@ data: {}
 
 ### `POST /api/users/:id/sessions/revoke` （admin）
 吊销该用户全部会话（强制下线）→ `200 { "revoked": 3 }`
+
+### 两步验证（TOTP）自助管理
+均需登录 + CSRF。挂在 `/api/users/me/*` 而不是 `/api/auth/*`，因为它们是
+**登录后的变更操作**（`/api/auth/*` 是匿名作用域，没有角色守卫与 CSRF 钩子）。
+
+账号对象在两个接口里都新增了 `totpEnabled: boolean`（`GET /api/auth/session`、
+`GET /api/users/me`、`GET /api/users` 的 `user` 一致）；另有 `totpConfirmedAt: string | null`
+（绑定确认时间，前端显示"启用时间"）。这两个字段都来自 `AuthService.toPublicUser()` 的
+**显式白名单**（`server/src/modules/auth/service.ts`）；`GET /api/users` 走的是
+`UsersRepository.list()` → `mapUserRow()`（`server/src/db/types.ts`），字段集合相同。
+
+> **种子与恢复码永远不会出现在任何响应里**：库里存的只有 AES-256-GCM 密文（`users.totp_secret`）
+> 和 sha256 摘要（恢复码、挑战令牌），而对外模型 `User` 里**根本没有**这些字段 ——
+> `UserWithSecret.totpSecretEncrypted` / `totpLastCounter` 只存在于服务端内部
+> （`server/src/db/types.ts`），且 `toPublicUser()` 是逐个字段列举的白名单而不是"删掉密码哈希后展开"，
+> 所以以后往内部模型加字段也不会默认泄漏。明文种子只在 `setup` 的响应里出现一次，
+> 恢复码明文只在 `enable` 与 `recovery-codes` 的响应里各出现一次。
+
+| 接口 | 请求体 | 成功响应 | 主要错误 |
+| --- | --- | --- | --- |
+| `POST /api/users/me/totp/setup` | — | `200 { "secret": "JBSW…", "otpauthUri": "otpauth://totp/HomePort:admin?secret=…", "digits": 6, "period": 30 }` | `CONFLICT`（已启用时不能重新生成，需先关闭）/ `TOTP_UNAVAILABLE` |
+| `POST /api/users/me/totp/enable` | `{ "code": "123456" }` | `200 { "recoveryCodes": ["XXXX-XXXX", …], "user": {...} }` | `TOTP_INVALID` / `TOTP_UNAVAILABLE`（服务端关闭了新绑定）/ `VALIDATION_FAILED`（未先 setup） |
+| `POST /api/users/me/totp/disable` | `{ "password": "...", "code": "123456"? }`（`code` 在 schema 里**可选**，但当前**已启用**两步验证时业务层必填） | `200 { "ok": true, "user": {...} }` | `VALIDATION_FAILED`（密码错误 → `fieldErrors.password`；已启用却没给 `code` → `fieldErrors.code`）/ `TOTP_INVALID` |
+| `POST /api/users/me/totp/recovery-codes` | `{ "code": "123456" }` | `200 { "recoveryCodes": ["XXXX-XXXX", …] }` | `TOTP_INVALID` / `VALIDATION_FAILED`（尚未启用） |
+| `POST /api/users/:id/totp/reset` （admin） | — | `200 { "ok": true, "revokedSessions": 3 }` | `NOT_FOUND` / `FORBIDDEN` |
+
+约定与注意点：
+
+1. `setup` 重复调用会**重新生成未确认的种子**，使上一个未确认种子立即失效；界面必须就此提示。
+2. `enable` / `recovery-codes` 返回的恢复码**只出现这一次**（库里只存 SHA-256 摘要），
+   界面必须一次性展示、逐条列出、要求用户确认已保存；重新生成时旧码全部作废。
+3. **关闭两步验证的门槛不低于开启**：要密码，且当前已启用时还要一次动态码或恢复码。
+   `code` 在 schema 上**可选**（未启用时不必给），但**已启用时业务层必填**，
+   缺失按 `VALIDATION_FAILED` 400 + `fieldErrors.code` 返回
+   （`totpDisableBodySchema`，`server/src/http/schemas.ts`）。
+   密码错误同样是 `VALIDATION_FAILED` 400 + `fieldErrors.password`，
+   **不**返回 401 `INVALID_CREDENTIALS` —— 与同文件的自助改密（`changeOwnPassword`）写法一致，
+   前端对这两种响应都已能正确提示。
+4. `reset`（admin 强制重置）的语义是"清空种子与恢复码 + 吊销该用户全部会话"，
+   用户会立即掉线、需重新登录并重新绑定，因此界面必须二次确认并写明后果。
+5. `setup` 与 `enable` 受服务端开关 `PORTAL_TOTP_ENABLED` 限制：关闭时两者都返回
+   `TOTP_UNAVAILABLE`。**已绑定账号的登录第二步、以及 `disable` / `recovery-codes` 不受该开关影响**
+   —— 否则关掉开关就等于静默降级或把人锁在门外（`assertTotpEnrollmentAllowed()`，
+   `server/src/modules/auth/service.ts`；配置说明见 [02-configuration.md](./02-configuration.md)）。
 
 ---
 
@@ -436,7 +513,7 @@ data: {}
 | 接口 | 匿名 | viewer | admin |
 | --- | :-: | :-: | :-: |
 | `/api/health` | ✅ | ✅ | ✅ |
-| `/api/auth/session`、`login`、`bootstrap` | ✅ | ✅ | ✅ |
+| `/api/auth/session`、`login`、`login/totp`、`bootstrap` | ✅ | ✅ | ✅ |
 | `/api/auth/logout`、`/api/auth/password` | ❌ | ✅ | ✅ |
 | `/api/overview`、`/api/containers*`、`/api/tailscale/*`、`/api/system/*`、`/api/tools*` | ❌ | ✅ | ✅ |
 | `/api/users/me*` | ❌ | ✅ | ✅ |
@@ -446,3 +523,14 @@ data: {}
 ## 10. 变更记录
 
 接口的任何变动必须同步更新本文件，并在 [09-changelog.md](./09-changelog.md) 记录。
+
+- **S0-03（两步验证 TOTP）**：新增 `POST /api/auth/login/totp`；
+  `POST /api/auth/login` 对已启用 TOTP 的账号改回 `{ totpRequired, challengeToken, expiresAt }` 且不发 Cookie；
+  `user` 对象新增 `totpEnabled`（另有 `totpConfirmedAt`）；
+  新增自助接口 `POST /api/users/me/totp/{setup,enable,disable,recovery-codes}` 与管理员的
+  `POST /api/users/:id/totp/reset`；错误码新增 `TOTP_INVALID` / `TOTP_CHALLENGE_EXPIRED` / `TOTP_UNAVAILABLE`。
+  - 归档补记（**对既有接口的澄清**，不是新增接口）：`disable` 的密码错误按
+    `VALIDATION_FAILED` 400 + `fieldErrors.password` 返回（与自助改密写法一致，**不是** 401）；
+    其 `code` 在 schema 上可选、**已启用时必填**；`login/totp` 的挑战尝试次数超限
+    也返回 `TOTP_CHALLENGE_EXPIRED`；`setup` / `enable` 在 `PORTAL_TOTP_ENABLED=0` 时返回
+    `TOTP_UNAVAILABLE`（不影响已绑定账号的登录第二步与 `disable`）。

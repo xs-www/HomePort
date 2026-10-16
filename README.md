@@ -1,5 +1,7 @@
 # HomePort · 母港 — Tailnet 动态门户
 
+[![CI](https://github.com/xs-www/HomePort/actions/workflows/ci.yml/badge.svg)](https://github.com/xs-www/HomePort/actions/workflows/ci.yml)
+
 跑在 Docker 里的**本机控制面板**。把宿主机上所有可经 tailnet 访问的容器、tailnet 设备在线状态、
 宿主 CPU/内存/磁盘/GPU 占用，以及 Ollama / DSH / ComfyUI 等本机工具，聚合成一个带登录权限管理的入口页。
 
@@ -15,7 +17,7 @@
 | **F2** | tailnet 设备状态 | 设备列表、在线/离线、OS、tailnet IP、直连或中继、最后可见时间 |
 | **F3** | 宿主资源占用 | CPU（含各核心）、内存、磁盘、GPU（含占用显存的进程），SSE 实时推送 |
 | **F4** | 本机工具入口 | Ollama / DSH / ComfyUI / Open WebUI / Portainer / Jellyfin 等，带 TCP+HTTP 可用性探测与多候选入口 |
-| **F5** | 登录权限管理 | 本地账号、admin/viewer 角色、会话持久化、首启管理员初始化、审计日志 |
+| **F5** | 登录权限管理 | 本地账号、admin/viewer 角色、会话持久化、首启管理员初始化、审计日志、**可选两步验证（TOTP + 一次性恢复码，含管理员强制重置）** |
 
 ## 快速开始
 
@@ -80,9 +82,16 @@ npm run dev
 npm run dev:web
 
 # 测试与类型检查
-npm test
-npm run typecheck
+npm test                      # 一次跑 server 与 web 两个工作区的单测（Vitest）
+                              # 当前规模：server 15 文件 / 333 用例，web 4 文件 / 106 用例
+npm run typecheck             # server + web 两个工作区
+npm run test:e2e              # Playwright 冒烟（默认端口 8988，先跑完整生产构建；
+                              # 换端口：PORTAL_E2E_PORT=9001 npm run test:e2e）
 ```
+
+CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在 PR 与 `master` push 上跑
+同样的 typecheck + 单测 + 构建，并额外跑 Playwright E2E；镜像发布
+（[`docker-publish.yml`](.github/workflows/docker-publish.yml)）只有质量门通过后才会推送。
 
 Windows 本机开发时设置 `DOCKER_ENDPOINT=npipe:////./pipe/dockerDesktopLinuxEngine`。
 若在 Windows 上直接跑 Node（不是容器内），无需任何挂载即可读真实硬件数据。
@@ -167,7 +176,10 @@ PORTAL_TAILSCALE_MODE=api
 PORTAL_TAILSCALE_API_TOKEN=tskey-api-xxxxxxxx
 ```
 
-compose 的 volume 里盘符**必须**写成 `"C:/:/host/disk/C:ro"`（写成 `C:` 会被当相对路径）。
+compose 里磁盘挂载**默认是注释掉的**（默认挂 `C:/` 会让 Linux/NAS 上的 `docker compose`
+直接起不来）。要读磁盘指标就把 `volumes` 里那行取消注释，并在 `.env` 同步
+`PORTAL_DISK_MOUNTS`；盘符**必须**写成 `"C:/"`（带斜杠）并加引号
+（写成 `C:` 会被当成相对路径，解析成 `<项目目录>/C:`）。
 
 不要加 `/proc:/host/proc:ro` —— 挂进来的是 WSL2 虚拟机视图，与任务管理器对不上。
 
@@ -281,13 +293,30 @@ Linux/NAS 上该域名才会解析。
 - 密码：bcrypt cost 12；最少 10 位且至少两类字符。
 - 会话：256 位随机令牌，DB **只存 SHA-256 摘要**，Cookie `HttpOnly; SameSite=Lax`。
 - CSRF：独立令牌 + 请求头校验，变更类请求全部强制。
+- **两步验证（可选）**：TOTP（HMAC-SHA1 / 6 位 / 30 秒，兼容各家验证器 App）。
+  密码通过后**不签发会话**，只给 5 分钟挑战令牌；10 个一次性恢复码（只显示一次、入库只存摘要）；
+  管理员可强制重置（清绑定 + 吊销该用户全部会话 + 审计）。绑定与关闭都在
+  「账号管理 → 安全与偏好」，关闭需要密码 + 当前验证码/恢复码。
+- **安全响应头**：CSP（默认策略可被 `PORTAL_CSP` 覆盖）、`X-Content-Type-Options: nosniff`、
+  `X-Frame-Options: DENY`、COOP/CORP、`Referrer-Policy: no-referrer`、`Permissions-Policy`；
+  HSTS **只在 HTTPS 下**下发且不带 `includeSubDomains`（宿主是共享域名 `*.ts.net`）；
+  `/api/*` 一律 `cache-control: no-store`。手写实现（`server/src/http/securityHeaders.ts`），
+  没有引入 `@fastify/helmet`。
+- **敏感数据加密**：`settings` 表里标 `sensitive` 的项（如 Tailscale API Token）与用户 TOTP 种子
+  都是 AES-256-GCM 密文（`enc:v1:…`）；主密钥来自 `PORTAL_SECRET_KEY`，或自动生成
+  `/data/secret.key`（0600）。**备份数据卷时要连 `secret.key` 一起备份**，否则这些字段读不回来。
+- 反代信任边界：`PORTAL_TRUST_PROXY` 默认 `loopback`（只信回环代理，即 `tailscale serve`），
+  既拿到真实客户端 IP 用于限流，又忽略外部客户端伪造的 `X-Forwarded-*`。
 - 防护：登录限流 10 次/分钟/IP；用户枚举防护（统一报错 + 耗时抹平）。
 - 脱敏：容器环境变量与日志里的密钥在**服务端**就替换为 `***`。
 - 不变量：系统始终保留至少一个启用状态的管理员。
 
 > **最大风险点**：挂载 `docker.sock` 意味着门户进程拥有等价于宿主机 root 的能力。
-> 因此本门户刻意只做只读展示、以非 root 用户运行、并强制登录。
-> 如需进一步收敛，可换成只读 socket 代理（如 `docker-socket-proxy` 仅放行 GET）。
+> 因此本门户刻意只做只读展示、以非 root 用户运行、并强制登录；`docker.sock` 默认以
+> **`:ro`** 挂载，另加 `cap_drop: ALL` 与 `no-new-privileges:true`。
+> 但 `:ro` 只是挂载层只读，挡不住通过 socket 发写请求 —— 需要更强保证时用**可选的只读
+> socket 代理**：`docker compose -f docker-compose.yml -f docker-compose.socket-proxy.yml up -d --build`
+> （只放行 list/inspect/logs/stats 等读接口）。
 > 完整威胁模型与残余风险见 [docs/static/06-security.md](docs/static/06-security.md)。
 
 ## 技术栈
@@ -296,8 +325,9 @@ Linux/NAS 上该域名才会解析。
 | --- | --- |
 | 后端 | Node.js 22 · TypeScript · Fastify 5 · dockerode · better-sqlite3 · zod |
 | 前端 | React 19 · Vite 6 · TypeScript · Tailwind CSS 4 · React Router 7 |
-| 打包 | 四阶段 Dockerfile（alpine，非 root，tini） |
-| 测试 | Vitest（129 个用例） |
+| 打包 | 四阶段 Dockerfile（alpine，非 root，tini）；镜像由 CI 多架构构建（amd64 + arm64） |
+| 测试 | `npm test` 一次跑 server 与 web 两个工作区的 Vitest 单测（当前 439 个用例），`npm run test:e2e` 跑 Playwright 冒烟（首启初始化 / 登录 / 关键页面 / 权限 / 安全响应头） |
+| CI | [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：typecheck + 单测 + 构建 + E2E（PR 与 master push） |
 
 架构与逐函数说明见 [docs/static/](docs/static/README.md)。
 
@@ -315,8 +345,14 @@ Linux/NAS 上该域名才会解析。
 1. **Windows 容器化部署下，CPU/内存只有 WSL2 虚拟机的数（4 线程 / 3.9 GB）**，
    与宿主（20 线程 / 31.6 GB）不符；GPU 也不可用。需要真实硬件数据请原生运行。
 2. Windows 上 tailnet 查询需用 API 模式（容器内无法执行 Windows 可执行文件）。
-3. 未做 TOTP 二次验证，未设置 CSP/HSTS 等安全响应头。
+3. 两步验证是**可选**的（未绑定的账号仍是"密码即可登录"）；唯一管理员丢失验证器时
+   只能走离线重置流程（见[运维手册](docs/static/08-operations.md) §5）。
+   安全响应头已默认开启，但 CSP 没有违规上报端点；`read_only` 根文件系统默认不开（compose 里留了注释示例）。
 4. 不提供容器写操作（有意的产品边界）。
 5. NAS 侧部署尚未实测（镜像已多架构构建并验证可拉取可运行）。
 
 详见 [todo.md](todo.md)。
+
+## 许可证
+
+[MIT License](LICENSE)，Copyright (c) 2026 xs-www。

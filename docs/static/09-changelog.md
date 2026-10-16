@@ -1234,5 +1234,642 @@ curl -s http://127.0.0.1:18899/api/health      # → status:ok
    仅需单架构时应临时把 `PLATFORMS` 收窄。
 4. 仍然只构建镜像、不跑测试（`typecheck` / `test` 未纳入 CI）。
 
+---
+
+## [2026-10-16] S0-05 技术债：拆分 Docker 映射逻辑 + 补「服务入口解析」单测
+
+### 背景
+
+`server/src/modules/docker/service.ts` 已 700 行，其中端口映射与 tailnet 可达性判定等
+**纯函数**与「缓存 / 数据源编排」混在一个文件里，导致：
+
+1. 想单测映射逻辑只能从业务服务文件里 import，边界不清；
+2. serve 路由的覆盖去重标记（`coveredByContainerPort`）藏在 `ContainerService` 私有方法里，
+   无法不起 Docker 就断言 —— 而它决定「同一条入口会不会出现两次」。
+
+本次按 S0-05 拆分，并补齐入口解析的纯函数单测。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 新增 | `server/src/modules/docker/mapper.ts`（430 行） | 「Docker inspect → 门户契约」纯函数层 |
+| 修改 | `server/src/modules/docker/service.ts`（700 → 370 行） | 只留缓存/数据源/装配编排；原导出全部 re-export |
+| 新增 | `server/tests/dockerMapper.test.ts`（498 行 / 24 用例） | 服务入口解析单测（纯函数，不起 Docker） |
+| 修改 | `docs/static/03-server-modules.md` | `docker/` 表新增 `mapper.ts` 行，补分层说明 |
+| 修改 | `todo.md` | 技术债勾掉「service.ts 拆分」项，补测试计数 |
+
+### 逐项明细
+
+#### 新增：`server/src/modules/docker/mapper.ts`
+
+分层铁律：只做纯计算 —— 不构造/调用 dockerode（仅 `import type` 引用 inspect 形状）、
+不发请求、不读文件、不读全局配置（`PortalConfig` 只经 `PortalHostContext` 传入）。
+
+- `summarize(items)` — 容器墙汇总统计（原样迁移）。
+- `cleanName(name)` — 容器名去前导斜杠。
+- `mapContainer(inspect, hostContext, tailscaleIps, { skipUrls? })` — 映射为 `ContainerSummary`；
+  `skipUrls` 时保留可达性、清空 URL 字段。
+- `mapNetworks(inspect)` / `mapMounts(inspect)` — 网络与挂载映射。
+- `mapPorts(inspect, hostContext, tailscaleIps, containerName)` — 端口映射 + 可达性判定 + 排序；
+  去重由下面的 `dedupeIdenticalBindings` 完成（先收集、去重、再排序）。
+- `dedupeIdenticalBindings(entries)` — **独立命名的纯函数**（S0-05 新增去重）：
+  去掉「除 `hostIp` 外渲染结果完全一致」的重复绑定，保留先出现的一条。
+  判定键 = `protocol` + `containerPort` + `hostPort` + `reachability` + `url` + `note`，
+  刻意不含 `hostIp`（它正是双栈重复里唯一不同的字段）；可达性不同的绑定不会被合并。
+- `urlForBinding(protocol, hostIp, hostPort, hostContext, reachability)` — 单绑定 URL
+  （原为模块私有函数，为可测性导出；`none` / `localhost-only` / 非 tcp 返回 `null`）。
+- `rebuildPortUrls(port, hostContext, containerName)` — 从缓存条目按访问者重建 URL
+  （原为 `service.ts` 私有函数，现导出）。
+- `attachHostContext(items, hostContext)` — 原 `ContainerService` 私有方法，现为纯函数：
+  重算 `ports[].url` / `reachability` / `primaryUrl` / `urlCandidates`。
+- `pickPrimaryUrl(ports)` / `buildCandidates(ports, hostContext)` — 首选入口与候选入口（按 URL 去重）。
+- `detectTailscaleSidecar(inspect)` / `joinCommand(parts)` / `normalizeCommandList(value)` — 原样迁移。
+- `collectReachableHostPorts(containers)` — **新抽出的纯函数**：收集已作为 tailnet/lan 端口展示过的
+  宿主端口集合（serve 去重的判定依据）。
+- `mapServeRoutes(routes, containers)` — **新抽出的纯函数**（原 `ContainerService.buildServeView` 内联逻辑）：
+  回填路由所属容器，并标记 `coveredByContainerPort`；**逐字段构造**输出，
+  避免 `funnel` / `targetPath` 混进 HTTP 契约。
+- `attachServePaths(items, routes)` — 原 `ContainerService` 私有方法，现为纯函数：把 serve 路径写到容器卡上。
+- `ServeRouteInput` — serve 路由输入类型（与 `ServeRoutesProvider` 返回条目结构一致）。
+
+#### 修改：`server/src/modules/docker/service.ts`
+
+- 行数 700 → 368；只保留 `ContainerService`（缓存、`list`/`detail`/`logs`/`resolveId`、
+  serve 视图装配、stats）、`HostInfoProvider` / `HostContextRequest` / `ServeRoutesProvider` /
+  `ContainerServiceDeps` 与 `describeListError`。
+- `buildServeView` — 覆盖判定由内联实现改为调用 `mapServeRoutes`（行为不变）。
+- `attachHostContext` / `attachServePaths` 私有方法 → 调用 `mapper.ts` 同名纯函数。
+- 新增 re-export 块：`summarize` `cleanName` `mapContainer` `mapNetworks` `mapMounts` `mapPorts`
+  `pickPrimaryUrl` `buildCandidates` `detectTailscaleSidecar` `joinCommand` `normalizeCommandList`
+  （拆分前就从本文件导出）以及新增的 `attachHostContext` `attachServePaths` `mapServeRoutes`
+  `collectReachableHostPorts` `rebuildPortUrls` `urlForBinding` `ServeRouteInput`。
+  **旧调用方 `import { mapPorts } from './docker/service.js'` 无需改动**
+  （`server/tests/modules.test.ts` 即依赖此约定，已加守护用例）。
+
+#### 新增：`server/tests/dockerMapper.test.ts`
+
+24 个纯函数用例，输入形态对齐真实 `docker inspect`：
+通配/空 `HostIp` → tailnet；双栈去重（含 `dedupeIdenticalBindings` 的收窄边界：
+`127.0.0.1` 与 `0.0.0.0` 绑同端口**不合并**、不同容器端口**不合并**、协议/宿主端口/URL 不同**不合并**）；
+`100.x` / `fd7a:…` → tailnet；LAN IP → lan；
+`127.0.0.1` / `::1` → localhost-only 且无入口；未发布 / 宿主端口未分配 → 无入口；
+排序（可达性优先 + 宿主端口升序）；多候选入口（MagicDNS / tailnet / localhost）；
+`skipUrls` 缓存阶段与响应阶段重建；serve 路由覆盖与独立入口、路径回填；
+边界（空端口表、非法端口键、`PortBindings` 回退、network mode = host）；`service.ts` re-export 守护。
+
+### 接口/行为影响
+
+- **HTTP 响应契约无变化**：字段、顺序、`serve` 覆盖标记语义、`localhost-only` 判定均保持原样；
+  无新增环境变量、无 DB 迁移。
+- **唯一的输出变化（有意）**：同一容器端口在宿主上的 `0.0.0.0` 与 `::` 双栈重复绑定现在会去重，
+  只保留先出现的一条。实测依据（本机真实输出）：
+
+  ```bash
+  docker inspect cs22-web --format '{{json .NetworkSettings.Ports}}'
+  # → {"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"8080"},{"HostIp":"::","HostPort":"8080"}]}
+  ```
+
+  拆分前去重缺失，容器卡上会出现两条**一模一样**的入口；现在只留一条。前后对比：
+
+  | | 拆分前（HEAD） | 拆分后 |
+  | --- | --- | --- |
+  | `ports` 条目数 | 2（`0.0.0.0:8080` + `::8080`） | **1**（`0.0.0.0:8080`） |
+  | 可点击入口数 | 2 条相同 URL | **1** 条 |
+  | `reachability` / `primaryUrl` / `urlCandidates` | tailnet / `http://…:8080/` / 3 个候选 | **完全相同** |
+
+  去重规则刻意收窄到「协议 + 容器端口 + 宿主端口 + 可达性 + URL + 提示」全部相同
+  （见 `dedupeIdenticalBindings`），因此不会吞掉任何一条有区分度的绑定：
+  `127.0.0.1` 与 `0.0.0.0` 绑同端口（可达性不同）、不同容器端口、不同协议都各自保留。
+  与 2.0 计划 S1-02「相同容器的 `::` 与 `0.0.0.0` 映射应去重」一致。
+
+### 验证方式
+
+```bash
+npx vitest run --root server tests/dockerMapper.test.ts
+# → 24 passed（1 文件）
+
+npx vitest run --root server
+# → 265 用例 / 265 passed / 10 文件全绿
+#   （拆分完成时 modules.test.ts 的 webDistDir 路径断言曾因本机仓库目录改名 HomePort 而失败，
+#    已由主代理改成断言相对结构 —— 绝对路径 + 末段 dist + 父目录名 web —— 本任务未改该文件）
+
+npm run typecheck --workspace server
+# → 通过（无输出）
+
+# 行为不变的机器化证据：以 git HEAD 的 service.ts 作旧实现，与 mapper.ts 对比同一批输入
+# （14 类 inspect 形态 × 3 种访问者上下文 × 有/无 tailnet 网段 × 是否 skipUrls）
+# → 168 次输出比较，差异 24 处，全部集中在 dualStack / real 两个「双栈重复绑定」fixture，
+#   其余 12 类形态（含回环、LAN、tailnet IP、UDP、未发布、host 网络、非法键）逐字节一致。
+```
+
+### 已知限制 / 后续
+
+1. `mapper.ts` 仍以 `import type { ContainerInspectInfo } from 'dockerode'` 引用阈值类型，
+   以便签名与拆分前一致；这是纯类型依赖，不引入运行时耦合。
+2. 双栈去重按「容器端口级」生效，尚未做到 S1-02 的「服务级去重」（跨容器的同一服务聚合），
+   那属于服务注册表阶段的工作。
+
+
+## [2026-10-16] S0-03 敏感设置加密存储（AES-256-GCM）
+
+### 背景
+
+`settings` 表里的 Tailscale API Token 原先**以明文落库**（因为要回读去调用外部 API）。
+数据库文件（或它的备份）被拷走即等于泄露 Token。底座 `secretBox.ts` 与
+`config.secrets` 已由用户写好并通过测试，本次把它接进设置存储：
+
+1. 注册表标 `sensitive` 的键**写库前加密、读出后解密**，服务内部拿到的仍是明文；
+2. 非敏感键一律不加密（保持可读，便于排障与人工修库）；
+3. **向后兼容**：老库明文照常可读，并在下次写入时自动升级（惰性迁移）；
+   首启提供一次性 `reencryptAll()` 兜底升级（含 `previousKeys` 轮换后的老密文）；
+4. 解密失败**不崩进程**：该键按「未设置」处理，绝不把解不开的值当有效 Token 用。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 新增 | `server/src/modules/settings/secretStore.ts` | 加解密装饰仓储 + `collectSensitiveKeys()` + `reencryptAll()` |
+| 修改 | `server/src/modules/settings/service.ts` | 构造函数新增**可选** `secretBox`；新增 `reencryptAll()`；读写改走装饰仓储 |
+| 修改 | `server/src/db/settings.ts` | 新增 `SettingsStore` 接口（`SettingsRepository implements`） |
+| 修改 | `server/src/modules/settings/registry.ts` | `ResolveOptions.repository` 改依赖 `SettingsStore` 接口（而非带 `private` 的类） |
+| 新增 | `server/tests/settingsCrypto.test.ts`（19 用例） | 落库/读取、惰性迁移、`reencryptAll` 幂等、密钥轮换、解密失败降级、审计日志不泄露 |
+| 修改 | `docs/static/02-configuration.md` `06-security.md` `07-data-model.md` `03-server-modules.md` | 主密钥配置、安全模型、数据模型、模块与方法表 |
+| 修改 | `todo.md` | F6 勾掉「敏感项加密存储」 |
+
+### 逐项明细
+
+#### 新增：`server/src/modules/settings/secretStore.ts`
+
+- `collectSensitiveKeys(config): Set<string>` — 从 `buildSettingDefinitions()` 里收集
+  `sensitive === true` 的键（当前只有 `PORTAL_TAILSCALE_API_TOKEN`）。**加密范围唯一来源**，
+  新增加密项只需在注册表打标。
+- `SecretSettingsStore implements SettingsStore` — 把加解密收敛到仓储边界，
+  避免散落在 `update()` / `resolveSettings()` / `currentVersion()` 多个读点上：
+  - `list()` / `toMap()` / `get()` — 敏感项密文 → 明文；
+    **解不开的行被剔除**（等价于「未设置」→ 回退环境变量/内置默认）；
+  - `upsert()` / `upsertMany()` — 敏感项明文 → 密文后再写库，
+    `upsert()` 返回给调用方的仍是明文；`delete*` 原样透传；
+  - `reencryptAll(): { upgraded, failed }` — 读**原始行**（`base.list()`，不能走 `this.list()`，
+    否则解不开的行被过滤掉就永远修不回来）：
+    无 `enc:v1:` 前缀的明文 → 加密；`isCurrentKey()` 为 false 的老密文 → 用 `previousKeys` 解出后
+    重新加密；`upgraded` 计数、`failed` 记键名。幂等（全部升级完再调返回 0 且不写库）。
+  - `keyFingerprint()` — 透出当前密钥指纹（非密钥），供启动日志与排障。
+- **边界规则**：空字符串不加密（没有可保护的内容，且保持「已清空」可读）；
+  非敏感键即使值长得像 `enc:v1:…` 也原样读写（不会被误解密）；
+  解密失败只告警一次/键（`warnedKeys`），日志只带键名与固定原因文案。
+
+#### 修改：`server/src/modules/settings/service.ts`
+
+- `SettingsServiceDeps.secretBox?: SecretBox` — **可选**。不传 = 完全保持明文行为，
+  现有 `tests/settings.test.ts`（27 用例）与无密钥场景不受影响。
+- 构造函数 — 传了 `secretBox` 时用 `SecretSettingsStore` 包住 `deps.repository`，
+  字段 `repository: SettingsStore`；未传则直接引用原仓储。
+- `reencryptAll(): Promise<number>` — 委托给 `secretStore`，返回升级条数；
+  有升级时记一条 `info`（条数 + 密钥指纹），有失败键时记一条 `warn`（仅键名）。
+  未启用加密时返回 0（安全空操作）。
+- `ensureApplied()` / `view()` / `update()`（`upsertMany`）/ `reset()` / `currentVersion()`
+  — 全部由 `this.deps.repository` 改为 `this.repository`，即**读写都经过加解密层**。
+  审计逻辑不变：敏感项仍写 `键=***`。
+
+#### 修改：`server/src/db/settings.ts`
+
+- 新增 `SettingsStore` 接口（`list` / `toMap` / `get` / `upsert` / `upsertMany` / `delete` /
+  `deleteMany` / `deleteAll`），`SettingsRepository implements SettingsStore`。
+  **原因**：TS 里带 `private` 成员的类是名义类型，装饰器无法被当作 `SettingsRepository` 传递；
+  抽成接口后 `resolveSettings()` 可以直接吃「已解密」的数据，且旧调用方零改动。
+
+#### 修改：`server/src/modules/settings/registry.ts`
+
+- `ResolveOptions.repository: SettingsRepository` → `SettingsStore`（仅类型与注释，行为不变）。
+
+#### 新增：`server/tests/settingsCrypto.test.ts`
+
+19 个用例（直接查 `settings` 表的**原始字符串**做断言）：
+密文落库且不含明文片段 + 服务读出明文并写回 `config.tailscale.apiToken`；
+视图仍打码且 JSON 无明文；随机 IV（两次写入密文不同）；
+非敏感键（数字/字符串/像密文的字符串）保持明文；
+旧明文可读 + 下次写入惰性升级 + `reencryptAll()` 数量正确且幂等；
+`previousKeys` 轮换后可读并升级到新密钥、只用新密钥也能解开；
+错密钥 / GCM 篡改 → 降级为未设置、其它键与进程不受影响；重新填写即恢复；
+审计只记 `键=***` 且日志/审计都不含明文与密文；不传 `secretBox` 时明文行为；
+装饰仓储直测（多键计数、解不开的行被剔除且 `reencryptAll` 记为失败并不覆盖原值）。
+
+### 配置/接口/数据模型影响
+
+- **无新增环境变量**（`PORTAL_SECRET_KEY` / `PORTAL_SECRET_KEY_FILE` /
+  `PORTAL_SECRET_KEY_PREVIOUS` 与 `config.secrets` 已存在）；**无 DB 迁移**。
+- `settings.value` 对 `sensitive` 键改为存 `enc:v1:<base64(iv|tag|cipher)>`；
+  无前缀 = 旧明文，仍可读。
+- HTTP 契约不变：视图里的敏感项仍是打码值，写入 `********` / 空串仍表示「不修改」。
+- **装配方接线点**（`app.ts` 本次未改，由用户接）：
+  `loadOrCreateKey()` → `createSecretBox({ key, previousKeys: config.secrets.previousKeys.map(parseKey) })`
+  → 传 `secretBox` 给 `SettingsService` → 启动时 `await settings.reencryptAll()`（在 `initialize()` 前后皆可，
+  建议紧邻 `initialize()`）→ `await settings.initialize()`。
+
+### 验证方式
+
+```bash
+npx vitest run --root server tests/settingsCrypto.test.ts
+# → 19 passed（1 文件）
+
+npx vitest run --root server
+# → 263 passed（10 文件，含并行任务的用例）
+#   注：本次验证期间 tests/modules.test.ts 的 HomePage 路径断言被并行任务改为
+#   目录名无关的写法，该既有失败已消失
+
+npx vitest run --root server tests/settings.test.ts
+# → 27 passed（不传 secretBox 的既有场景）
+
+npm run typecheck --workspace server
+# → 通过（无输出）
+```
+
+### 已知限制 / 后续
+
+1. `secret.key` 默认与数据库同卷：防「数据库文件单独泄露」，**不防主机失陷**；
+   需要更强隔离请显式设 `PORTAL_SECRET_KEY` 并把密钥与数据卷分开存放。
+2. 主密钥丢失后已加密值不可逆（界面显示未设置，重填即恢复）——
+   备份数据卷时须一并备份密钥文件。
+3. 明文值若恰好以 `enc:v1:` 开头会被误判为密文（解密失败 → 视为未设置）。
+   实际 Token 不会长这样，未做额外转义。
+4. 解密失败回退到**环境变量**（若该键配了 `.env`）——这是三层优先级的既有语义，
+   并非"脏值被启用"；测试里已清空相关环境变量以保证断言确定性。
+5. 后续用户 TOTP 种子可复用同一 `SecretSettingsStore`/`createSecretBox`（`secretBox.ts` 已预留用途）。
+
+---
+
+## [2026-10-16] S0-03 前端：两步验证（TOTP）登录与自助管理
+
+### 背景
+
+S0-03 要求在管理登录上增加可选的两步验证（含恢复码、丢失设备流程、管理员强制重置）。
+后端接口契约已冻结（`POST /api/auth/login` 的 `totpRequired` 分支、`POST /api/auth/login/totp`、
+`POST /api/users/me/totp/*`、`POST /api/users/:id/totp/reset`），本次交付**前端**：
+登录第二步、自助绑定/关闭/恢复码、管理员强制重置，以及配套组件测试。
+验收方式：`npm run typecheck --workspace web`、`npm run test:web`、`npm run build:web`
+（后端可能尚未运行，因此不联调，以类型检查 + 单测 + 构建为准）。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 修改 | `web/src/api/types.ts` | 新增 TOTP 请求/响应类型与 `LoginResponse` 判别联合；`SessionUser` 加 `totpEnabled` |
+| 修改 | `web/src/api/client.ts` | 新增 `loginTotp` / `totpSetup` / `totpEnable` / `totpDisable` / `totpRegenerateRecoveryCodes` / `resetUserTotp`；修正 401 语义 |
+| 修改 | `web/src/auth/AuthProvider.tsx` | `login()` 返回判别联合；新增 `completeTotpLogin()`；抽出 `establishSession()` |
+| 修改 | `web/src/pages/LoginPage.tsx` | 两步登录界面 + 完整无障碍写法 |
+| 修改 | `web/src/pages/admin/SecurityTab.tsx` | 新增「两步验证（TOTP）」区块（绑定 / 一次性恢复码 / 重新生成 / 关闭） |
+| 修改 | `web/src/pages/admin/UsersTab.tsx` | `totpEnabled` 徽标 + 「重置两步验证」（二次确认，展示吊销会话数） |
+| 新增 | `web/tests/totp.test.tsx`（14 用例） | 两步登录切换、`TOTP_INVALID`、`TOTP_CHALLENGE_EXPIRED`、一次性恢复码、强制重置、接口契约与 401 语义 |
+| 修改 | `docs/static/04-api-contract.md` | 补 `login/totp`、`users/me/totp/*`、`users/:id/totp/reset`、新错误码与权限矩阵 |
+| 修改 | `docs/static/05-web-modules.md` | 补类型/客户端方法/AuthProvider 两步登录/页面说明/测试清单 |
+| 修改 | `docs/static/06-security.md` | 新增「两步验证（TOTP）」小节，改写残余风险第 1 条 |
+| 修改 | `docs/static/09-changelog.md` | 本节 |
+
+未新增任何 npm 依赖；`web/vitest.config.ts` 与既有测试文件均未改动。
+
+### 逐项明细
+
+#### `web/src/api/types.ts`
+
+- `SessionUser` 新增 `totpEnabled: boolean`（契约要求）与可选 `totpConfirmedAt?: string | null`
+  （后端 `User` 已带该字段，用于显示"启用时间"；契约未承诺，故可选、缺失显示 `—`）。
+- 登录响应拆成 `LoginSuccessResponse`（会话成功）与 `LoginTotpChallengeResponse`
+  （`totpRequired: true` + `challengeToken` + `expiresAt`，**不设 Cookie**），
+  联合为 `LoginResponse`；导出类型守卫 `isTotpChallenge()` 供 UI 分支。
+- 新增 `LoginTotpRequest`（`code` 兼容 6 位码与 `XXXX-XXXX` 恢复码）、`TotpSetupResponse`、
+  `TotpEnableRequest/Response`、`TotpDisableRequest/Response`、
+  `TotpRecoveryCodesRequest`、`RecoveryCodesResponse`、`TotpResetResponse`。
+
+#### `web/src/api/client.ts`
+
+- `loginTotp()` 走 `/auth/login/totp`：与 `login` 同样在**建立会话之前**调用，
+  因此 `skipUnauthorizedHandler: true`、不假设已有 CSRF 令牌。
+- 自助方法 `totpSetup()` / `totpEnable()` / `totpDisable()` / `totpRegenerateRecoveryCodes()`
+  与管理员 `resetUserTotp(id)`：路径、方法、请求体严格对齐冻结契约；变更类请求自动带 CSRF。
+- **既有实现的一处真实缺陷（本次最小化修正）**：`request()` 原先对**任何** 401 都触发
+  `onUnauthorized`。TOTP 的 `TOTP_INVALID` / `TOTP_CHALLENGE_EXPIRED` 与关闭两步验证时的
+  密码错误都是 401，于是"输错一次验证码"会被当成"会话失效"而强制登出。
+  改为新增 `CREDENTIAL_FAILURE_CODES = { TOTP_INVALID, TOTP_CHALLENGE_EXPIRED, INVALID_CREDENTIALS }`，
+  这些码的 401 不触发全局登出回调；真正的会话失效仍是 `UNAUTHORIZED`，行为不变。
+
+#### `web/src/auth/AuthProvider.tsx`
+
+- `login()` 返回 `LoginOutcome = { status: 'ok' } | { status: 'totp'; challengeToken; expiresAt }`。
+- 新增 `completeTotpLogin({ challengeToken, code, remember })`，成功后走同一条
+  `establishSession()`（写 CSRF、`user`、偏好）。
+- **不持久化 `challengeToken`**：只经返回值交给登录页，由组件状态持有，刷新即失效。
+- `bootstrap()` 仍直接登录；若意外收到 `totp` 分支则抛错（不假装登录成功）。
+
+#### `web/src/pages/LoginPage.tsx`
+
+- 第一步沿用原表单；收到 `totp` 后切第二步：标题「两步验证」、验证码输入
+  （`inputMode="numeric"`、`autoComplete="one-time-code"`、`maxLength=9`）、
+  "使用恢复码"提示、「返回上一步」、本次验证失效时间。
+- `TOTP_INVALID` → 就地 `role="alert"` 提示"验证码不正确，请重试"并**保留输入**；
+  `TOTP_CHALLENGE_EXPIRED` → 清挑战与密码、保留用户名，退回第一步并用 `role="status"`
+  提示"验证已过期，请重新登录"。
+- 无障碍：`<label htmlFor>`、`aria-invalid`、`aria-describedby`（指向 `totp-code-error`）、
+  提交中 `disabled`、验证码不足 6 位禁用提交。
+
+#### `web/src/pages/admin/SecurityTab.tsx`
+
+- 新增 `TotpSection`（置于标签页顶部，跨两列）：未启用时「启用两步验证」→ `setup` →
+  展示 `secret`（可选中复制 + 复制按钮）与 `otpauthUri`，说明"手动输入密钥或粘贴 otpauth 链接"，
+  再输入 6 位码 → `enable` → **一次性恢复码弹窗**（等宽逐条、警告"只显示这一次，请立即保存"、
+  复制全部、必须勾选"我已保存恢复码"才能关闭）。
+- 已启用时显示状态与"启用时间"，提供「重新生成恢复码」（需当前动态码）与
+  「关闭两步验证」（需密码 **+ 当前验证码或恢复码**，后端 `fieldErrors` 就地显示）。
+- `setup` 重复调用要二次确认，并提示"会使上一次未确认的种子立即失效"。
+- 刻意**不引入二维码库**（不加依赖）：密钥文本 + otpauth 链接即可，文案里也这么说。
+- 绑定/关闭成功后 `refresh()` 同步 `user.totpEnabled`。
+
+#### `web/src/pages/admin/UsersTab.tsx`
+
+- 对 `totpEnabled` 用户显示 `两步验证已启用` 徽标。
+- 「重置两步验证」按钮：`window.confirm` 明确"清除绑定 + 吊销全部会话 → 用户会掉线、
+  需重新登录并重新绑定"，成功后提示带 `revokedSessions` 的文案并刷新列表。
+- `act()` 的 `successMessage` 参数扩展为 `string | ((result: T) => string)`（原本只能是字符串，
+  无法把响应里的 `revokedSessions` 写进提示），既有调用点不受影响。
+
+#### `web/tests/totp.test.tsx`（新增，14 用例）
+
+沿用 `client.test.ts` 的假 fetch 写法（`vi.stubGlobal('fetch', …)`、按精确 URL 分发、
+未定义路由返回 500 + 明确文案），RTL + jsdom，表单提交用 `fireEvent.submit(form)`：
+
+1. 两步登录切换（含 `inputMode`/`autoComplete`/`maxLength`、label 关联、恢复码文案）；
+2. `challengeToken` 不写入 localStorage/sessionStorage；
+3. 第二步请求体为 `{ challengeToken, code, remember }`（`code` 已 trim）；
+4. 验证码不足 6 位禁用提交；
+5. `TOTP_INVALID` 就地报错 + 保留输入 + `aria-invalid`/`aria-describedby`；
+6. `TOTP_CHALLENGE_EXPIRED` 退回第一步（用户名保留、密码清空）+ `role="status"`；
+7. 启用流程：`setup` 展示密钥/otpauth → `enable` → 一次性恢复码弹窗（等宽、逐条）→
+   未勾选不能关闭 → 关闭后切到"已启用"视图；
+8. 管理员强制重置：徽标、二次确认文案（含"掉线/重新绑定"）、提示带吊销会话数、刷新列表；
+9. `ApiClient` 层的 TOTP 接口契约与 401 语义（凭据类 401 不触发全局登出、
+   `UNAUTHORIZED` 仍触发、CSRF 头、`fieldErrors` 可读）。
+
+### 验证
+
+```bash
+npm run typecheck --workspace web   # 通过
+npm run test:web                    # 4 个文件 / 106 用例全部通过（新增 14）
+npm run build:web                   # 构建成功（dist/assets/index-*.js ≈ 382 kB）
+```
+
+### 已知限制 / 与冻结契约的差异
+
+1. **关闭两步验证的密码错误返回码**：契约写 `401 INVALID_CREDENTIALS`，
+   实际后端（`badRequest()`）返回 `400 VALIDATION_FAILED` + `fieldErrors.password`；
+   界面两种都能正确提示（`useSubmit` 同时读 `message` 与 `fieldErrors`）。
+   若要对齐契约需改后端。
+2. **`POST /api/users/me/totp/disable` 的 `code` 实际上是必填**（已启用时），
+   契约标为可选；界面据此把它标成必填并给出 `XXXX-XXXX` 输入位（`maxLength=9`）。
+3. 契约只承诺 `user.totpEnabled`；界面"启用时间"依赖 `totpConfirmedAt`（后端已返回）。
+   若后端不返回该字段，界面显示 `—`，不影响任何逻辑。
+4. 登录第二步的尝试次数超限同样返回 `TOTP_CHALLENGE_EXPIRED`（后端文案"尝试次数过多"），
+   前端统一显示"验证已过期，请重新登录"。
+5. 客户端把 `INVALID_CREDENTIALS` 一并列入"不触发全局登出"的码集合：
+   这也顺带修掉了「修改密码时输错当前密码会被踢下线」的既有隐患。
+
+
+---
+
+## [2026-10-16] Sprint 0 汇总：安全加固 + CI 质量门 + 技术债（S0-01…S0-05）
+
+### 背景
+
+Sprint 0 的目标是"把地基补硬"：安全默认值收紧、把质量门搬进 CI、清掉几处已经影响
+可维护性的技术债。任务分解 S0-01…S0-05 的**逐项明细**已分别归档在本文件里
+（S0-03 敏感设置加密、S0-03 前端 TOTP、S0-05 docker mapper 拆分三条），
+因此本条是**汇总索引 + 尚未单独归档的部分**：安全响应头、`trustProxy` 默认收紧、
+CI 质量门与 E2E、AdminPage 拆分、web 单测、LICENSE、容器最小权限。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 新增 | `docs/sprint0-baseline-audit.md` | S0-01 基线审计：源码与 `todo.md` 的过期描述、未完成项、风险分级与只读复现命令 |
+| 新增 | `server/src/http/securityHeaders.ts` | 手写安全响应头：固定头 + CSP + HSTS 条件判定 + `/api/*` no-store |
+| 新增 | `server/src/modules/settings/secretBox.ts` `secretStore.ts` | AES-256-GCM 加密盒与加密装饰仓储（明细见 S0-03 条目） |
+| 新增 | `server/src/modules/auth/totp.ts` `server/src/db/totp.ts` | TOTP 纯函数核心 + 恢复码/挑战仓储（明细见 S0-03 条目） |
+| 新增 | `server/src/modules/docker/mapper.ts` | Docker inspect → 门户契约纯函数层（明细见 S0-05 条目） |
+| 新增 | `.github/workflows/ci.yml` | 质量门 + E2E 冒烟；PR 与 master push 触发，无 `paths-ignore` |
+| 新增 | `playwright.config.ts` `e2e/` | Playwright 配置、E2E 用例与专用服务启动器 |
+| 新增 | `docker-compose.socket-proxy.yml` | **可选**的只读 Docker socket 代理覆盖文件 |
+| 新增 | `LICENSE` | MIT，Copyright (c) 2026 xs-www |
+| 新增 | `web/tests/` `web/vitest.config.ts` | web 工作区单测套件（client / format / components / totp）+ jsdom/RTL 测试环境 |
+| 新增 | `web/src/pages/admin/{UsersTab,AuditTab,SecurityTab}.tsx` | 从 `AdminPage.tsx` 拆出的标签页 |
+| 修改 | `server/src/config.ts` | `trustProxy` 默认由"信任全部"改为 `loopback`；新增 `securityHeaders`/`secrets`/`totp` 配置段与 `DEFAULT_CSP` |
+| 修改 | `server/src/app.ts` | 装配主密钥与 `secretBox`、启动时 `reencryptAll()`、注入 TOTP 仓储、注册安全响应头 |
+| 修改 | `server/src/api/system.ts` | SSE 端点手动补安全头（`reply.raw.writeHead` 绕过 `onRequest` 钩子） |
+| 修改 | `docker-compose.yml` | `docker.sock` 改 `:ro`、`cap_drop: ALL`、`no-new-privileges:true`、去掉硬编码 Windows 磁盘挂载 |
+| 修改 | `.github/workflows/docker-publish.yml` | 新增 `quality` job，`build-and-push` 依赖它 |
+| 修改 | `README.md` `todo.md` `docs/static/06-security.md` `08-operations.md` 等 | 同步归档（README 的测试数量改为范围描述） |
+
+### 逐项明细
+
+#### 安全：新增 `server/src/http/securityHeaders.ts`
+
+- `STATIC_SECURITY_HEADERS` — 与请求无关的固定头（冻结常量）：
+  `x-content-type-options: nosniff`、`x-frame-options: DENY`、`referrer-policy: no-referrer`、
+  `cross-origin-opener-policy: same-origin`、`cross-origin-resource-policy: same-origin`、
+  `x-permitted-cross-domain-policies: none`、以及把设备能力全关的 `permissions-policy`。
+- `securityHeadersFor(config, protocol): Record<string, string>` — 纯函数。
+  总开关关掉即返回 `{}`；HSTS 仅在 `config.hsts && protocol === 'https' && hstsMaxAge > 0`
+  三者同时成立时加入，且**不带** `includeSubDomains` / `preload`。
+- `registerSecurityHeaders(app, config, logger)` — 注册 `onRequest` 钩子：
+  逐头下发（已存在同名头时**不覆盖**，用 `reply.hasHeader` 判定）；
+  `request.url` 以 `/api/` 开头时补 `cache-control: no-store`；开关关闭时打一条 `warn`。
+- `SecurityHeaderConfig` — `{ enabled, csp, hsts, hstsMaxAge }`。
+
+**为什么手写而不用 `@fastify/helmet`**：
+
+1. 门户只需要"六个固定头 + 一个可配 CSP"，引插件换来的是它的一整套默认值
+   （`coep` / `origin-agent-cluster` 等对本场景没有收益），却要逐个去关 ——
+   关错一个就可能让 SSE 或静态资源失效；
+2. HSTS 的判定必须与本项目的 `trustProxy` 边界对齐（只在**确为 HTTPS** 时下发），
+   自己写才能把"谁说了算"写清楚，而不是依赖插件默认值；
+3. 少一个运行时依赖 = 少一份供应链风险，arm64/amd64 多架构构建也不需要额外的安装步骤。
+
+**HSTS 不带 `includeSubDomains` / `preload` 的原因**：宿主是
+`family-nas.tail585599.ts.net` 这类 `*.ts.net` **共享域名**，带上 `includeSubDomains`
+会波及同域下不属于本门户的其它服务 —— 那不是本门户能替用户做的决定。
+`preload` 同理，且一旦进 preload 列表几乎不可撤销。
+
+**踩到的坑（已修）**：SSE 端点 `/api/system/stream` 用 `reply.raw.writeHead()` 直接写原始
+响应头，**绕过了 Fastify 的正常发送流程，因此 `onRequest` 钩子里设置的安全头不会自动带上**。
+该处理器显式调用一次 `securityHeadersFor(ctx.config.securityHeaders, request.protocol)`
+并展开进 head。以后再新增"直接写 raw head"的端点（长连接、文件流）必须照做，
+否则会出现"普通接口有头、长连接没头"的隐形缺口。
+
+#### 安全：修改 `server/src/config.ts`（`trustProxy` 默认收紧）
+
+- `DEFAULT_TRUST_PROXY: TrustProxySetting = 'loopback'`（新增导出）。
+  默认值从"信任全部"（`true`）改为**只信回环**：标准部署是
+  `tailscale serve → 127.0.0.1:8899`，代理连接必然来自回环 ——
+  既拿到真实客户端 IP（登录限流键正确），又**忽略** tailnet 直连客户端自带的伪造
+  `X-Forwarded-For` / `X-Forwarded-Proto`（后者还会让门户误以为在 HTTPS 后面而误发 `Secure` Cookie）。
+- `parseTrustProxy(raw)` — 支持 `0/1`、布尔词、预置名（`loopback` / `linklocal` / `uniquelocal`）
+  与 IP/CIDR 列表；**非法值启动即抛错**，不静默退化成"信任所有人"。
+- 新增 `DEFAULT_CSP` 与 `securityHeaders` 配置段（`PORTAL_SECURITY_HEADERS` /
+  `PORTAL_CSP` / `PORTAL_HSTS` / `PORTAL_HSTS_MAX_AGE`，默认开启、HSTS 开、maxAge = 180 天）；
+  `secrets` 与 `totp` 配置段（明细见 S0-03 条目）。
+
+#### 安全：敏感数据加密与两步验证（汇总口径）
+
+逐项明细见本文件的 S0-03 两条。汇总：
+
+- **加密**：`settings` 表标 `sensitive` 的键 **+ 用户 TOTP 种子**统一走 AES-256-GCM，
+  密文 `enc:v1:<base64(iv|tag|cipher)>`；主密钥来源优先级
+  `PORTAL_SECRET_KEY` → `PORTAL_SECRET_KEY_FILE`（默认 `<dataDir>/secret.key`，0600）→ 自动生成；
+  `PORTAL_SECRET_KEY_PREVIOUS`（逗号分隔）用于轮换，启动时 `reencryptAll()` 幂等升级存量明文。
+- **两步验证**：密码通过后**不签发会话**，只给 5 分钟挑战令牌（默认 300s，库里只存摘要）；
+  挑战最多 5 次尝试；`/api/auth/login` 与 `/api/auth/login/totp` **共用** 10 次/分钟/IP 限流；
+  防重放（`users.totp_last_counter`）**只作用于登录路径**，会话内的再次确认
+  （关闭两步验证、重新生成恢复码）**不消费**计数器 —— 否则"绑定完立刻退出再登录"
+  会在同一个 30 秒窗口里被自己的防重放挡住，属于自伤式安全（**有意的取舍**）；
+  恢复码 10 个 `XXXX-XXXX`（字符集剔除易混的 `0 O 1 I L`）、入库仅 sha256 摘要、
+  一次性核销、重新生成即作废旧码；验证码用 `timingSafeEqual` 比较、时间窗默认 ±1 周期；
+  关闭门槛 = 当前密码（+ 已启用时的一次验证码或恢复码）；
+  管理员可强制重置（清绑定 + 删除恢复码 + 吊销该用户全部会话 + 记 `auth.totp_reset`）。
+  TOTP 接口挂在 `/api/users/me/*`：`/api/auth/*` 是匿名作用域，没有角色守卫也没有 CSRF 钩子，
+  而绑定/关闭是登录后的变更操作，必须同时满足「已登录 + CSRF」两层。
+
+#### CI / 质量：新增 `.github/workflows/ci.yml`
+
+- 触发：`pull_request`、`master` 的 push、`workflow_dispatch`；
+  `permissions: contents: read`（**不引用任何 secret**，外部 fork 的 PR 也会跑到）；
+  `concurrency` 取消同分支上仍在跑的旧 CI。
+- `quality` job：`npm ci` → `npm run typecheck`（server + web）→ `npm test`（server + web）→
+  `npm run build` → 校验 `web/dist/index.html` 与 `server/dist/index.js` 存在。
+- `e2e` job（`needs: quality`）：`npx playwright install --with-deps chromium` →
+  `npm run test:e2e` → 失败时上传 `playwright-report/`。
+- **刻意没有 `paths-ignore`**：若 CI 只在代码变动时跑，纯文档 PR 就不产生任何 check，
+  而一旦分支保护要求"check 必须通过"，这类 PR 会永久停在 pending。
+
+#### CI / 质量：修改 `.github/workflows/docker-publish.yml`
+
+- 新增 `quality` job（与 `ci.yml` 相同的 typecheck / test / build），并把 `build-and-push`
+  改为 `needs: quality` —— **测试不过就没有镜像被推送**。
+- 重复而不复用 `ci.yml` 的步骤：两个工作流触发条件不同
+  （本文件有 `paths-ignore`），且发布门禁必须**自证**，依赖另一个工作流的结论会引入
+  "那个工作流被跳过或改名后门禁静默失效"的风险。`server/tests/ciWorkflow.test.ts` 守卫两边一致。
+- 本文件**没有** `pull_request` 触发，因此 fork 的 PR 拿不到 `secrets.GITHUB_TOKEN`
+  与 `packages: write`。
+
+#### CI / 质量：新增 `playwright.config.ts` + `e2e/`
+
+- `playwright.config.ts` — 串行（`workers: 1` + `fullyParallel: false`）、
+  `reuseExistingServer: false`（绝不复用本机可能在跑的 8899 旧服务）、
+  `trace: 'retain-on-failure'`、超时给足（`webServer` 5 分钟 / 单用例 60 秒）、
+  默认端口 **8988**（`PORTAL_E2E_PORT` 可覆盖）。
+- `e2e/start-server.mjs` — 启动前跑完整 `npm run build`、**每次清空** `.e2e-data`、
+  `DOCKER_ENDPOINT` 指向不存在的 socket、`PORTAL_TAILSCALE_MODE=off`、固定测试令牌；
+  双向转发退出信号，Windows 上补 3 秒强制终止兜底。
+- `e2e/smoke.spec.ts` + `e2e/security-headers.spec.ts` — 覆盖首启初始化（错误令牌被拒 /
+  正确令牌创建管理员）、登录登出与受保护路由回跳、Docker 与 tailnet 均不可用时的降级提示
+  （不是白屏）、viewer/admin 权限边界、首页安全响应头与"CSP 不阻断门户自身前端产物"。
+
+#### 技术债
+
+- `web/src/pages/AdminPage.tsx` 651 → 82 行：只保留路由级取数、标签页骨架与 props 分发；
+  三个标签页各自成文件 —— `web/src/pages/admin/UsersTab.tsx`（用户与权限）、
+  `AuditTab.tsx`（审计日志）、`SecurityTab.tsx`（安全与偏好，含 TOTP 区块）；
+  `SettingsPanel.tsx` 原已独立。行数下降不是目的，**取数与渲染分离**才是（回调经 props 传入）。
+- `server/src/modules/docker/service.ts` 拆出 `mapper.ts`（明细见 S0-05 条目）。
+- web 工作区新增单测与 `vitest.config.ts`：`web/tests/client.test.ts`（CSRF 注入、错误转换、
+  401 语义）、`format.test.ts`、`components.test.tsx`、`totp.test.tsx`；
+  根 `npm test` 现在按顺序跑 server 与 web 两个工作区。
+- 根 `LICENSE`（MIT，Copyright (c) 2026 xs-www），与 `package.json` 的 `"license": "MIT"` 对齐
+  （此前"声明 MIT 但无 LICENSE 文件"等于保留所有权利，公开仓库尤其明显）。
+
+#### 部署
+
+- `docker-compose.yml`：`docker.sock` 从可写改为 **`:ro`**；新增 `cap_drop: [ALL]` 与
+  `security_opt: [no-new-privileges:true]`；**移除**硬编码的 Windows 磁盘挂载
+  （默认挂 `C:/` 会让 Linux/NAS 上 `docker compose` 直接起不来），改为注释示例 +
+  要求同步 `PORTAL_DISK_MOUNTS`。
+- 新增**可选**覆盖文件 `docker-compose.socket-proxy.yml`：
+
+  ```bash
+  docker compose -f docker-compose.yml -f docker-compose.socket-proxy.yml up -d --build
+  ```
+
+  用 `tecnativa/docker-socket-proxy` 只放行 `CONTAINERS` / `INFO` / `VERSION` / `PING`
+  （按 `docker/provider.ts` 实际用到的接口列），写接口（`POST` / `EXEC` / `BUILD` /
+  `SECRETS` / `SYSTEM` …）显式关闭；代理不 publish 到宿主端口，门户改连
+  `tcp://docker-socket-proxy:2375`。
+  **为什么 `:ro` 不够**：`ro` 只是**挂载层面**只读，Docker 的 HTTP API 看不到挂载选项，
+  容器内的进程依然能对 socket 发 `POST /containers/{id}/stop` 这类写请求；
+  只有在代理层拒绝，才是与门户代码是否有漏洞无关的**结构性**保证。
+
+### 配置/接口/数据模型影响
+
+- **行为变更（部署时需要注意）**：`PORTAL_TRUST_PROXY` 未设置时的语义从"信任全部"
+  变为 `loopback`。直连（无反代）部署不受影响；反代部署若代理**不在回环**上需显式配置，
+  否则所有请求会被归到同一个限流桶。
+- 新增环境变量：`PORTAL_SECURITY_HEADERS`、`PORTAL_CSP`、`PORTAL_HSTS`、
+  `PORTAL_HSTS_MAX_AGE`、`PORTAL_SECRET_KEY`、`PORTAL_SECRET_KEY_FILE`、
+  `PORTAL_SECRET_KEY_PREVIOUS`、`PORTAL_TOTP_ENABLED`、`PORTAL_TOTP_ISSUER`、
+  `PORTAL_TOTP_WINDOW`、`PORTAL_TOTP_CHALLENGE_TTL_SECONDS`（逐项语义见 `02-configuration.md`）。
+- DB 迁移 v3 `totp_two_factor`：`users` 增加 `totp_secret` / `totp_enabled` /
+  `totp_confirmed_at` / `totp_last_counter`，并新建 `totp_recovery_codes` 与 `totp_challenges`。
+- 新增接口：`POST /api/auth/login/totp`、
+  `POST /api/users/me/totp/{setup,enable,disable,recovery-codes}`、
+  `POST /api/users/:id/totp/reset`（契约见 `04-api-contract.md`）。
+- HTTP 响应新增安全响应头（CSP / nosniff / X-Frame-Options / COOP / CORP / Referrer-Policy /
+  Permissions-Policy，HTTPS 下加 HSTS）；`/api/*` 新增 `cache-control: no-store`。
+
+### 验证方式
+
+```bash
+npm run typecheck      # server + web 两个工作区
+npm test               # 单测：先 server 工作区、再 web 工作区（Vitest）
+npm run build          # web（vite build）→ server（tsc）
+npm run test:e2e       # Playwright 冒烟：首启初始化 → 登录/登出 → 关键页面降级 →
+                       # 权限边界 → 安全响应头（默认端口 8988，PORTAL_E2E_PORT 可覆盖）
+
+# 手工核对安全响应头（HTTPS 下应有 hsts，HTTP 直连不应有）
+curl -sI http://127.0.0.1:8899/ | grep -iE 'content-security-policy|x-content-type-options|strict-transport-security'
+```
+
+CI 上同一组命令由 `.github/workflows/ci.yml` 执行（`quality` + `e2e`）；
+`docker-publish.yml` 的 `quality` job 跑同样的 typecheck / test / build，通过后才构建并推送镜像。
+
+本轮实测结果（供后续对照）：
+
+```text
+npm run typecheck   → exit 0
+npm test            → server 15 文件 / 333 用例 + web 4 文件 / 106 用例 = 439 全绿
+npm run build       → web (vite) + server (tsc) 均成功
+npm run test:e2e    → 7 passed（2 个 spec）
+```
+
+另有两条**升级路径/部署硬化**专项测试：`server/tests/migrationV3.test.ts`
+（把库真实退回 v2 再升级，验证管理员/设置/已加密敏感值无损、迁移可重放）与
+`server/tests/composeHardening.test.ts`（静态钉住 socket `:ro`、`cap_drop: ALL`、
+代理只放行 4 个读接口且写接口全 0）。
+
+### 已知限制 / 未做项
+
+1. **`read_only: true` 根文件系统默认不开**：NAS 上的 Docker/Compose 版本对
+   `read_only` + 命名卷 + `group_add` 的组合处理不一致，个别版本会直接起不来，
+   而收益小于这个风险。`docker-compose.yml` 里留了注释示例（开启时需给 `/tmp` 挂 tmpfs，
+   `/data` 必须保持可写）。
+2. **E2E 不是发布前置**：`docker-publish.yml` 的 `build-and-push` 只依赖同文件的 `quality`。
+   要让 E2E 也卡住发布，需要在该文件里**也定义 `e2e` job**，并把依赖写成
+   `needs: [quality, e2e]` —— `needs` 只能引用同一工作流文件内的 job，不能跨工作流。
+3. **`:ro` 的 `docker.sock` 仍不等于最小权限**：只读代理是**可选**覆盖文件，不是默认开启，
+   因此"门户进程被攻破即可控制宿主 Docker"这条最大风险默认仍然存在。
+4. **两步验证是可选而非强制**：未绑定的账号仍是"密码即可登录"；
+   唯一管理员丢失验证器时只能走离线重置（绕过审计，见 `08-operations.md` §5）。
+5. **主密钥默认与数据库同卷**：防"数据库文件被单独拷走"，不防主机失陷；
+   备份必须把 `secret.key` 与 `portal.sqlite` 一起保存（`08-operations.md` §10）。
+6. **CSP 静默无报告**：未接 `report-uri` / `report-to`，策略改严后的违规只能靠界面表现发现；
+   默认策略还为 React 的内联 `style` 属性保留了 `style-src 'unsafe-inline'`。
+7. **HTTPS 下的 HSTS 与反代绑定**：只有 `X-Forwarded-Proto: https` 被 `trustProxy` 采信时才会下发，
+   反代配置不对就会出现"以为开了 HSTS 其实没开"。
+
 
 
