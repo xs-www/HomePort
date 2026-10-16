@@ -397,8 +397,11 @@ describe('告警引擎 · container_exit 边界', () => {
     world.close();
   });
 
-  it('用真实容器列表构造的快照（exitCode 未映射 → null）不会误报 exited', async () => {
-    // 这条同时记录了集成缺口：ContainerSummary 目前没有 exitCode 字段。
+  it('退出码未知（null）时不会把 exited 误报成异常退出', async () => {
+    // 语义：`null` = 未知、`0` = 正常退出，**两者都不触发** —— 宁可漏报，
+    // 也不能把"正常停止"报成异常退出。`makeContainer()` 默认就是 `exitCode: null`，
+    // 模拟的是"容器已 exited 但退出码没取到"（缺 State 的 inspect、或旧夹具）。
+    // 注：mapper 现已映射 `State.ExitCode`，"非 0 退出码触发"由引擎用例另行覆盖。
     const live: ContainerListResult = makeContainerList([
       makeContainer({ id: 'c-gitea', name: 'gitea', state: 'exited', status: 'Exited (1)', finishedAt: T0_ISO }),
     ]);

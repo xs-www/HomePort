@@ -238,7 +238,13 @@ export interface AlertTickResult {
 
 const ALERT_KIND_SET: ReadonlySet<string> = new Set(['disk_percent', 'memory_percent', 'container_exit', 'service_health']);
 
-/** 未知 kind 收敛为 `disk_percent`（DB 有 CHECK 约束，这里只防手写测试数据）。 */
+/**
+ * 未知 kind 收敛为 `disk_percent`。
+ *
+ * 注意：迁移 v5 **没有**给 `alert_rules.kind` / `severity` 加 CHECK 约束
+ * （只有 v1 的 `users.role` 有），所以这里是**唯一**的收敛点 ——
+ * 它不是"防手写测试数据"的兜底，从库里读出来的脏值同样靠它。
+ */
 function normalizeKind(value: string): AlertKind {
   return ALERT_KIND_SET.has(value) ? (value as AlertKind) : 'disk_percent';
 }
