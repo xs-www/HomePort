@@ -11,6 +11,7 @@ import type { AuditRepository } from '../db/users.js';
 import type { AuthService } from '../modules/auth/service.js';
 import type { ContainerService, HostContextRequest } from '../modules/docker/service.js';
 import type { OverviewService } from '../modules/overview/service.js';
+import type { ServiceRegistryService } from '../modules/services/service.js';
 import type { SettingsService } from '../modules/settings/service.js';
 import type { SystemService } from '../modules/system/service.js';
 import type { TailscaleService } from '../modules/tailscale/service.js';
@@ -28,6 +29,8 @@ export interface RouteContext {
   tools: ToolsService;
   overview: OverviewService;
   settings: SettingsService;
+  /** 服务注册表（Sprint 1：发现 / 列表 / 管理 / 健康探测） */
+  services: ServiceRegistryService;
   audit: AuditRepository;
 }
 

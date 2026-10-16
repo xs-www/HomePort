@@ -16,6 +16,8 @@ import { registerContainerRoutes } from './containers.js';
 import type { RouteContext } from './context.js';
 import { registerHealthRoutes } from './health.js';
 import { registerOverviewRoutes } from './overview.js';
+import { registerSearchRoutes } from './search.js';
+import { registerServiceRoutes } from './services.js';
 import { registerSettingsRoutes } from './settings.js';
 import { registerSystemRoutes } from './system.js';
 import { registerTailscaleRoutes } from './tailscale.js';
@@ -29,6 +31,10 @@ const PROTECTED_PREFIXES: ReadonlyArray<{ prefix: string; register: (app: Fastif
   { prefix: '/api/tailscale', register: registerTailscaleRoutes },
   { prefix: '/api/system', register: registerSystemRoutes },
   { prefix: '/api/tools', register: registerToolRoutes },
+  // 服务注册表（Sprint 1）：读接口 viewer 可用，写接口在 handler 内要求 admin；
+  // 聚合搜索按角色过滤索引内容。
+  { prefix: '/api/services', register: registerServiceRoutes },
+  { prefix: '/api/search', register: registerSearchRoutes },
   { prefix: '/api/users', register: registerUserRoutes },
   // 设置域内的每个 handler 自行要求 admin（不能只靠 prefix 守卫，
   // 因为 /api/users 下也有非 admin 的 /me 路由，保持一致的写法更安全）

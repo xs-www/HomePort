@@ -168,6 +168,111 @@ export const totpDisableBodySchema = z.object({
   code: z.string().trim().min(6).max(16).optional(),
 });
 
+// ---- 服务注册表（Sprint 1，见 docs/sprint1-implementation-spec.md §4）----
+
+/**
+ * 布尔型查询参数（`1`/`0`/`true`/`false`）。
+ *
+ * 与 `containerListQuerySchema` 同一风格：只有显式写了才算数，
+ * 省略时**不**给默认值 —— 默认值统一在路由层显式给出，避免类型里混进 `| undefined`。
+ */
+const boolQuerySchema = z
+  .union([z.literal('0'), z.literal('1'), z.literal('true'), z.literal('false')])
+  .transform((value) => value === '1' || value === 'true');
+
+/** `GET /api/services` 查询参数（`.strict()`：未知参数直接拒绝，避免"拼错了却没报错"）。 */
+export const serviceListQuerySchema = z
+  .object({
+    query: z.string().trim().max(128).optional(),
+    category: z.string().trim().max(32).optional(),
+    favorite: boolQuerySchema.optional(),
+    /** 仅 admin 生效（viewer 传了也只会看到 visible 的服务） */
+    includeHidden: boolQuerySchema.optional(),
+  })
+  .strict();
+
+/** `POST /api/services`：新建手工服务。 */
+export const serviceCreateBodySchema = z
+  .object({
+    displayName: z.string().trim().min(1, '服务名称不能为空').max(64),
+    description: z.string().trim().max(280).optional(),
+    /** 内置图标键或 https URL（具体判定在服务层，见 modules/services/service.ts） */
+    icon: z.string().trim().max(2048).optional(),
+    category: z.string().trim().max(32).optional(),
+    preferredUrl: z.string().trim().max(2048).optional(),
+    healthTarget: z.string().trim().max(2048).optional(),
+    healthPath: z.string().trim().max(512).optional(),
+    visibility: z.enum(['visible', 'hidden']).optional(),
+    sortOrder: z.number().int().min(-10000).max(10000).optional(),
+    favorite: z.boolean().optional(),
+  })
+  .strict();
+
+/**
+ * `PATCH /api/services/:id`：上表任意子集。
+ *
+ * `null` 表示"清空该字段"（与"没传"区分开），空字符串由服务层同样当作清空。
+ */
+export const serviceUpdateBodySchema = z
+  .object({
+    displayName: z.string().trim().min(1, '服务名称不能为空').max(64).optional(),
+    description: z.string().trim().max(280).nullable().optional(),
+    icon: z.string().trim().max(2048).nullable().optional(),
+    category: z.string().trim().max(32).nullable().optional(),
+    preferredUrl: z.string().trim().max(2048).nullable().optional(),
+    healthTarget: z.string().trim().max(2048).nullable().optional(),
+    healthPath: z.string().trim().max(512).nullable().optional(),
+    visibility: z.enum(['visible', 'hidden']).optional(),
+    sortOrder: z.number().int().min(-10000).max(10000).optional(),
+    favorite: z.boolean().optional(),
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, { message: '至少提供一个待更新字段' });
+
+/** `DELETE /api/services/:id?mode=reset`：只接受 `reset`（其它值一律 400，不做模糊匹配）。 */
+export const serviceDeleteQuerySchema = z
+  .object({
+    mode: z.literal('reset').optional(),
+  })
+  .strict();
+
+/** `POST /api/services/reorder`：批量排序。 */
+export const serviceReorderBodySchema = z
+  .object({
+    order: z
+      .array(
+        z
+          .object({
+            id: z.string().trim().min(1).max(128),
+            sortOrder: z.number().int().min(-10000).max(10000),
+          })
+          .strict(),
+      )
+      .min(1, '至少提供一个排序项')
+      .max(500),
+  })
+  .strict();
+
+/** `POST /api/services/:id/health`：可带一次性覆盖目标（与服务层同一套校验）。 */
+export const serviceHealthBodySchema = z
+  .object({
+    healthTarget: z.string().trim().max(2048).optional(),
+  })
+  .strict();
+
+/**
+ * `GET /api/search` 查询参数。
+ *
+ * 空查询直接 400（而不是"返回全部"）：搜索框为空时前端应展示本地内容，
+ * 静默返回全量数据既浪费又容易让人以为"搜索没生效"。
+ */
+export const searchQuerySchema = z
+  .object({
+    q: z.string().trim().min(1, '请输入搜索关键词').max(128),
+    limit: z.coerce.number().int().min(1).max(20).optional(),
+  })
+  .strict();
+
 /**
  * 解析 + 校验；失败抛 `VALIDATION_FAILED`（含 `fieldErrors`）。
  *

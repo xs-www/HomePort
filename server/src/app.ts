@@ -17,6 +17,7 @@ import { createLogger, type Logger } from './logger.js';
 import { initDatabase, type Db } from './db/database.js';
 import { AuditRepository, PreferencesRepository, UsersRepository } from './db/users.js';
 import { SettingsRepository } from './db/settings.js';
+import { ServicesRepository } from './db/services.js';
 import { RecoveryCodesRepository, TotpChallengesRepository } from './db/totp.js';
 import { handleError } from './http/errors.js';
 import { createAuthHook } from './http/guards.js';
@@ -28,6 +29,7 @@ import { ContainerService } from './modules/docker/service.js';
 import { OverviewService } from './modules/overview/service.js';
 import { SettingsService } from './modules/settings/service.js';
 import { createSecretBox, loadOrCreateKey, parsePreviousKeys } from './modules/settings/secretBox.js';
+import { ServiceRegistryService } from './modules/services/service.js';
 import { SystemProvider } from './modules/system/provider.js';
 import { SystemService } from './modules/system/service.js';
 import { selectTailscaleProvider } from './modules/tailscale/provider.js';
@@ -92,6 +94,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
   const preferencesRepo = new PreferencesRepository(db);
   const auditRepo = new AuditRepository(db);
   const settingsRepo = new SettingsRepository(db);
+  const servicesRepo = new ServicesRepository(db);
   const recoveryCodesRepo = new RecoveryCodesRepository(db);
   const totpChallengesRepo = new TotpChallengesRepository(db);
 
@@ -136,6 +139,17 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
 
   const tools = new ToolsService({ config, logger });
   const overview = new OverviewService({ containers, tailscale, system, tools, config, logger });
+
+  // 服务注册表（Sprint 1）。**构造期不拉数据**：第一次请求（或管理员 discover）才 sync，
+  // 保证「settings.initialize() 之后才读 Docker」这条顺序不会被这里破坏。
+  const serviceRegistry = new ServiceRegistryService({
+    containers,
+    tailscale,
+    repository: servicesRepo,
+    audit: auditRepo,
+    config,
+    logger,
+  });
 
   // ---- 运行时设置服务 ----
   // 构造一次即可：`initialize()` 内部会先应用数据库覆盖值，
@@ -236,6 +250,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
     tools,
     overview,
     settings,
+    services: serviceRegistry,
     audit: auditRepo,
   };
 
