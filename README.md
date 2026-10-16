@@ -6,8 +6,10 @@
 宿主 CPU/内存/磁盘/GPU 占用，以及 Ollama / DSH / ComfyUI 等本机工具，聚合成一个带登录权限管理的入口页。
 
 > **只读设计**：门户不提供容器启停/删除等写操作。它能看到宿主机的一切，因此故意把权限收窄到"展示 + 跳转"。
-> 唯一的例外是**服务注册表**（Sprint 1）：管理员可以给服务改名、换图标、指定首选入口、排序与收藏 ——
-> 这些只写入门户自己的数据库，**不会**改容器、Compose 或 Tailscale Serve 的任何配置。
+> 例外只有**两处**，且都只写门户自己的数据库，**不会**改容器、Compose 或 Tailscale Serve 的任何配置：
+> 一是**服务注册表**（Sprint 1）—— 管理员可以给服务改名、换图标、指定首选入口、排序与收藏；
+> 二是**告警规则与告警确认**（Sprint 2）—— 管理员可以开关内置规则、改阈值与静默周期、确认事件。
+> Sprint 2 同样**不做任何出站通知（邮件/Webhook），也不自动重启或停止容器**。
 
 ---
 
@@ -21,6 +23,8 @@
 | **F3** | 宿主资源占用 | CPU（含各核心）、内存、磁盘、GPU（含占用显存的进程），SSE 实时推送 |
 | **F4** | 本机工具入口 | Ollama / DSH / ComfyUI / Open WebUI / Portainer / Jellyfin 等，带 TCP+HTTP 可用性探测与多候选入口 |
 | **F5** | 登录权限管理 | 本地账号、admin/viewer 角色、会话持久化、首启管理员初始化、审计日志、**可选两步验证（TOTP + 一次性恢复码，含管理员强制重置）** |
+| **F6** | 历史趋势 | 后台按分钟/小时聚合落库（宿主 CPU/内存/磁盘、关键容器、服务健康占比），4 个时间范围（1 小时 / 24 小时 / 7 天 / 30 天）手写 SVG 曲线。**缺测处断开、绝不补 0**；百分比与字节是两套指标键，永不互相换算；图上标明单位、数据源、采样方式与窗口内缺测数 |
+| **F7** | 告警 | 四条内置规则（磁盘/内存使用率过高、容器异常退出、服务连续探测失败，**默认关闭**）；同一规则同一目标的一次故障只占一条事件、静默期内重开同一行而不是刷屏；管理员改阈值/开关/静默周期并确认事件，viewer 只读；**仅站内事件 + 审计**，不外发通知、不自动修复 |
 
 ## 快速开始
 
@@ -86,10 +90,11 @@ npm run dev:web
 
 # 测试与类型检查
 npm test                      # 一次跑 server 与 web 两个工作区的单测（Vitest）
-                              # 当前规模：server 21 文件 / 430 用例，web 8 文件 / 141 用例
+                              # 当前规模：server 31 文件 / 594 用例，web 10 文件 / 172 用例
 npm run typecheck             # server + web 两个工作区
-npm run test:e2e              # Playwright 冒烟（默认端口 8988，先跑完整生产构建；
-                              # 换端口：PORTAL_E2E_PORT=9001 npm run test:e2e）
+npm run build                 # 生产构建（先 web 后 server：web/dist + server/dist）
+npm run test:e2e              # Playwright 冒烟 12 条（smoke 10 + 安全响应头 2；默认端口 8988，
+                              # 先跑完整生产构建；换端口：PORTAL_E2E_PORT=9001 npm run test:e2e）
 ```
 
 CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在 PR 与 `master` push 上跑
@@ -329,7 +334,7 @@ Linux/NAS 上该域名才会解析。
 | 后端 | Node.js 22 · TypeScript · Fastify 5 · dockerode · better-sqlite3 · zod |
 | 前端 | React 19 · Vite 6 · TypeScript · Tailwind CSS 4 · React Router 7 |
 | 打包 | 四阶段 Dockerfile（alpine，非 root，tini）；镜像由 CI 多架构构建（amd64 + arm64） |
-| 测试 | `npm test` 一次跑 server 与 web 两个工作区的 Vitest 单测（当前 439 个用例），`npm run test:e2e` 跑 Playwright 冒烟（首启初始化 / 登录 / 关键页面 / 权限 / 安全响应头） |
+| 测试 | `npm test` 一次跑 server 与 web 两个工作区的 Vitest 单测（**766 个用例**：server 594 + web 172），`npm run test:e2e` 跑 Playwright 冒烟 **12 条**（首启初始化 / 登录 / 关键页面 / 权限 / 服务墙 / 历史与告警 / 安全响应头） |
 | CI | [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：typecheck + 单测 + 构建 + E2E（PR 与 master push） |
 
 架构与逐函数说明见 [docs/static/](docs/static/README.md)。
@@ -342,6 +347,11 @@ Linux/NAS 上该域名才会解析。
 [接口契约](docs/static/04-api-contract.md) · [前端模块](docs/static/05-web-modules.md) ·
 [数据模型](docs/static/07-data-model.md) · [安全模型](docs/static/06-security.md) ·
 [变更记录](docs/static/09-changelog.md)
+
+**开发计划与规格**：[2.0 开发计划](docs/HomePort_2.0_Balanced_Development_Plan.md) ·
+[Sprint 2 冻结契约](docs/sprint2-implementation-spec.md)（轻量历史监控 / 健康监测 / 告警，
+签名与语义的唯一真相来源） · [Sprint 1 冻结契约](docs/sprint1-implementation-spec.md) ·
+[Sprint 0 基线审计](docs/sprint0-baseline-audit.md)
 
 ## 已知限制
 

@@ -116,6 +116,27 @@
 | `PORTAL_CACHE_CONTAINERS_TTL_MS` | `2000` | 容器列表缓存。容器多（>30）时可调到 5000 降低 inspect 压力 |
 | `PORTAL_CACHE_TAILSCALE_TTL_MS` | `5000` | tailnet 状态缓存，避免频繁 fork `tailscale` 进程 |
 
+### 历史采集与健康探测（Sprint 2）
+
+> ⚠️ **`PORTAL_METRICS_INTERVAL_MS` 与 `PORTAL_METRICS_SAMPLE_INTERVAL_SEC` 是两件事**，
+> 名字像但作用域完全不同：前者只管"往**浏览器**推多快"（开页面时的实时刷新），
+> 后者决定"**落库**的历史曲线密度"。历史采集与浏览器开不开、开几个标签页**无关**
+> —— 进程内只有一个采样器。调优时别只调前者（详见 `08-operations.md` §7.2/§8）。
+
+| 变量 | 默认值 | 范围 | 说明 |
+| --- | --- | --- | --- |
+| `PORTAL_METRICS_SAMPLE_INTERVAL_SEC` | `30` | 5–3600 | 后台采样 tick 间隔（秒）；同时是 minute 桶"应有样本数"的基准（`max(1, round(60/间隔))`）。NAS 弱机建议 `60` |
+| `PORTAL_METRICS_RETENTION_MINUTE_HOURS` | `24` | 1–168 | minute 桶保留小时数。**稳态行数由此封顶**（窗口滚动，不随时间累积） |
+| `PORTAL_METRICS_RETENTION_HOUR_DAYS` | `30` | 1–3650 | hour 桶保留天数 |
+| `PORTAL_METRICS_CONTAINER_LIMIT` | `10` | 0–100 | 采集容器的数量上限（**0 = 完全不采容器指标**，只留宿主与服务健康） |
+| `PORTAL_HEALTH_PROBE_INTERVAL_SEC` | `300` | 0–86400 | 自动 HTTP 探测间隔（秒）。**0 = 关闭自动探测**（容器维度判定与手动探测仍可用） |
+| `PORTAL_HEALTH_PROBE_CONCURRENCY` | `4` | 1–32 | 全局在飞探测并发上限；超出的服务轮到下一轮，不排队 |
+
+- 非法值**启动即报错**（与 `PORTAL_TRUST_PROXY` 同风格），不静默截断 ——
+  否则"我设了保留 3 天"可能实际生效的是别的值。
+- 这 6 项都是 `live` 生效级别（改完即生效，不需要重启、不需要重建容器）。
+- 取值只影响"采多少、留多久、探多勤"，**都不改变任何出站行为**：Sprint 2 没有任何通知通道。
+
 ### 安全响应头（S0-03）
 
 | 变量 | 默认值 | 说明 |

@@ -101,8 +101,8 @@
 
 | 角色 | 权限 |
 | --- | --- |
-| `admin` | 全部只读功能 + **服务注册表配置（改名/图标/分类/首选入口/排序/收藏/健康目标，S1）** + 账号管理（增删改用户、重置密码、强制下线、查看审计） |
-| `viewer` | 全部只读功能（总览/服务墙/服务详情/容器/设备/系统/工具），个人偏好与自助改密 |
+| `admin` | 全部只读功能 + **服务注册表配置（改名/图标/分类/首选入口/排序/收藏/健康目标，S1）** + **告警规则与事件确认（S2）** + 账号管理（增删改用户、重置密码、强制下线、查看审计） |
+| `viewer` | 全部只读功能（总览/服务墙/服务详情/容器/设备/系统/工具/**历史指标/健康监测/告警（读）**），个人偏好与自助改密 |
 
 > **服务注册表是本项目第二处写面**（第一处是账号与运行时设置）。写的是什么必须说清：
 > 只写门户**自己的数据库**（`services` / `service_bindings` / `service_preferences`），
@@ -147,6 +147,49 @@
 > （例如只允许与服务自身入口同源的地址）时有据可依。
 > 校验与执行都在 `server/src/modules/services/healthProbe.ts`（纯函数 + 可注入 fetch，有单测）。
 
+### 后台任务的授权与能力边界（S2）
+
+Sprint 2 新增了三条后台任务链（历史采样、健康监测、告警评估）。它们的安全处境与请求驱动的
+路由**不一样**：它们不需要会话就能跑，所以"谁能触发它们"这个问题不成立，真正要回答的是
+"它们能对外做什么、又能看到什么"。
+
+| 项 | 约束 | 为什么 |
+| --- | --- | --- |
+| 读接口 | `/api/metrics/*`、`/api/alerts/{rules,events,summary}`、`/api/health/monitor` 一律 **viewer 可读**，且**无需 CSRF** | 它们是"只读运维视图"，与容器/系统/服务墙同级：能看到宿主机 CPU 曲线的人，本来就是被邀请登录的用户；把读权限提到 admin 只会逼所有人在日常浏览时共用管理员账号 —— 那是更差的结局 |
+| 写接口 | `PATCH /api/alerts/rules/:id`、`POST /api/alerts/events/:id/ack` 要求 **admin + 有效 CSRF** | 改阈值会改变"什么时候会告警"（安全相关配置），确认会写审计并代表"人已经看到" |
+| 匿名 | 三条前缀都在 `PROTECTED_PREFIXES` 里（`requireRole('viewer')` + `createCsrfHook()`），匿名一律 `401`（不是空列表、不是 `404`） | "默认安全"：新增路由即使忘记加守卫，最坏结果是"需要登录"，不会匿名开放 |
+| 兜底守卫 | `api/alerts.ts` 与 `api/healthMonitor.ts` **各自再挂一份** viewer + CSRF 钩子 | 万一 `PROTECTED_PREFIXES` 漏了某条前缀，最坏也是"需要登录 + 缺 CSRF 被拒"，而不是把只读的规则与事件匿名开放出去。重复挂同一钩子是幂等的（只是多校验一次），代价远小于"漏一个前缀就对外裸奔"。有测试独立验证：`/api/alerts-unwired`、`/api/health/monitor-unwired` |
+| 后台采样视角 | 采样 `service.health.up_ratio` 时固定 `role: 'viewer'`；健康监视器取服务列表同样是 viewer 视角 | **hidden 服务不采、不监测**：否则 viewer 可读的历史接口会变成"隐藏服务名"的泄漏通道 —— 用户刻意隐藏的服务的名字不该从曲线或健康列表里冒出来 |
+| 探测复用 | 健康探测复用 S1 的 `runHealthProbe`（GET、不跟随跳转、3s 超时、最多读 16KB、失败不重试） | 不做第二份探测逻辑，SSRF 拒绝清单与请求纪律只维护一处（见上表） |
+| 出站能力 | **零**（见下） | Sprint 2 不做任何外发通知，也不做自动修复 |
+
+#### `backgroundBoundary.test.ts`：把"没有这种能力"变成可判定的断言
+
+`server/tests/backgroundBoundary.test.ts` 是一条**可执行的架构约束**（不是注释，也不是行为测试）：
+它扫描 `server/src/modules/{metrics,health,alerts}` 与 `modules/docker/backgroundContext.ts` 的源码，
+断言后台代码**根本不具备**出站或执行外部命令的能力。
+
+| 断言 | 内容 |
+| --- | --- |
+| 目录存在且非空 | `modules/metrics`、`modules/health`、`modules/alerts` 都必须有 `.ts` 文件 —— 否则一次重命名就能让守卫退化成"永远为真的空扫描" |
+| 无出站 / 执行能力 | 源码（先去掉注释 —— 注释里提到 `fetch` 不算违规）不得出现：`fetch(`、`http(s).request` / `http(s).get`、`net.connect(`、`child_process` / `spawn(` / `execFile(`、`nodemailer` / `axios` / `node-fetch` / `undici`、以及直连 `/var/run/docker.sock` |
+| 不持有 Docker 写能力 | 不得**值导入** `docker/service.js`、`docker/provider.js`、`dockerode`（`import type` **允许** —— 类型不产生运行期连接对象）；需要主机上下文时用 `modules/docker/backgroundContext.ts` |
+| 探测只读 | `modules/services/healthProbe.ts` 只声明 `method: 'GET'`（且先断言"确实声明了方法"，防止方法被删掉后断言静默通过），并且源码里不出现请求体 `body:` |
+
+为什么用"扫源码"而不是行为测试：这条要求描述的是**没有发生某事**
+（"默认配置不向外发送告警，也不自动重启容器"），行为测试很难证完 —— 总有没走到的分支、
+没 mock 到的路径，而且"这次没发"不等于"不能发"。反之，"代码里根本不具备这种能力"是可判定的。
+同仓库先例：`envBoundary.test.ts`（钉住"只有一个环境变量读取点"）。
+
+这条约束的意义不止"一条测试过了"，它同时冻结了三件事：
+
+1. **不外发**：告警只产生站内事件与审计，出站通知渠道（邮件 / webhook）是 Sprint 4 的事。
+   `notifyRecovery` 现在只被记进 `alert.resolved` 的审计详情，作为"用户当初的意图"留档
+   （`server/src/modules/alerts/engine.ts`），**没有任何代码读它来决定发不发**。
+2. **不自动修复**：后台代码拿不到能写 Docker 的连接对象，所以"自动重启容器"这类需求
+   不可能被某次重构顺手引进后台 tick —— 要引进必须先改这条测试，等于强制一次显式评审。
+3. **不泄漏隐藏服务**：采样固定 viewer 视角（见上表），历史与健康接口不会报出 hidden 服务。
+
 ## 4. CSRF
 
 | 项 | 实现 |
@@ -160,6 +203,17 @@
 
 > 为什么不用 Double-Submit Cookie：会话令牌是 httpOnly 的，前端无法读取它来做签名；
 > 服务端持有会话记录，直接比对存储的令牌更简单且没有"cookie 可被覆盖"的攻击面。
+
+Sprint 2 新增的写接口只有两个（`PATCH /api/alerts/rules/:id`、`POST /api/alerts/events/:id/ack`），
+都落在 `/api/alerts` 前缀下，因此自动获得 CSRF 钩子（`api/alerts.ts` 还自带一份作兜底）。
+它们**不改容器、不改 Compose、不改 Tailscale 配置**，只写门户自己的 `alert_rules` / `alert_events`。
+
+> ⚠️ **缺 CSRF 的 403 与角色不足的 403 是两个不同的理由，不能混为一谈。**
+> 两者都是 `403`，但 `code` 不同：缺少或不匹配令牌 → `CSRF_MISMATCH`；角色不够 → `FORBIDDEN`。
+> `server/tests/alertsApi.test.ts` 用两条**分开的**用例分别断言：
+> viewer 带 CSRF 的写 → `403`（角色不足），admin **缺** CSRF 的写 → `403`（并额外断言库里**没被改动**）。
+> 合并成一条"403 就算过了"的断言，会让其中一条防线失效而测试照旧全绿 ——
+> "两种拒绝必须分别断言"说的就是这个：它们保护的是两件不同的事。
 
 ## 5. 限流
 
@@ -185,6 +239,11 @@
 > "我是谁、我用的是什么协议"的决定权交给每一个客户端。
 > 为什么默认也不是 `false`：标准部署里代理连接必然来自回环，`loopback` 既拿到真实 IP，
 > 又不必相信任何外部来源。改这个值之前请先确认"门户前面是否真有一个**不可绕过**的反代"。
+
+Sprint 2 新增的 metrics / alerts / health 读接口**没有单独限流**：它们靠"必须已登录"这道门，
+轮询频率由前端控制。全局限流插件是 `global: false`（按需开启），本 Sprint 没有给新路由开启
+（目前只有 `/api/auth/login` 与 `/api/auth/login/totp` 显式开了 10 次/分钟/IP）。
+如果将来把门户暴露到不可信网络，这是需要重新评估的一处。
 
 ## 6. 敏感信息脱敏
 
@@ -348,6 +407,17 @@ connect-src 'self'; form-action 'self'; frame-ancestors 'none'`。
    换取的便利是"能探测本机服务"，代价是"管理员若被诱导保存了内网管理地址，门户会替他去请求"。
    拒绝清单只覆盖"被请求就会造成危害"的目标（云元数据、Docker API 端口），
    不含普通内网管理页。**默认不探测、必须显式配置**是这条风险的主要缓解。
+9. **告警只有站内可见，没有任何外发通道**（S2）：`backgroundBoundary.test.ts` 把这一点钉成了
+   架构约束（见 §3），出站通知渠道排到 Sprint 4。后果是**没人打开门户就等于没有告警** ——
+   夜间磁盘写满这类事件不会被主动送到手机上。缓解：默认四条内置规则 `enabled = false`
+   （装了但不吵，避免制造没人看的噪音）、事件与确认都留审计、以及"只要有告警，
+   下一次打开门户必然看到未确认计数"。接通知渠道时**必须**重新评估这条测试与信源可信度
+   （收件人、webhook 目标、凭据存放都属于新增的出站面）。
+10. **历史指标与告警读接口对 viewer 开放且没有单独限流**（S2）：viewer 可以持续拉取宿主 CPU/内存/
+    磁盘曲线、服务健康判定与告警历史（含容器与服务名）。这是**有意**的取舍 ——
+    只读视图与容器/系统页同级，且后台采样固定 viewer 视角、hidden 服务不进样本（§3）；
+    但"可读"与"可高频读"是两件事，将来若把门户暴露到不可信网络，
+    应在这里加按用户的读限流（现在只有登录接口限流，见 §5）。
 
 ## 10. 安全检查清单（发布前）
 
@@ -365,4 +435,7 @@ connect-src 'self'; form-action 'self'; frame-ancestors 'none'`。
       需要更强保证时已启用只读 socket 代理（`docker-compose.socket-proxy.yml`）
 - [ ] 区分 admin 与 viewer 账号用途，日常浏览用 viewer
 - [ ] 需要的账号已绑定两步验证，并且**恢复码已离线保存**（恢复码只显示一次）
-- [ ] 定期检查审计日志中的 `auth.login_failed`、`auth.totp_failed`、`auth.totp_reset`
+- [ ] 确认后台任务仍然**没有**出站能力：`npm test` 里的 `backgroundBoundary.test.ts` 全绿
+      （它同时断言三个后台目录存在且非空 —— 别在重命名模块后把它变成空扫描）
+- [ ] 定期检查审计日志中的 `auth.login_failed`、`auth.totp_failed`、`auth.totp_reset`、
+      `alert.rule_updated`、`alert.acknowledged`

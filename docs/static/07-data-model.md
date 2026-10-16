@@ -263,9 +263,98 @@
 | `value` | TEXT | NOT NULL | 值（统一 TEXT，避免为加一项就迁移） |
 | `updated_at` | TEXT | NOT NULL | ISO |
 
+### `metric_buckets`（迁移 v5）
+
+历史指标桶。**一行 = 一个时间桶内一条序列的聚合结果**（不是原始样本）。
+
+| 列 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PK | UUID |
+| `resolution` | TEXT | NOT NULL | `minute` / `hour` |
+| `metric` | TEXT | NOT NULL | 指标键，如 `host.cpu.percent`、`host.disk.used_bytes` |
+| `target` | TEXT | NOT NULL | **稳定身份**：`host` / `disk:<label>` / `container:<sourceRef>` / `service:<sourceRef>` |
+| `target_label` | TEXT | NOT NULL | 展示名（随最新一桶更新：服务改名后曲线仍连续） |
+| `unit` | TEXT | NOT NULL | `percent` / `bytes` / `ratio`（**与 `metric` 一起决定图表纵轴单位**） |
+| `bucket_at` | INTEGER | NOT NULL | 桶起点 unix 秒（`floor(now/60)*60` 或 `floor(now/3600)*3600`） |
+| `value` | REAL | NOT NULL | 均值 |
+| `min_value` | REAL | NOT NULL | 桶内最小值（服务健康这类 0/1 序列靠它看抖动） |
+| `max_value` | REAL | NOT NULL | 桶内最大值 |
+| `samples` | INTEGER | NOT NULL | 桶内实际样本数 |
+| `expected` | INTEGER | NOT NULL | 应有样本数（minute：`max(1, round(60/采样间隔))`；hour：`60`） |
+| `created_at` | TEXT | NOT NULL | ISO |
+
+约束与索引：
+
+- `UNIQUE (resolution, metric, target, bucket_at)` —— 幂等重写的依据
+  （`INSERT … ON CONFLICT DO UPDATE`），同一分钟重复 flush 不会产生重复行。
+- `idx_metric_buckets_series (resolution, metric, target, bucket_at)` —— 曲线查询。
+- `idx_metric_buckets_retention (resolution, bucket_at)` —— 保留清理按分辨率+时间扫。
+
+> **两条必须记住的语义**（图上直接可见）：
+> 1. **缺测没有行，绝不写 0**：某个分钟没采到样本，就是**没有这一行** ——
+>    图表在时间轴上断开，而不是画一条 0 的平线（写 0 会把"没数据"伪装成"CPU 真的是 0%"）。
+> 2. `samples < expected` 才是"这桶有数据但缺了一部分"（`partial`），
+>    两个数都必须落库，否则事后无法区分"没采"与"采到了 0"。
+>
+> `target` **刻意不含容器 ID**：容器重建后 `sourceRef` 不变，历史曲线因此连续；
+> 用容器 ID 会让每次重建都断成两条线。
+
+### `alert_rules`（迁移 v5）
+
+告警规则。内置四条由 `AlertsService.ensureBuiltinRules()` 在**装配期幂等补齐**
+（迁移只建结构、不塞业务数据）。
+
+| 列 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PK | 如 `rule-disk-percent`（内置规则用稳定 ID） |
+| `kind` | TEXT | NOT NULL | `disk_percent` / `memory_percent` / `container_exit` / `service_health` |
+| `name` | TEXT | NOT NULL | 展示名 |
+| `description` | TEXT | NOT NULL DEFAULT `''` | 说明 |
+| `enabled` | INTEGER | NOT NULL DEFAULT `0` | **默认关闭**：装了但不吵，由管理员显式开启 |
+| `threshold` | REAL | 可 NULL | 阈值（`container_exit` 用不到） |
+| `duration_sec` | INTEGER | NOT NULL DEFAULT `0` | 条件**需持续**多久才算数（0 = 立即） |
+| `target` | TEXT | 可 NULL | 限定目标；NULL = 适用于该 kind 的全部目标 |
+| `silence_sec` | INTEGER | NOT NULL DEFAULT `3600` | 静默周期：多久内不重复刷屏 |
+| `notify_recovery` | INTEGER | NOT NULL DEFAULT `1` | 是否发恢复通知 |
+| `severity` | TEXT | NOT NULL DEFAULT `warning` | `warning` / `critical` |
+| `builtin` | INTEGER | NOT NULL DEFAULT `1` | 是否内置（内置规则不可删除） |
+| `updated_at` / `created_at` | TEXT | NOT NULL | ISO |
+
+### `alert_events`（迁移 v5）
+
+告警**事件（episode 模型）**：一次故障一行，不是"每次判定一行"。
+
+| 列 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PK | UUID |
+| `rule_id` | TEXT | NOT NULL, FK → `alert_rules(id)` **ON DELETE CASCADE** | 规则删除即级联清理事件 |
+| `kind` / `rule_name` / `severity` | TEXT | NOT NULL | **快照**规则信息：规则改了名/被删，历史事件仍能如实显示当时的样子 |
+| `target` / `target_label` | TEXT | NOT NULL | 目标（`target` 用稳定身份，同 `metric_buckets`） |
+| `value` / `threshold` / `unit` | REAL/REAL/TEXT | 可 NULL | 触发时的实测值、阈值、单位 |
+| `message` | TEXT | NOT NULL | 人可读文案（含"已持续 N 分钟"；`duration_sec = 0` 时不写这句以免噪声） |
+| `started_at` | TEXT | NOT NULL | 条件**开始成立**的时刻（不是发现时刻） |
+| `fired_at` | TEXT | NOT NULL | 实际触发时刻（`started_at + duration_sec` 之后） |
+| `resolved_at` | TEXT | 可 NULL | **NULL = 未恢复**（"在告警中"的定义） |
+| `reopen_count` | INTEGER | NOT NULL DEFAULT `0` | 静默期内重开次数（第 2、3 次…） |
+| `acknowledged_at` / `acknowledged_by` | TEXT | 可 NULL | 确认（ack）只表示"人已看到"，**不改变判定**；重开时清空 |
+| `created_at` | TEXT | NOT NULL | ISO |
+
+约束与索引：
+
+- **`UNIQUE INDEX idx_alert_events_open (rule_id, target) WHERE resolved_at IS NULL`**
+  —— 本次设计的核心不变量：**同一规则同一目标最多只有一行未恢复**。
+  "一小时内不重复刷屏"与"进程重启后不重复通知"都靠它兜底，而不是靠引擎代码自觉：
+  引擎写入前先查未恢复行，有就只把同一行 `reopen_count + 1`。
+  （部分索引：SQLite 支持 `WHERE` 子句，因此"已恢复"的历史行不受此约束，可以有很多条。）
+- `idx_alert_events_recent (fired_at DESC)` —— 事件列表按触发时间倒序。
+
+> **为什么快照 `kind` / `rule_name` / `severity`**：规则是可改可删的，而事件是历史事实。
+> 若事件只存 `rule_id`，删掉规则后（`ON DELETE CASCADE`）或改了名之后，
+> 历史事件会显示成"现在"的样子 —— 那是篡改历史。
+
 ## 3. 迁移
 
-`MIGRATIONS`（`src/db/database.ts`）当前有四项：
+`MIGRATIONS`（`src/db/database.ts`）当前有**五项**：
 
 | version | name | 内容 |
 | --- | --- | --- |
@@ -273,6 +362,7 @@
 | 2 | `runtime_settings` | `settings` 表（运行时设置覆盖层） |
 | 3 | `totp_two_factor` | `users` 新增 `totp_secret` / `totp_enabled` / `totp_confirmed_at` / `totp_last_counter`；新建 `totp_recovery_codes` / `totp_challenges` 两张表与索引 |
 | 4 | `services_registry` | 新建 `services` / `service_bindings` / `service_preferences` 三张表与两个索引（服务注册表，Sprint 1） |
+| 5 | `metrics_alerts_schema` | 新建 `metric_buckets` / `alert_rules` / `alert_events` 三张表、两个指标索引、告警部分唯一索引与最近事件索引（历史监控与告警，Sprint 2）**——只建结构，不塞业务数据；四条内置规则由启动时 `ensureBuiltinRules()` 幂等补齐** |
 
 **迁移规则**
 
@@ -320,5 +410,16 @@ docker compose cp homeport:/data/ ./backup/
 | totp_recovery_codes | 每用户 10 行；重新生成时整批替换，关闭两步验证即清空 |
 | totp_challenges | 每次"密码正确但需要第二步"的登录一行；过期或消费超 24h 即清理 |
 | audit_log | 每次登录/登出/管理操作一行；按 90 天清理。日活 10 次操作 ≈ 数千行/年 |
+| metric_buckets（minute） | ≈36 行/分钟（基准：宿主 3 + 磁盘 6 + 容器 10×2 + 服务 7）→ 约 51,840 行/天；**只保留 24h，稳态不累积**（≈10–12 MB） |
+| metric_buckets（hour） | 864 行/天；保留 30 天（≈5–6 MB） |
+| alert_rules | 固定 4 条内置（+人工新增），可忽略 |
+| alert_events | 每次**故障（episode）**一行，不是每次判定一行；静默期内重开只 `reopen_count+1`。按 90 天清理。正常家庭环境 ≈ 每年几十行 |
 
-实际长期稳定在几百 KB 量级，NAS 上无需担心。
+既有数据实际长期稳定在几百 KB 量级，NAS 上无需担心。
+
+**Sprint 2 之后的总量**：历史指标成为唯一有意义的增长项，但 **minute 分辨率 24h 后即被清理，
+稳态总量 ≤ 32 MB**（含索引与空闲页；每行约 200 B，见 `docs/sprint2-implementation-spec.md` §1.1）。
+
+> **判断"有没有泄漏"只看一条**：`minute` 行数**不应随运行时长增长**（保留窗口滚动）。
+> 若它持续单调上升，说明保留清理没生效 —— 那不是"数据多"，是真 bug。
+> 用 `GET /api/metrics/storage` 可随时核对行数、`page_count × page_size` 与按当前速率外推的日增。

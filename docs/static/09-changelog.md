@@ -2936,4 +2936,104 @@ git stash pop
 4. **未做**：`/dsh` 这类"目标不是容器"的 serve 路由在真实 NAS 上的呈现仍待 NAS 实机复核（同 Sprint 1 条目）。
 
 
+---
+
+## [2026-10-16] Sprint 2：历史趋势 + 健康监测 + 告警（S2-01…S2-04）
+
+### 背景
+
+Sprint 2 补两个具体缺口：**只有瞬时值、看不到历史**，以及**服务挂了没人知道**。四条 P1：
+S2-01 指标存储（后台单例降采样）、S2-02 历史图表、S2-03 健康检查、S2-04 告警规则。
+冻结契约在 `docs/sprint2-implementation-spec.md`（验收口径、响应形状、测试清单）。
+三条并行开发线（服务端指标存储 / 健康与告警 / 前端）+ 集成裁决；接缝问题
+（路由依赖签名、tick 结果类型、`/api/health/monitor` 前缀归属、后台 HostContext 的唯一定义）
+在集成阶段统一处理，装配缺口由端到端用例兜住。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 新增 | `docs/sprint2-implementation-spec.md` | Sprint 2 冻结契约（含 §1.1 预算判据、§7 响应形状、§10 测试清单） |
+| 新增 | `server/src/modules/metrics/{types,buckets,collector,history,sampler,scheduler}.ts` | 指标采集与存储域：内存累积 + 分钟落库 + 整点滚动 + 保留清理 + 后台单飞调度 |
+| 新增 | `server/src/modules/health/{types,state,monitor}.ts` | 三维健康状态机 + 探测节流与全局并发上限 |
+| 新增 | `server/src/modules/alerts/{types,rules,engine,service}.ts` | 四条内置规则 + episode 引擎（触发/恢复/静默期重开）+ 规则与事件服务 |
+| 新增 | `server/src/api/{metrics,alerts,healthMonitor}.ts` | 9 个新路由（见下） |
+| 新增 | `server/src/modules/docker/backgroundContext.ts` | "没有访客"的 `HostContextRequest` **唯一定义**，两条后台线共用 |
+| 修改 | `server/src/db/database.ts` | **只追加** v5 迁移 `metrics_alerts_schema`：3 表 + 4 索引（含部分唯一索引 `idx_alert_events_open`） |
+| 修改 | `server/src/config.ts` `settings/registry.ts` `settings/service.ts` | 6 个新设置键（全 `live`）；**修掉 `groupList()` 手抄副本漏分组**导致设置页少渲染 6 个键的真 bug |
+| 修改 | `server/src/modules/docker/{types,mapper}.ts` | `ContainerSummary.exitCode` + 映射 `State.ExitCode`（`null`=未知、`0`=正常退出，语义不可互换） |
+| 修改 | `server/src/api/index.ts` `app.ts` `index.ts` | 路由依赖与保护前缀；装配采样器/监视器/引擎/调度器；`backgroundJobs` 只控制定时器 |
+| 新增 | `web/src/api/{metrics,alerts}.ts`、`hooks/{useMetricsHistory,useAlertSummary}.ts`、`components/{MetricsChart,MetricPicker,AlertEventList,AlertRuleForm}.tsx`、`pages/{HistoryPage,AlertsPage}.tsx` | 历史页与告警页 |
+| 修改 | `web/src/api/client.ts` `App.tsx` `layout/AppShell.tsx` | 客户端**纯新增**（+68/−0，未动既有方法）、两条路由、侧栏两个入口（未读 badge 是 NavLink 的**兄弟节点**，保持链接可访问名干净） |
+| 新增 | `server/tests/{metricsBuckets,metricsSampler,metricsHistory,metricsApi,healthState,healthMonitor,alertEngine,alertsApi,backgroundBoundary,schedulerIntegration}.test.ts`、`web/tests/{metricsChart,alertsPage}.test.tsx` | 见"验证方式" |
+
+### 关键决策（含被否决的方案）
+
+1. **写事务频率：规格勘误。** 规格早期写"一小时的 tick 只产生 2 次批量写"，那是**算错的** ——
+   漏了 flush 发生在**每个分钟边界**。真实是 30s 间隔下 **60 次 flush + 1 次整点 rollup = 61 次/小时**。
+   实现按机制原文走，判据换成机器可证的三条：写事务数与 **tick 密度无关**（30s 与 5s 同样时长
+   都是 1861）、整点那一 tick 恰好 2 次批量写、与前端会话数无关。
+   **被否决**：攒到整点才 flush 能做到字面"2 次/小时"，但当前小时只在内存，重启最多丢 59 分钟、
+   1h 视图整点前恒为空 —— 与"24h 每分钟 1 条""重启后历史保留"直接冲突。
+2. **缺测不写 0。** 缺的分钟**没有行**，`samples < expected` 才标 `partial`；图上"没数据"与
+   "真的是 0"必须能分开（写 0 会把采样失败画成 0% 占用，是**主动误导**）。
+3. **多副本合并成一条序列。** `containerServiceRef` 对 compose 服务的所有副本返回同一 target，
+   `expected = base × 副本数`（掉一个副本会正确显示 partial），`targetLabel` 只由 target 身份决定。
+   **被否决**：每容器一条序列（前端按 `/api/services` 每服务推导一个 target，切过去会让历史错位）；
+   也否决了"取名字最小的副本"（副本数 3→1 时同一条序列会反复改名）。
+4. **`duration` 门控计时在内存。** 重启后重新计时（宁晚一轮，不误报）；抖动会立刻清零，不累积。
+5. **`suppressed` 与 `reopened` 分开计。** `suppressed` 只在"未恢复行已存在"时计数，
+   静默期内重新触发算 `reopened`（`reopen_count+1`，清空确认）；唯一来源是引擎的 `suppressedTotal()`。
+6. **"后台模块无出站能力"做成可执行约束。** `backgroundBoundary.test.ts` 扫描源码断言无
+   `fetch`/`http.request`/`net.connect`/`child_process`/通知库/直连 docker.sock，
+   且探测只发 GET 无请求体；并断言目标目录存在且非空（防止约束退化成永不触发的空扫描）。
+7. **E2E 登录会话复用（不为测试放宽安全控制）。** 登录限流是硬编码的安全常量（10 次/分钟）。
+   Sprint 2 新增两条用例后登录次数达 11 次/分钟，末尾用例被 429 挡在登录页。
+   **没有**放宽限流，而是让每个角色只走一次真实登录表单，其余复用缓存会话，
+   并在会话被"退出"撤销时自愈重登（缓存的令牌会被退出真正作废）。
+8. **装配缺口：`AlertEngine` 必须接快照来源。** 不接则四条规则永远 `evaluated = 0` ——
+   36 条单测全绿但**生产上任何告警都不触发**（引擎拿空快照时"正确地什么都不做"，
+   既无异常也无日志）。已接 `createAlertSnapshotSource(...)` 并把"每轮结果回灌服务层"一并接上，
+   同时补了端到端因果链用例，并用"只撤掉那一行接线"实测其判别力。
+
+### 配置 / 接口 / 数据模型影响
+
+- **设置键（6 个，全部 `effect: 'live'`）**：`PORTAL_METRICS_SAMPLE_INTERVAL_SEC`(30, 5–3600)、
+  `PORTAL_METRICS_RETENTION_MINUTE_HOURS`(24, 1–168)、`PORTAL_METRICS_RETENTION_HOUR_DAYS`(30, 1–3650)、
+  `PORTAL_METRICS_CONTAINER_LIMIT`(10, 0–100)、`PORTAL_HEALTH_PROBE_INTERVAL_SEC`(300, **0 = 关闭探测**)、
+  `PORTAL_HEALTH_PROBE_CONCURRENCY`(4, 1–32)。
+- **HTTP 契约（9 个新路由）**：`GET /api/metrics/{catalog,history,storage}`、
+  `GET|PATCH /api/alerts/rules[/:id]`、`GET /api/alerts/events`、`POST /api/alerts/events/:id/ack`、
+  `GET /api/alerts/summary`、`GET /api/health/monitor`。读接口 viewer 即可、无需 CSRF；
+  写接口要求 admin + 有效 CSRF。`GET /api/alerts/rules` 响应是 `{ items: [...] }`（不是裸数组）。
+- **数据模型**：迁移 **v5 `metrics_alerts_schema`**（纯追加）。`metric_buckets` 的
+  `UNIQUE (resolution, metric, target, bucket_at)` 是"同一桶幂等重写"的裁判；
+  `alert_events` 的部分唯一索引 `WHERE resolved_at IS NULL` 是"同一规则同一目标最多一行未恢复"的裁判
+  （**不变量，不是实现细节**）。保留清理边界含等号。
+- **内部签名**：`tickOnce(now?)`、`MetricsTickResult`、`MetricStorageView`、`AlertTickResult`、
+  `HealthTickResult`、`backgroundHostRequest(config)`（见 `03-server-modules.md`）。
+
+### 验证方式
+
+```
+npm run typecheck                      # exit 0（server + web）
+npm test                               # server 31 文件 / 594 用例；web 10 文件 / 172 用例
+npm run build                          # exit 0
+npm run test:e2e                       # 12 用例通过（含 Sprint 2 的历史/告警与 viewer 只读）
+# 真实库副本迁移演练（只读源 → 临时副本）：v4→v5、v3→v4→v5 各 15/15 通过
+node migrate-rehearsal-s2.mjs portal-v4-fixture.sqlite portal-live-pre-sprint1.sqlite
+# 判别力：只撤掉 app.ts 里 AlertEngine 的 snapshot 接线 → 端到端告警用例红在 evaluated > 0
+```
+
+### 已知限制 / 后续
+
+1. **不做外发通知、不做自动修复**（Sprint 4 才加通知渠道）；告警"确认"只在界面内，
+   引擎本身不做任何出站调用，也不重启/停止任何容器。
+2. `container_exit` 规则依赖 `State.ExitCode`：**未知退出码不告警**（`null` 与 `0` 都沉默，
+   但语义不同，不许互相伪装）；`dead` 状态仍可直接触发。
+3. **多副本"另一个副本也在跑"仍不可见**（同 Sprint 1 已知限制，绑定只留代表容器）。
+4. `e2e/**` 仍不在类型检查内（`todo.md` 技术债）；本轮 E2E 又踩到一次"断言写错但类型检查无感"。
+5. **尚未部署到 NAS**：生产仍是 Sprint 0 镜像，Sprint 1 + Sprint 2 待一起部署验收。
+
+
 

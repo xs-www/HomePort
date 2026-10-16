@@ -33,7 +33,7 @@
 | `NOT_FOUND` | 404 | 资源不存在 |
 | `CONFLICT` | 409 | 唯一约束冲突（如用户名重复） |
 | `RATE_LIMITED` | 429 | 触发限流（登录 10 次/分钟/IP） |
-| `UPSTREAM_UNAVAILABLE` | 503 | 依赖的外部数据源不可用（如 docker.sock 未挂载） |
+| `UPSTREAM_UNAVAILABLE` | 503 | 依赖的外部数据源不可用（如 docker.sock 未挂载）；S2 起也用于"后台监视器**未装配**"这类接线缺口（见 §6.8 —— 谎报空列表等于谎报"全部健康"） |
 | `INTERNAL` | 500 | 未预期错误 |
 
 ### 0.4 健康检查
@@ -502,6 +502,379 @@ data: {}
 
 ---
 
+## 6.7 历史指标 `/api/metrics`（Sprint 2）
+
+三条**只读**接口，把后台采样器（`MetricsSampler`）落库的分钟/整点桶读成曲线与容量视图。
+权限由 `api/index.ts` 的 `PROTECTED_PREFIXES` 统一给（`requireRole('viewer')` + CSRF 钩子），
+handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉前缀条目，最坏也只是"需要登录"）。
+**本域没有写接口**：`POST /api/metrics/history` → `404` —— 采样是后台单例（`BackgroundScheduler`）的事，
+不开放给前端触发。
+
+| 接口 | 权限 | 说明 |
+| --- | --- | --- |
+| `GET /api/metrics/catalog` | viewer | 指标目录 + 可用 target + range 表 + 采样/调度状态；前端据此渲染选择器 |
+| `GET /api/metrics/history?metric=&target=&range=` | viewer | 一条曲线：点 + 缺口 + 窗口统计 + 数据源状态 |
+| `GET /api/metrics/storage` | viewer | 行数 / 文件占用 / 保留窗口 / 存储预算 + 最近一次采样摘要 |
+
+### `GET /api/metrics/catalog`
+
+→ `200`
+```json
+{
+  "metrics": [{
+    "key": "host.cpu.percent", "label": "宿主 CPU 使用率", "unit": "percent",
+    "targetKind": "host", "targetPattern": "host",
+    "source": "SystemProvider.snapshot().cpu.percent",
+    "description": "两次采样做差得出；宿主 /proc 不可用时会退化为容器/虚拟机视图（见系统页的数据源提示）。",
+    "availableTargets": 1
+  }],
+  "targets": [{
+    "metric": "host.memory.percent", "target": "host", "targetLabel": "宿主",
+    "unit": "percent", "lastSeenAt": "2026-10-15T10:00:00.000Z"
+  }],
+  "ranges": [
+    { "range": "1h",  "resolution": "minute", "windowSec": 3600,     "expectedBuckets": 60,   "label": "最近 1 小时" },
+    { "range": "24h", "resolution": "minute", "windowSec": 86400,    "expectedBuckets": 1440, "label": "最近 24 小时" },
+    { "range": "7d",  "resolution": "hour",   "windowSec": 604800,   "expectedBuckets": 168,  "label": "最近 7 天" },
+    { "range": "30d", "resolution": "hour",   "windowSec": 2592000,  "expectedBuckets": 720,  "label": "最近 30 天" }
+  ],
+  "sampling": {
+    "intervalSec": 30, "expectedPerMinuteBucket": 2, "containerLimit": 10,
+    "containerNote": "只采关键容器：运行中的优先，按稳定身份排序取前 10 个；超出上限的容器不采（历史库大小由此封顶）",
+    "aggregate": "mean", "note": "30s 采样 → 每分钟 1 条；缺测处断开，不补 0"
+  },
+  "scheduler": { "running": true, "lastTickAt": "2026-10-15T10:00:00.000Z", "lastDurationMs": 41, "lastError": null }
+}
+```
+
+约定与边界：
+
+- **恰好 8 个指标键**，`metrics` 的顺序即前端展示顺序：
+  `host.cpu.percent`、`host.memory.percent`、`host.memory.used_bytes`、`host.disk.percent`、
+  `host.disk.used_bytes`、`container.cpu.percent`、`container.memory.used_bytes`、`service.health.up_ratio`
+  （`METRIC_CATALOG`，`server/src/modules/metrics/types.ts`）。
+- **key 是稳定标识**：进库（`metric_buckets.metric`）、进 URL、进前端。改名等于改契约，历史数据会因此与图表对不上。
+- `unit` 只有 `percent` / `bytes` / `ratio` 三种，**不做任何换算**。百分比与字节是
+  **两套独立的 key**（`*.percent` 与 `*.used_bytes` 各有自己的桶）：这样"磁盘用了 91%"与
+  "磁盘用了 900GB"都是原始事实，不会因为某处除了一个总数而悄悄变成另一个量纲。
+- `targets` = "库里出现过的行" ∪ "本进程刚采到但还没落库的"；后者的 `lastSeenAt` 为 `null`。
+  target 形态与 `targetKind` 对应：`host` / `disk:<label>` / `container:<sourceRef>` / `service:<sourceRef>`。
+- `scheduler` 可以是 `null`（装配方没接调度器）。`running: false` **不等于"没在采"**：
+  `backgroundJobs: false` 的测试里调度器被构造但定时器没起，手工 `tick()` 照样落库。
+- `containerLimit` 为 `0` 时 `containerNote` 换成"完全不采容器指标（宿主与磁盘指标不受影响）"。
+  把"只采前 N 个"写进响应是刻意的：否则"某个容器没有曲线"会被误读成那个容器没跑。
+
+### `GET /api/metrics/history`
+
+查询参数**三个都必填**（缺失 → `400`，`fieldErrors` 指出是哪一个）：
+
+| 参数 | 取值 | 说明 |
+| --- | --- | --- |
+| `metric` | 8 个指标键之一 | 未知 → `400`，`details.allowed` 给出**全部 8 项**（前端可直接渲染候选） |
+| `target` | `host` / `disk:<label>` / `container:<sourceRef>` / `service:<sourceRef>` | 形态不匹配或**从未出现过** → `400`；后者另带 `details.targetPattern`，好让用户知道该指标要的是哪种 target |
+| `range` | `1h` / `24h` / `7d` / `30d` | 未知 → `400`，`fieldErrors.range` 写明"只能是 1h / 24h / 7d / 30d" |
+
+→ `200`
+```json
+{
+  "metric": "host.cpu.percent", "label": "宿主 CPU 使用率", "unit": "percent",
+  "target": "host", "targetLabel": "宿主",
+  "range": "24h", "resolution": "minute",
+  "from": "2026-10-14T10:00:00.000Z", "to": "2026-10-15T10:00:00.000Z",
+  "sampling": { "intervalSec": 30, "aggregate": "mean", "expectedPerBucket": 2,
+                "note": "30s 采样 → 每分钟 1 条；缺测处断开，不补 0" },
+  "source": { "available": true, "mode": "host-proc", "detail": null },
+  "points": [{ "at": "2026-10-15T10:00:00.000Z", "value": 12.4, "min": 10.1, "max": 22,
+               "samples": 2, "expected": 2, "partial": false }],
+  "gaps": { "missingBuckets": 3, "partialBuckets": 5 },
+  "summary": { "count": 1440, "min": 3.1, "max": 91.2, "avg": 22.7, "latest": 12.4, "latestAt": "2026-10-15T10:00:00.000Z" }
+}
+```
+
+关键边界（逐条有单测：`server/tests/metricsApi.test.ts`、`metricsHistory.test.ts`）：
+
+- **缺测没有行**。整分钟一个样本都没有 → 该桶**不写行**，只在 `gaps.missingBuckets` 里计数；
+  桶存在但样本不足 → `samples < expected` 且 `partial: true`。任何情况下都不会写 `value: 0` 来表示"不知道"。
+- **空窗口时 `summary.count = 0`，而 `min/max/avg/latest/latestAt` 全为 `null`，绝不是 `0`**。
+  用 0 冒充"没有数据"会让前端画出一条贴着 0 的平线 —— 正是本项目反复强调要避免的谎话。
+  此时 `points: []`，前端据此显示空态文案而不是平线。
+- `1h/24h` → `resolution: "minute"`（桶 60s）；`7d/30d` → `"hour"`（桶 3600s，由 60 条分钟行聚合，
+  缺分钟即 `partial`）。`sampling.note` 随分辨率换文案。
+- `to` 也**向下对齐到桶起点**：桶是左闭右开的整数区间，未结束的当前桶不算进"应有桶数"，
+  否则每个窗口都会永远缺一个桶。
+- `source` 是**本进程最近一次采集**该指标的数据源状态；重启后还没采过时返回
+  `{ "available": false, "mode": "none", "detail": "本进程尚未采集到该指标的数据源状态（重启后需要一次采样）" }`
+  —— 宁可说"这次没采到"，也不假装可用。
+- 本接口是**手工校验**三个参数（不是 zod `.strict()`），因此多传的未知查询参数被忽略、不会 `400`；
+  对比 `GET /api/alerts/events` 用的是 `.strict()`。两条路由的写法不同，不要互相推断。
+
+### `GET /api/metrics/storage`
+
+→ `200`
+```json
+{
+  "generatedAt": "2026-10-15T10:00:00.000Z",
+  "rows": { "minute": 36, "hour": 2, "total": 38 },
+  "size": { "pageCount": 42, "pageSize": 4096, "freelistCount": 0, "bytes": 172032, "megabytes": 0.16 },
+  "bounds": {
+    "minute": { "oldestAt": "2026-10-15T09:00:00.000Z", "newestAt": "2026-10-15T09:59:00.000Z" },
+    "hour":   { "oldestAt": "2026-10-15T08:00:00.000Z", "newestAt": "2026-10-15T09:00:00.000Z" }
+  },
+  "retention": {
+    "minuteHours": 24, "hourDays": 30,
+    "minuteCutoffAt": "2026-10-14T10:00:00.000Z", "hourCutoffAt": "2026-09-15T10:00:00.000Z"
+  },
+  "budget": {
+    "basis": "observed", "seriesPerMinute": 36, "bytesPerRow": 200,
+    "minuteRowsPerDay": 51840, "hourRowsPerDay": 864,
+    "minuteSteadyRows": 51840, "hourSteadyRows": 25920,
+    "estimatedBytesPerDay": 10540800, "estimatedSteadyBytes": 15552000,
+    "steadyLimitBytes": 33554432, "withinBudget": true,
+    "note": "按最近一小时实际出现的 36 条序列/分钟线性外推（每行约 200 B，含索引开销）；这是估算而非实测，实测占用见 size.bytes。分钟行数由保留窗口封顶，不随运行时长增长。"
+  },
+  "lastTick": { "at": "2026-10-15T10:00:00.000Z", "collected": 41, "samplesWritten": 36,
+                "bucketsFlushed": 36, "hoursRolledUp": 0, "pruned": 0, "gaps": 0, "errors": [] }
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `rows` | 各分辨率的行数与合计；`minute` 是**当前库里真实存在的行数**，不是"理论上应有 1440 行" |
+| `size` | SQLite 文件的页统计（`pageCount × pageSize`），`bytes = pageCount × pageSize`，`megabytes` 保留两位 |
+| `bounds.*` | 各分辨率**实际存在**的最老/最新桶时刻；一行都没有时为 `null`（不是 `0`/空串） |
+| `retention.minuteCutoffAt` / `hourCutoffAt` | 清理截止时刻。按**当前时钟**算并对齐到桶起点（不是按最后一次落库时刻），否则"很久没采样"会被误读成"还没开始清理" |
+| `budget.basis` | 估算基准：`observed`（按最近一小时库里实际出现的序列数）/ `baseline`（观察不到时退回典型部署基准 36 条序列/分钟） |
+| `budget.seriesPerMinute` | 每分钟落库的序列数（= metric × target 组合数） |
+| `budget.bytesPerRow` | 每行估算 **200 B**（含索引开销） |
+| `budget.minuteSteadyRows` | 稳态 minute 行数（= `seriesPerMinute × 60 × minuteHours`）：**只与保留窗口有关，不随运行时长增长** |
+| `budget.hourSteadyRows` | 稳态 hour 行数 |
+| `budget.steadyLimitBytes` | 稳态总量上限：**32 MB = `32 * 1024 * 1024`**（`STEADY_STATE_BUDGET_BYTES`） |
+| `budget.withinBudget` | `estimatedSteadyBytes <= steadyLimitBytes` |
+| `budget.note` | 必须写明"这是**估算**而非实测"，实测占用看 `size.bytes` |
+| `lastTick` | 最近一次**采样 tick** 的摘要（不是后台调度摘要 —— 调度摘要在 catalog 的 `scheduler` 里）；进程还没 tick 过时为 `null` |
+
+---
+
+## 6.8 健康监测 `/api/health/monitor`（Sprint 2）
+
+### `GET /api/health/monitor`
+需登录（viewer 即可）。→ `200`，**无信封**，直接返回健康监视器的内存视图。
+
+```json
+{
+  "generatedAt": "2026-10-15T10:00:00.000Z",
+  "thresholds": { "failThreshold": 3, "okThreshold": 2 },
+  "probe": { "intervalSec": 300, "concurrency": 4, "inFlight": 0,
+             "lastRunAt": null, "probedThisTick": 0, "skippedForConcurrency": 0 },
+  "services": [{
+    "sourceRef": "docker:gitea", "serviceId": "3f1c…", "label": "Gitea",
+    "verdict": "degraded",
+    "dimensions": {
+      "container":    { "state": "ok",      "consecutiveFailures": 0, "detail": null },
+      "dockerHealth": { "state": "unknown", "consecutiveFailures": 0, "detail": null },
+      "http":         { "state": "fail",    "consecutiveFailures": 2, "detail": "连接超时" }
+    },
+    "consecutiveFailures": 2, "consecutiveSuccesses": 0,
+    "changedAt": "2026-10-15T09:50:00.000Z",
+    "lastEvaluatedAt": "2026-10-15T10:00:00.000Z",
+    "lastProbeAt": "2026-10-15T10:00:00.000Z",
+    "reasons": ["HTTP 探测失败 2/3 次：连接超时"]
+  }],
+  "notes": []
+}
+```
+
+约定与边界：
+
+- 它**单独注册为一个前缀**（`{ prefix: '/api/health/monitor' }`），不能挂在 `/api/alerts` 下：
+  前缀挂载时 Fastify 默认同时接受带尾斜杠的写法，因此只定义 `'/'` 一条路由
+  （与 `/api/overview` 一致，`GET /api/health/monitor/` 同样 `200`）。
+- 与 `/api/health` **不是一回事**：`/api/health` 是匿名可达的 compose healthcheck；
+  本接口暴露逐服务判定与探测统计，必须登录。
+- `dimensions` 的三个维度键固定为 `container` → `dockerHealth` → `http`，各自 `state` 取
+  `ok` / `fail` / `unknown`（`unknown` = **没有信号，不等于坏**）；`consecutiveFailures` 是**该维度**的连续失败次数。
+- `verdict` 是去抖后的结论：`healthy` / `degraded` / `down` / `unknown`（默认阈值：连续失败 3 次判 `down`，
+  从失败中恢复需连续全好 2 次）。`thresholds` **一并透出**，否则前端无法解释"为什么失败了 2 次还不告警"。
+- `reasons[]` 是面向人的证据（只描述有问题的维度，**没有证据就不编**）；
+  `notes[]` 是**降级说明**（服务列表/容器列表取不到、自动探测已关闭、探测因并发上限被推迟、
+  一个服务都没有），语义是"**不允许静默为空**"。
+- `probe.intervalSec = 0` 表示关闭自动 HTTP 探测（此时只评估容器维度，`http` 维保持 `unknown`）。
+- **监视器由 `app.ts` 构造一次**（与调度器共用同一实例），本路由只读它的内存状态：
+  在这里 `new` 一个 `HealthMonitor` 会产生第二条探测循环，把宿主服务探两遍。
+- 装配方没把监视器传进来时 → `503 UPSTREAM_UNAVAILABLE`（"健康监视器尚未装配"）。
+  **不返回空列表**：空数组会被读成"全部健康 / 没有服务"。
+- admin 与 viewer 拿到的是同一份视图（纯只读，无角色差异）。
+
+---
+
+## 6.9 告警 `/api/alerts`（Sprint 2）
+
+### 接口一览
+
+| 接口 | 权限 | 说明 |
+| --- | --- | --- |
+| `GET /api/alerts/rules` | viewer | 四条内置规则 + 当前配置（未启用也返回，用 `enabled` 说明状态） |
+| `PATCH /api/alerts/rules/:id` | **admin** + CSRF | 部分更新（只允许 6 个字段） |
+| `GET /api/alerts/events?state=&limit=` | viewer | 事件列表（episode 模型）+ 全量计数 |
+| `POST /api/alerts/events/:id/ack` | **admin** + CSRF | 确认（幂等；已恢复的也能确认） |
+| `GET /api/alerts/summary` | viewer | 徽标用计数 + `top` + `suppressed` / `evaluatedAt` |
+
+权限分两层，缺一不可：路由域在 `api/index.ts` 的 `PROTECTED_PREFIXES` 里统一挂
+`requireRole('viewer')` + CSRF 钩子；**写操作在 handler 内再 `assertAdmin`**。
+`api/alerts.ts` **另外自带一份 viewer + CSRF 钩子作为兜底**：万一前缀条目被漏掉，
+最坏结果也必须是"需要登录 + 缺 CSRF 被拒"，而不是把只读的规则与事件匿名开放出去
+（重复挂同一钩子是幂等的，只是多校验一次）。同样的兜底也存在于 `api/healthMonitor.ts`；
+两者都有测试独立验证（`/api/alerts-unwired`、`/api/health/monitor-unwired`）。
+
+`401`（匿名）、`403 FORBIDDEN`（角色不足）、`403 CSRF_MISMATCH`（缺/错 CSRF 令牌）是**三种不同的拒绝**，
+其中两种 403 的 `code` 不同，前端与测试都必须分开处理（见 06-security.md §4）。
+
+本域还会产生**引擎侧**的审计（不经过接口，但读取告警时看得见）：
+`alert.fired` / `alert.reopened` / `alert.resolved`（`modules/alerts/engine.ts`），
+以及接口侧的 `alert.rule_updated` / `alert.acknowledged`。
+
+### `GET /api/alerts/rules`
+
+→ `200`，**恰好只有 `items` 一个键**（服务层的 `rules()` 仍是裸数组，由路由包成 `{ items }`
+—— 与 `/api/services`、`/api/alerts/events` 的列表写法保持一致）：
+
+```json
+{
+  "items": [{
+    "id": "rule-disk-percent", "kind": "disk_percent", "name": "磁盘使用率过高",
+    "description": "任一磁盘使用率超过阈值并持续一段时间",
+    "enabled": false, "threshold": 85, "durationSec": 600, "target": null,
+    "silenceSec": 3600, "notifyRecovery": true,
+    "severity": "warning", "builtin": true,
+    "updatedAt": "2026-10-15T10:00:00.000Z"
+  }]
+}
+```
+
+每条规则**恰好 13 个字段**，且**不含 `createdAt`**（它是内部列，不进 HTTP 契约）。
+`kind` ∈ `disk_percent` / `memory_percent` / `container_exit` / `service_health`；`severity` ∈ `warning` / `critical`。
+
+四条内置规则（`BUILTIN_ALERT_RULES`，`server/src/modules/alerts/rules.ts`；`target` 均为 `null`、
+`notifyRecovery` 均为 `true`、`builtin` 均为 `true`、**默认 `enabled` 均为 `false`**）：
+
+| id | kind | threshold | durationSec | silenceSec | severity |
+| --- | --- | :-: | :-: | :-: | --- |
+| `rule-disk-percent` | `disk_percent` | 85 | 600 | 3600 | `warning` |
+| `rule-memory-percent` | `memory_percent` | 90 | 300 | 3600 | `warning` |
+| `rule-container-exit` | `container_exit` | 0 | 0 | 3600 | `critical` |
+| `rule-service-health` | `service_health` | 3 | 0 | 3600 | `critical` |
+
+> **默认 `enabled: false` 是刻意的**（"装了但不吵"）：装了规则不等于开始告警，由管理员显式打开。
+> 补齐发生在**装配期**（`ensureBuiltinRules()`，由 `app.ts` 调一次）而**不是迁移里的 INSERT**：
+> 迁移只建结构，于是"迁移后新表为空"这条性质可验证；`GET` 也**不**顺手播种，
+> 否则"接口一被调用表就有四条"会和迁移自检互相打脸。补齐是**幂等**的 ——
+> 已存在的行（含管理员改过的阈值）一个字都不动（`server/tests/alertsApi.test.ts`）。
+
+### `PATCH /api/alerts/rules/:id`
+
+需 admin + CSRF。部分更新，只传要改的字段：
+
+```json
+{ "enabled": true, "threshold": 90, "durationSec": 600, "silenceSec": 3600,
+  "notifyRecovery": true, "target": "disk:C:" }
+```
+
+| 字段 | 取值域 | 越界结果 |
+| --- | --- | --- |
+| `enabled` | boolean | 非布尔 → `400` |
+| `threshold` | `disk_percent` / `memory_percent`：`(0, 100]`；`service_health`：`1..10` 整数；`container_exit`：**必须为 `0`** | 越界 / 传 `null` → `400`（`container_exit` 用 `0` 表示"非 0 退出码即触发"） |
+| `durationSec` | `0..86400` 整数 | 越界 → `400` |
+| `silenceSec` | `60..604800` 整数（60s ~ 7 天） | 越界 → `400` |
+| `notifyRecovery` | boolean | 非布尔 → `400` |
+| `target` | `null`，或与 `kind` 同源的形态：`disk:<label>` / `host` / `container:<sourceRef>` / `service:<sourceRef>` | 前缀不同源 / 含空白或控制字符 / 超 200 字符 / 空串 → `400`（清空请传 `null`） |
+
+→ `200` + 更新后的 `AlertRuleView`（**无信封**，形状与 `items[]` 元素相同）。
+
+- `id` / `kind` 不可改，也没有 `DELETE`：内置规则**不可删除**。未知字段 → `400`（zod `.strict()`）；
+  空对象 → `400`（"至少提供一个待更新字段"）。
+- 校验在**落库之前**完成：非法值直接 `400 VALIDATION_FAILED`，什么都不写 ——
+  被悄悄截断的阈值（"我设了 200% 却变成 100%"）比报错危险得多。
+- `target` 与 `kind` 必须同源，否则规则会永远匹配不到任何目标，那是**最难发现的"配了但不生效"**。
+- 生效范围：只写门户**自己的数据库**（`alert_rules`），不会改容器、Compose 或 Tailscale 配置。
+- **`notifyRecovery` 在 Sprint 2 不改变任何行为**：没有出站通道，它只被记进审计
+  （"用户当初的意图"留档），等 Sprint 4 接通知渠道时才读它。字段现在就存在是为了不改契约。
+- 审计：`alert.rule_updated`，`target = alert_rule:<id>`，`detail` 只放非敏感字段
+  （改了哪几个字段 + 关键数值）。
+- 错误：`400 VALIDATION_FAILED`（`fieldErrors.patch` 给出业务级原因）、`404 NOT_FOUND`、`403`（见上）。
+
+### `GET /api/alerts/events`
+
+查询参数（zod `.strict()`：**拼错参数直接 `400`，不静默忽略**）：
+
+| 参数 | 取值 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `state` | `all` / `open` / `resolved` | `all` | `open` = `resolved_at IS NULL`，`resolved` = 已恢复 |
+| `limit` | `1..200` 整数 | `50` | 越界 / 非数字 → `400`（不是"按 200 处理"） |
+
+→ `200`
+```json
+{
+  "items": [{
+    "id": "alert-…", "ruleId": "rule-disk-percent", "kind": "disk_percent",
+    "ruleName": "磁盘使用率过高", "target": "disk:C:", "targetLabel": "C:",
+    "severity": "warning", "state": "open", "value": 91.2, "threshold": 85, "unit": "percent",
+    "message": "磁盘 C: 使用率 91.2%（阈值 85%，已持续 12 分钟）",
+    "startedAt": "…", "firedAt": "…", "resolvedAt": null, "reopenCount": 0,
+    "acknowledgedAt": null, "acknowledgedBy": null
+  }],
+  "total": 1,
+  "counts": { "open": 1, "resolved": 4, "unacknowledged": 1 }
+}
+```
+
+- 排序：`fired_at` **倒序**（`created_at` 倒序作同刻兜底）。
+- `counts` 是**全量**统计（整张表），**不受 `limit` 截断、也不受 `state` 过滤影响**：
+  徽标要的是"现在有多少未确认"，不是"这一页里有多少未确认"。
+  `unacknowledged` = 未恢复**且**未确认；`resolved` 也照样计入全量。
+- `state` 由 `resolvedAt` 派生（`null` → `open`），是事件的**当前**状态，不是列表快照。
+- 事件是 **episode 模型**：同一 `(rule, target)` 在未恢复期间最多一行；静默期内再次成立是**重开这一行**
+  （`reopenCount++`、`firedAt` 更新、重新变回 `open`），而不是新增一行。
+
+### `POST /api/alerts/events/:id/ack`
+
+需 admin + CSRF。无请求体。→ `200` + 确认后的 `AlertEventView`（**无信封**）。
+
+- **已恢复的事件也能确认**（"我看到了这条历史"是合法需求）。
+- **幂等**：重复确认不改时间、不再写审计 —— 事先的"确认"没有新的信息量，
+  若每次都刷新 `acknowledged_at`，"谁在什么时候先看到的"这个信息就丢了。
+- 审计：`alert.acknowledged`，`target = alert_event:<id>`。
+- 错误：`404 NOT_FOUND`（未知事件 ID）。
+
+### `GET /api/alerts/summary`
+
+→ `200`，聚合对象（不是列表，直接返回对象本身）：
+```json
+{
+  "open": 2, "unacknowledged": 1,
+  "suppressed": 3,
+  "bySeverity": { "warning": 1, "critical": 1 },
+  "top": [{ "id": "alert-…", "ruleName": "磁盘使用率过高", "targetLabel": "C:",
+            "severity": "warning", "firedAt": "2026-10-15T09:00:00.000Z" }],
+  "evaluatedAt": "2026-10-15T10:00:00.000Z"
+}
+```
+
+- `top` **最多 5 条**，只含**未恢复**事件，且是精简形状（只有这 5 个字段）：
+  已解决的事件不该在"需要关注"里占位，徽标也不需要每条事件的完整消息
+  （那会让每次轮询多传几 KB）。排序：`critical` 优先 → `fired_at` 倒序。
+- `bySeverity` 只统计**未恢复**事件；`warning` 桶的口径是 `severity <> 'critical'`
+  （非 critical 全归 warning），因此 `bySeverity.warning + bySeverity.critical = open`。
+- `evaluatedAt` 是**上次告警引擎 tick 的时间**，引擎还没 tick 过时为 `null`
+  （不是"现在"—— 它表示这份结论有多新）。
+- `suppressed` 是"自进程启动以来，因同一 `(rule, target)` **已有未恢复行**而未产生新通知的触发次数"（累计值）。
+  **它只在那个时刻加 1**：静默期内条件再次成立是**重开**旧行，计进引擎 tick 结果的 `reopened`，
+  **不算 `suppressed`**。它的唯一来源是引擎的 `suppressedTotal()`，由 `composeAlertSummary()`
+  覆盖进响应；装配方没接引擎时退回服务层记录的值（装配期没人调 `recordTick` 时就是 `0` / `null`）
+  —— **不做 `Math.max` 之类的"折中"，一个数只能有一个来源**。
+  这个字段存在的唯一理由：让"没有告警"这件事可解释 —— 是被静默压掉了，还是条件根本没成立。
+
+---
+
 ## 7. 用户与偏好
 
 ### `GET /api/users/me`
@@ -674,6 +1047,8 @@ data: {}
 | `/api/overview`、`/api/containers*`、`/api/tailscale/*`、`/api/system/*`、`/api/tools*` | ❌ | ✅ | ✅ |
 | `/api/services`（GET）、`/api/services/:id`（GET）、`/api/search` | ❌ | ✅ | ✅（可见 hidden） |
 | `/api/services` 及 `/api/services/:id*` 的**写**方法（POST/PATCH/DELETE） | ❌ | ❌ | ✅ |
+| `/api/metrics/*`（GET）、`/api/health/monitor`（GET）、`/api/alerts/{rules,events,summary}`（GET） | ❌ | ✅ | ✅ |
+| `PATCH /api/alerts/rules/:id`、`POST /api/alerts/events/:id/ack` | ❌ | ❌ | ✅ |
 | `/api/users/me*` | ❌ | ✅ | ✅ |
 | `/api/users` 及 `/api/users/:id*` | ❌ | ❌ | ✅ |
 | `/api/settings` 及 `/api/settings/*` | ❌ | ❌ | ✅ |
@@ -682,6 +1057,18 @@ data: {}
 
 接口的任何变动必须同步更新本文件，并在 [09-changelog.md](./09-changelog.md) 记录。
 
+- **S2-01…S2-04（历史指标、健康监测、告警）**：新增 **9 个接口**，契约见 §6.7 / §6.8 / §6.9 ——
+  `GET /api/metrics/catalog`、`GET /api/metrics/history`、`GET /api/metrics/storage`、
+  `GET /api/health/monitor`、`GET /api/alerts/rules`、`PATCH /api/alerts/rules/:id`、
+  `GET /api/alerts/events`、`POST /api/alerts/events/:id/ack`、`GET /api/alerts/summary`。
+  `/api/metrics`、`/api/alerts`、`/api/health/monitor` 已加入 `PROTECTED_PREFIXES`
+  （前缀守卫 = 登录 + CSRF），两个写接口在 handler 内再 `assertAdmin`。
+  **未新增错误码**：沿用既有 `VALIDATION_FAILED` / `NOT_FOUND` / `FORBIDDEN` / `CSRF_MISMATCH`，
+  并首次把 `UPSTREAM_UNAVAILABLE`(503) 用于"健康监视器未装配"这类接线缺口（§6.8）。
+  外层形状上的两处**冻结**：`GET /api/alerts/rules` **恰好是 `{ items }`**（不是裸数组，每条 13 字段、
+  不含 `createdAt`），其余新接口**都不带信封**；`GET /api/alerts/events` 的 `counts` 是**全量**计数，
+  不受 `limit` / `state` 影响。缺测语义也在这里定死：空窗口的 `summary` 只有 `count: 0`，
+  `min/max/avg/latest/latestAt` 全为 `null`（`0` 不是"没有数据"的合法表示）。
 - **S1-01…S1-05（服务注册表、服务墙、快捷搜索）**：新增 `/api/services` 读写接口与
   `GET /api/search`（见 §6.5 / §6.6）；`/api/services` 与 `/api/search` 已加入
   `PROTECTED_PREFIXES`（前缀守卫 = 登录 + CSRF），写方法在 handler 内再 `assertAdmin`；

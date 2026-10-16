@@ -128,6 +128,44 @@
 - [x] 前端「账号管理 → 系统设置」面板：分组展示 + 生效级别徽标 + 来源徽标 + 测试连接
 - [x] 明确标注硬边界（需重建容器的项不给编辑控件）
 
+### F7 历史趋势 / 健康监测 / 告警（Sprint 2）
+- [x] 迁移 **v5 `metrics_alerts_schema`**：`metric_buckets` / `alert_rules` / `alert_events`
+      （纯追加，v1–v4 一列未动；真实库**副本**演练 v4→v5、v3→v4→v5 均 15/15 通过，
+      用户/会话/审计/设置数不变、密文逐字不变、新表为空、重复迁移 0 个）
+- [x] **后台单例降采样**：最近 24h 每分钟 1 条、最近 30d 每小时 1 条；宿主 CPU/内存/磁盘 +
+      关键容器 RSS/CPU + 服务健康。**不是每个前端会话采一份** —— `backgroundJobs` 只控制定时器，
+      采样器始终构造，**零浏览器连接时 `tickOnce()` 照样写库**（用零 SSE/HTTP 客户端验证）
+- [x] **缺测不写 0**：缺的分钟是"没有行"，`samples < expected` 才标 `partial`；采样中断该段无行
+      并计入 `gaps`（图上"没数据"与"真的是 0"必须能分开，否则会误导判断）
+- [x] **批量写 + WAL + 保留清理 + 预算**：写事务数与 **tick 密度无关**（30s 与 5s 间隔同样时长
+      写事务数相同 = 1861）、整点那一次 tick 恰好 2 次批量写（flush + rollup）；
+      库大小按 `page_count × page_size` 报出；稳态上限 32 MB，`storage()` 给出 `withinBudget`
+- [x] **历史查询与图表**：1h/24h/7d/30d（分钟/小时两分辨率）；空窗口 `summary` 的
+      `avg/min/max/latest` 是 `null` 而**不是 0**；**磁盘百分比与磁盘字节永不混算**；
+      图表标注单位、数据来源、缺测与聚合方式
+- [x] **健康检查（S2-03）**：容器生命周期 + Docker health + 独立 HTTP 探测三维独立计数
+      （连续 N 次失败才 `down`、恢复需连续 2 次全好、抖动清零、`unknown` 不清零也不推进）；
+      可配探测间隔与**全局并发上限**；探测失败只判 http 维、不清空既有状态
+- [x] **告警（S2-04）**：四条内置示例规则**默认关闭**（装了但不吵），界面可开关/改阈值/静默期；
+      episode 模型（同一规则同一目标最多一行未恢复，用部分唯一索引保证）+ 恢复通知 + 确认与审计；
+      **一小时内不重复刷屏**（静默期内重开同一行 `reopen_count+1`）
+- [x] **"后台模块无出站能力"是可执行约束而非注释**：`backgroundBoundary.test.ts` 扫描
+      `modules/metrics|health|alerts` 与 `backgroundContext.ts`，断言无
+      `fetch`/`http(s).request`/`net.connect`/`child_process`/`nodemailer|axios|node-fetch|undici`/
+      直连 `docker.sock`，且 `healthProbe.ts` 只发 `GET` 无请求体
+      （Sprint 2 不做外发通知、不自动修复；通知渠道到 Sprint 4）
+- [x] **装配层缺口由端到端用例抓出并验证判别力**：告警引擎若未接 `createAlertSnapshotSource`，
+      四条规则永远 `evaluated = 0` —— 36 条单测全绿但**生产上静默失效**。
+      `schedulerIntegration.test.ts` 现在断言完整因果链（触发 1 条 → 故障期不重复 →
+      恢复写回同一行 → 静默期内重开不新增 → 三个审计动作齐全），
+      并用"只撤掉那一行接线"实测过它确实会红
+- [x] **新增 6 项可热改设置**：`PORTAL_METRICS_SAMPLE_INTERVAL_SEC` /
+      `PORTAL_METRICS_RETENTION_MINUTE_HOURS` / `PORTAL_METRICS_RETENTION_HOUR_DAYS` /
+      `PORTAL_METRICS_CONTAINER_LIMIT` / `PORTAL_HEALTH_PROBE_INTERVAL_SEC` /
+      `PORTAL_HEALTH_PROBE_CONCURRENCY`（全部 `effect: 'live'`）
+- [x] 顺带修掉两个真缺陷：设置分组 `groupList()` 手抄副本漏了 metrics/health（导致设置页少渲染 6 个键）；
+      `ContainerSummary` 未映射 `State.ExitCode`（导致"容器异常退出"规则名不副实，只有 `dead` 能触发）
+
 ### 前端
 - [x] React 19 + Vite 6 + Tailwind 4 + React Router 7
 - [x] 类型化 API 客户端（CSRF 自动注入、401 回调、超时）
@@ -223,8 +261,9 @@
 - [ ] **CSP 违规上报**：目前没有 `report-uri` / `report-to`，策略改严后违规是静默的
 - [ ] **容器 list 性能**：容器数 >50 时，list+inspect 的耗时可能超过缓存 TTL。
       可改为增量：先 list 比对 ID，只对新容器 inspect
-- [ ] **历史趋势图**：目前只有瞬时值。可加环形缓冲区记录最近 N 分钟 CPU/内存，
-      前端画折线（注意 NAS 内存占用，建议只保留内存内数据不落盘）
+- [x] **历史趋势图（Sprint 2 已做，方案比原计划更稳）**：没有采用"内存环形缓冲区"（重启即丢），
+      改为 SQLite 降采样落库（24h 每分钟 / 30d 每小时）+ 保留清理 + 预算约束，
+      所以重启后曲线还在、磁盘占用也有上界（原计划"不落盘"的顾虑由保留窗口与 32 MB 预算解决）
 - [ ] **tailscale serve 集成**：对通过 `tailscale serve` 暴露的服务，
       读取 serve 配置以生成准确的入口 URL（当前只识别 sidecar 并打 badge）
 - [ ] **通知**：容器退出、磁盘将满、登录失败次数异常时推送（可选 webhook / ntfy）
@@ -245,6 +284,18 @@
 
 ## 技术债
 
+- [ ] **`e2e/**` 完全不在类型检查内**：`npm run typecheck` 只跑 `server` + `web` 两个工作区，
+  Playwright 用例是运行期转译（不做类型检查）。代价是 E2E 里的类型/属性笔误只能在跑测试时暴露
+  —— Sprint 1 就真的踩过一次（`getByRole('textbox')` 写成不存在的角色，`typecheck` 毫无反应）。
+  修法：给 `e2e/` 加一个 `tsconfig.json`（`types: ['node']` + 引用 `@playwright/test`）并纳入
+  `npm run typecheck`。**没有立刻做**是因为 e2e 从未被类型检查过，首次纳入可能一次性冒出若干
+  既有报错，属于独立改动，不想混进 Sprint 2 的提交里。
+- [ ] **函数级静态文档重建（方案已定，待执行）**：用 `code-static-documentation` 技能包为
+  `server/src`（73）+ `web/src`（39）+ 配置文件（13）共约 **125 篇**函数级文档，输出到
+  **`docs/static/code/**`**（镜像源码目录；保留现有 01–09 契约文档，并把这些文档里那种
+  "汇总表"式描述与逐函数文档分工：01–09 讲架构与契约，`code/**` 讲每个函数的签名与边界）。
+  **时机：Sprint 2 提交之后** —— 技能本身要求版本稳定期执行（每篇文档头要写 commit hash），
+  且需等三条并行开发线的文件全部落地。
 - [x] `server/src/modules/docker/service.ts` 映射逻辑已拆到 `mapper.ts`（S0-05）：
       700 → 370 行（只留缓存/数据源/契约装配），纯函数层 430 行；
       `service.ts` 保留全部同名 re-export；新增 `server/tests/dockerMapper.test.ts`（24 个入口解析用例）。
@@ -297,6 +348,20 @@
       彻底修法是让 mapper 在冲突时返回 `null`，但那会改动既有 HTTP 契约字段，需单独评估
 - [ ] `web/src/api/types.ts` 导出的 `ServiceReorderRequest` 目前零引用
       （`client.ts` 的 `reorderServices` 用内联对象数组类型）。冗余但无害，顺手时可统一
+- [ ] **登录限流是硬编码常量，且 E2E 会撞上它**：`LOGIN_RATE_LIMIT = { max: 10, timeWindow: '1 minute' }`
+      写死在 `server/src/api/auth.ts`，不可通过环境变量调整。Sprint 2 新增两条 E2E 用例后
+      登录次数达到 11 次/分钟，末尾用例被 429 挡在登录页（症状是"登录页标题一直不消失"，
+      容易被误判成页面坏了）。**已改为"每个角色只真正登录一次、其余复用缓存会话，
+      并在会话被「退出」撤销时自愈重登"**（不是放宽限流，安全控制一个字没动）。
+      若将来用例继续增长，可考虑把这个限流做成可配置项（默认值不变），
+      但要先论证它不会削弱暴力破解防护
+- [ ] **W2 交付文件里两处注释已过期（低风险）**：`alerts/engine.ts` 的 `readExitCode`
+      容错读法，与 `alerts/types.ts` 里"Sprint 2 的 ContainerSummary 没有映射 ExitCode"的注释，
+      在 `exitCode` 映射补上之后已经不准确（**行为无需改**，容错读法照样工作），顺手可简化
+- [ ] **判据写进规格前要先算一遍（教训）**：Sprint 2 规格 §1.1 我写的"每小时只 2 次批量写"
+      与"分钟落库"在算术上不可兼得（真实是 60 次 flush + 1 次 rollup = 61 次/小时）。
+      已加勘误块并改为机器可证的三条判据。**验收判据必须能被一条命令证伪**，
+      否则它只是措辞
 
 ## 环境备忘
 

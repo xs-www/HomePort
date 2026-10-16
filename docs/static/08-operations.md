@@ -608,6 +608,102 @@ DELETE FROM schema_migrations WHERE version = 4;
 > 手工删 `schema_migrations` 那行是为了让下次升级能重跑 v4；如果只删表不删这行，
 > 新版代码启动会认为迁移已应用 → 表不存在 → 接口 500。**两者必须一起处理**。
 
+### 7.2 升级到 Sprint 2（轻量历史监控、健康与告警）
+
+**结论先说：这次升级同样不动任何已有数据，不需要改 compose 或 Serve 配置；
+而且默认什么都不会往外发、也不会去重启任何容器。**
+
+| 项 | 变化 |
+| --- | --- |
+| 数据库 | 迁移 **v5** 追加三张新表（`metric_buckets` / `alert_rules` / `alert_events`）；**迁移只建结构，不塞业务数据**（四条内置规则由启动时 `ensureBuiltinRules()` 幂等补齐） |
+| 已有表 | 用户、会话、偏好、设置、审计、TOTP、服务注册表 **一列未改** |
+| 环境变量 | 新增 6 个，**全部有默认值，可以不设**（见 `02-configuration.md`） |
+| 卷 | 不变（`homeport-data:/data`）—— 但库会**持续增长**，见下面"库增长预算" |
+| 首页 | 不变；侧栏新增 `历史`（`/history`）与 `告警`（`/alerts`）两个入口 |
+| 出站行为 | **无**：Sprint 2 没有任何通知通道（邮件/Webhook 是 Sprint 4）。告警只写站内事件 + 审计 |
+| 容器操作 | **无**：后台任务只有读能力（源码级守卫测试 `backgroundBoundary.test.ts` 钉住） |
+
+升级步骤（与 §7.1 相同节奏，保持数据卷不动）：
+
+```bash
+# 1) 一致性备份（§10 方案 A；不要用 docker cp 直接拷运行中的 WAL 库）
+docker exec -e NODE_PATH=/app/node_modules homeport-portal \
+  node -e "const D=require('better-sqlite3');const db=new D('/data/portal.sqlite');db.exec(\"VACUUM INTO '/tmp/snap.sqlite'\");db.close()"
+docker cp homeport-portal:/tmp/snap.sqlite ./portal-pre-sprint2.sqlite
+
+# 2) 打回滚标签
+docker tag homeport:local homeport:pre-sprint2
+
+# 3) 升级（数据卷不动！绝对不要 docker compose down -v）
+docker compose stop homeport
+docker compose up -d --build homeport
+
+# 4) 确认 v5 已应用，并看采集是否在跑
+docker exec -e NODE_PATH=/app/node_modules homeport-portal node -e "const D=require('better-sqlite3');const db=new D('/data/portal.sqlite',{readonly:true});console.log(db.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all());console.log(db.prepare('SELECT resolution,COUNT(*) n FROM metric_buckets GROUP BY resolution').all());db.close()"
+```
+
+打开 `/history`：**刚升级完是空的，这是正确的** —— 历史只能从"装上新版之后"开始积累，
+它不会、也不该凭空补出升级之前的数据（空态文案会说明这一点）。
+`/alerts` 会列出四条内置规则且**默认全部关闭**（"装了但不吵"）。
+
+**库增长预算**（依据 `docs/sprint2-implementation-spec.md` §1.1，按"3 磁盘 + 10 容器 + 7 服务"基准）：
+
+| 项 | 数值 |
+| --- | --- |
+| 每分钟写入 | ≈ 36 行（host 3 + 磁盘 6 + 容器 20 + 服务 7） |
+| minute 分辨率 | 约 51,840 行/天，**只保留 24h → 稳态不累积**（≈10–12 MB） |
+| hour 分辨率 | 864 行/天，保留 30 天（≈5–6 MB） |
+| **稳态总量** | **≤ 32 MB**（含索引与空闲页） |
+| 单次 tick 开销 | 一次 `SystemProvider.snapshot()`（原本 SSE 也在用）+ 一次容器列表**缓存**读；不新增 docker API 频率 |
+
+随时用 `GET /api/metrics/storage` 核对实际值（行数、`page_count × page_size`、保留配置、
+按当前速率外推的日增）。**判断有没有泄漏看这一条**：minute 行数应当**不随运行时长增长**
+（保留窗口滚动）；如果它持续单调上升，说明保留清理没生效，而不是"数据多"。
+
+调优（界面上改，`live` 生效、无需重启）：
+
+| 键 | 建议 | 说明 |
+| --- | --- | --- |
+| `PORTAL_METRICS_SAMPLE_INTERVAL_SEC` | `60` | 采样间隔。拉到 60 后 minute 桶期望样本数为 1，库与 CPU 都更省 |
+| `PORTAL_METRICS_CONTAINER_LIMIT` | `5` | 只采前 N 个关键容器；`0` = 完全不采容器指标 |
+| `PORTAL_METRICS_RETENTION_MINUTE_HOURS` | `12` | 只要 12 小时细粒度曲线 |
+| `PORTAL_HEALTH_PROBE_INTERVAL_SEC` | `600` | HTTP 探测间隔；`0` = **关闭自动探测**（只留容器维度判定与手动探测） |
+| `PORTAL_HEALTH_PROBE_CONCURRENCY` | `2` | 同时最多几个探测在飞，超出的轮到下一轮 |
+
+**告警运维**
+
+- 默认四条内置规则（磁盘 >85% 持续 10 分钟、内存 >90% 持续 5 分钟、容器异常退出、
+  服务连续 3 次失败）**全部 `enabled = 0`**。开启方式：`/alerts` 页（管理员）打开开关、
+  改阈值/持续时长/静默周期，或 `PATCH /api/alerts/rules/:id`。
+- **静默周期（`silenceSec`，默认 3600）**决定"多久之内不重复刷屏"：同一规则同一目标在恢复后
+  一小时内再次触发，只会**重开同一条事件**（`reopenCount` 递增），不会新增一条。
+- **确认（ack）**只表示"人已看到"，不改变判定；已确认的事件若再次重开会**清空确认**
+  （说明它又需要人关注了）。
+- 状态变化全部进审计，动作名：`alert.rule_updated` / `alert.fired` / `alert.reopened` /
+  `alert.resolved` / `alert.acknowledged`（不含任何凭据）。
+- "没有告警"有两种可能，必须分清：条件没成立，还是**被静默压掉了**。后者计入 `suppressed`，
+  在 `GET /api/alerts/summary` 与日志里可见。
+
+**回滚**（v5 也是纯追加，回滚安全）：
+
+```bash
+docker compose stop homeport
+docker tag homeport:pre-sprint2 homeport:local
+docker compose up -d homeport                       # 旧镜像照常启动，v4 数据结构完好
+```
+
+确认不再回滚后才清理（先备份）：
+
+```sql
+DROP TABLE IF EXISTS alert_events;
+DROP TABLE IF EXISTS alert_rules;
+DROP TABLE IF EXISTS metric_buckets;
+DELETE FROM schema_migrations WHERE version = 5;
+```
+
+> 与 v4 同理：**删表和删 `schema_migrations` 那行必须一起做**。
+> v5 的三张表是**互相独立**的追加，不会影响服务注册表（v4）。
+
 ## 8. 资源占用与调优
 
 | 场景 | 调整 |
@@ -617,6 +713,12 @@ DELETE FROM schema_migrations WHERE version = 4;
 | tailnet 设备多 | `PORTAL_CACHE_TAILSCALE_TTL_MS=30000`，减少 fork `tailscale` |
 | 工具很多 | `PORTAL_TOOLS_PROBE_TTL_MS=60000`，减少探测 |
 | 内存紧张 | 镜像基于 alpine，运行时无 devDependencies；实测常驻约 60-90 MB |
+| NAS 性能弱（含历史采集） | `PORTAL_METRICS_INTERVAL_MS=10000` 降推送；后台采集另见 §7.2 的表：`PORTAL_METRICS_SAMPLE_INTERVAL_SEC=60`、`PORTAL_METRICS_CONTAINER_LIMIT=5`、`PORTAL_HEALTH_PROBE_INTERVAL_SEC=600` |
+
+> **后台采集与 SSE 是两回事**：`PORTAL_METRICS_INTERVAL_MS` 只管"往浏览器推多快"，
+> 影响的是打开页面时的推送频率；**历史采集由 `PORTAL_METRICS_SAMPLE_INTERVAL_SEC` 决定，
+> 与浏览器开不开、开几个标签页都无关**（进程内只有一个采样器，见 §7.2 与
+> `docs/sprint2-implementation-spec.md` §3）。调优时别只调前者。
 
 ## 9. 反向代理（可选）
 
