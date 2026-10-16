@@ -267,6 +267,8 @@ export function ErrorNotice({ message, onRetry }: { message: string; onRetry?: (
 export function Icon({ name, className = 'size-4' }: { name: string; className?: string }): ReactNode {
   const paths: Record<string, ReactNode> = {
     overview: <path d="M3 3h7v7H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 14h7v7H3z" />,
+    dashboard: <path d="M4 13h6v7H4zM14 4h6v9h-6zM14 17h6v3h-6zM4 4h6v5H4z" />,
+    server: <path d="M4 4h16v6H4z M4 14h16v6H4z M8 7h.01 M8 17h.01" />,
     container: <path d="M3 7l9-4 9 4v10l-9 4-9-4z M3 7l9 4 9-4 M12 11v10" />,
     devices: <path d="M4 5h16v10H4z M8 19h8 M12 15v4" />,
     system: <path d="M4 20V10 M10 20V4 M16 20v-7 M22 20H2" />,

@@ -5,7 +5,7 @@
  * - 未登录 → `/login`
  * - 系统未初始化 → `/setup`（无论访问哪个路径）
  * - 已登录访问 `/login` 或 `/setup` → 跳回首页
- * - viewer 访问 `/admin` → 403 页面（后端也会独立拒绝）
+ * - viewer 访问 `/admin` 或 `/admin/services` → 403 页面（后端也会独立拒绝）
  */
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import type { ReactNode } from 'react';
@@ -13,12 +13,15 @@ import { AuthProvider, useAuth } from './auth/AuthProvider.js';
 import { Icon } from './components/ui.js';
 import { AppShell } from './layout/AppShell.js';
 import { AdminPage } from './pages/AdminPage.js';
+import { AdminServicesPage } from './pages/AdminServicesPage.js';
 import { ContainerDetailPage } from './pages/ContainerDetailPage.js';
 import { ContainersPage } from './pages/ContainersPage.js';
 import { DevicesPage } from './pages/DevicesPage.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { NotFoundPage } from './pages/NotFoundPage.js';
 import { OverviewPage } from './pages/OverviewPage.js';
+import { ServiceDetailPage } from './pages/ServiceDetailPage.js';
+import { ServicesPage } from './pages/ServicesPage.js';
 import { SetupPage } from './pages/SetupPage.js';
 import { SystemPage } from './pages/SystemPage.js';
 import { ToolsPage } from './pages/ToolsPage.js';
@@ -93,11 +96,30 @@ function AppRoutes(): ReactNode {
       />
       <Route path="/setup" element={<SetupPage />} />
 
+      {/* 首页 = 服务墙（Sprint 1） */}
       <Route
         path="/"
         element={
           <Protected>
+            <ServicesPage />
+          </Protected>
+        }
+      />
+      {/* 原首页改为「总览」，保留原有全部内容 */}
+      <Route
+        path="/overview"
+        element={
+          <Protected>
             <OverviewPage />
+          </Protected>
+        }
+      />
+      {/* 服务详情：viewer 也可查看（hidden 服务对非管理员返回 404） */}
+      <Route
+        path="/services/:id"
+        element={
+          <Protected>
+            <ServiceDetailPage />
           </Protected>
         }
       />
@@ -147,6 +169,17 @@ function AppRoutes(): ReactNode {
           <Protected>
             <AdminOnly>
               <AdminPage />
+            </AdminOnly>
+          </Protected>
+        }
+      />
+      {/* 服务管理（Sprint 1）：服务配置可写，因此单独一个 adminOnly 子页面 */}
+      <Route
+        path="/admin/services"
+        element={
+          <Protected>
+            <AdminOnly>
+              <AdminServicesPage />
             </AdminOnly>
           </Protected>
         }

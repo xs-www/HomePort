@@ -6,6 +6,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider.js';
+import { CommandPaletteProvider } from '../components/CommandPalette.js';
 import { Icon } from '../components/ui.js';
 
 interface NavItem {
@@ -13,15 +14,25 @@ interface NavItem {
   label: string;
   icon: string;
   adminOnly?: boolean;
+  /** 仅精确匹配时高亮（有子路由的条目必须置 true，避免父项与子项同时高亮） */
+  end?: boolean;
 }
 
+/**
+ * 侧边导航。
+ *
+ * Sprint 1 起 `/` 是**服务墙**，原首页迁到 `/overview`；
+ * 服务配置可写，因此 `/admin/services`（服务管理）是第二个 adminOnly 条目。
+ */
 const NAV_ITEMS: NavItem[] = [
-  { to: '/', label: '总览', icon: 'overview' },
+  { to: '/', label: '服务', icon: 'server', end: true },
+  { to: '/overview', label: '总览', icon: 'overview' },
   { to: '/containers', label: '容器', icon: 'container' },
   { to: '/devices', label: 'tailnet 设备', icon: 'devices' },
   { to: '/system', label: '系统指标', icon: 'system' },
   { to: '/tools', label: '工具入口', icon: 'tools' },
-  { to: '/admin', label: '账号管理', icon: 'admin', adminOnly: true },
+  { to: '/admin/services', label: '服务管理', icon: 'dashboard', adminOnly: true, end: true },
+  { to: '/admin', label: '账号管理', icon: 'admin', adminOnly: true, end: true },
 ];
 
 export interface AppShellProps {
@@ -54,7 +65,8 @@ export function AppShell({ children, topbarExtra, title }: AppShellProps): React
   };
 
   return (
-    <div className="flex min-h-screen">
+    <CommandPaletteProvider>
+      <div className="flex min-h-screen">
       {/* 侧栏 */}
       <aside
         className={`fixed inset-y-0 left-0 z-40 w-64 shrink-0 transform border-r border-slate-200/80 bg-white/95 backdrop-blur transition-transform duration-200 lg:sticky lg:top-0 lg:h-screen lg:translate-x-0 dark:border-white/8 dark:bg-ink-900/80 ${
@@ -79,7 +91,7 @@ export function AppShell({ children, topbarExtra, title }: AppShellProps): React
               <NavLink
                 key={item.to}
                 to={item.to}
-                end={item.to === '/'}
+                end={item.to === '/' || item.end === true}
                 className={({ isActive }) =>
                   `flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ${
                     isActive
@@ -152,9 +164,11 @@ export function AppShell({ children, topbarExtra, title }: AppShellProps): React
         </main>
 
         <footer className="muted px-4 pb-6 text-center text-[11px] sm:px-6">
-          HomePort 门户 · 只读展示，不提供容器写操作 · 数据源不可用时会在对应卡片上标注原因
+          HomePort 门户 · 容器与设备只读展示（不提供容器写操作），服务配置可由管理员编辑 ·
+          数据源不可用时会在对应卡片上标注原因
         </footer>
       </div>
-    </div>
+      </div>
+    </CommandPaletteProvider>
   );
 }
