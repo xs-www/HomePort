@@ -26,6 +26,15 @@ import type {
   OverviewResponse,
   RecoveryCodesResponse,
   ResetSettingsResponse,
+  ServiceCreateRequest,
+  ServiceDeleteResponse,
+  ServiceDetailResponse,
+  ServiceHealthResponse,
+  ServiceListParams,
+  ServiceListResponse,
+  ServiceSearchResponse,
+  ServiceUpdateRequest,
+  ServiceView,
   SessionActivity,
   SessionUser,
   SessionView,
@@ -316,6 +325,105 @@ export class ApiClient {
     return this.request<{ tool: ToolView }>(`/tools/${encodeURIComponent(id)}/probe`, {
       timeoutMs: SLOW_TIMEOUT_MS,
     });
+  }
+
+  // ------------------------------------------------------------ 服务注册表（Sprint 1）
+
+  /**
+   * 服务列表（聚合接口）。
+   *
+   * 只调这一个接口就够：候选入口、可达性、容器状态都由服务端实时算好后返回，
+   * 前端**不要**再并行调 `/containers` 自行拼装（那会引入两套口径）。
+   */
+  services(params: ServiceListParams = {}): Promise<ServiceListResponse> {
+    return this.request<ServiceListResponse>('/services', {
+      query: {
+        query: params.query,
+        category: params.category,
+        favorite: params.favorite ? '1' : undefined,
+        includeHidden: params.includeHidden ? '1' : undefined,
+      },
+      timeoutMs: SLOW_TIMEOUT_MS,
+    });
+  }
+
+  /** 服务详情：含**全部**候选入口（含不可达）与诊断数据。 */
+  service(id: string): Promise<ServiceDetailResponse> {
+    return this.request<ServiceDetailResponse>(`/services/${encodeURIComponent(id)}`, {
+      timeoutMs: SLOW_TIMEOUT_MS,
+    });
+  }
+
+  /**
+   * 新建手工服务（admin）。
+   *
+   * 成功响应是**裸的 `ServiceView`**（HTTP 201，无信封）—— 与 `server/src/api/services.ts` 一致。
+   */
+  createService(input: ServiceCreateRequest): Promise<ServiceView> {
+    return this.request<ServiceView>('/services', {
+      method: 'POST',
+      body: input,
+    });
+  }
+
+  /** 修改展示属性 / 可见性 / 排序 / 收藏 / 健康配置（admin）；成功响应是裸的 `ServiceView`。 */
+  updateService(id: string, patch: ServiceUpdateRequest): Promise<ServiceView> {
+    return this.request<ServiceView>(`/services/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: patch,
+    });
+  }
+
+  /**
+   * 删除 / 隐藏 / 重置（admin）。
+   *
+   * `mode='reset'` 清空全部用户覆盖（`user_edited=0`，展示属性回到自动值）；
+   * 不带 mode 时：`manual` 服务真删除，自动服务只隐藏。
+   */
+  deleteService(id: string, mode?: 'reset'): Promise<ServiceDeleteResponse> {
+    return this.request<ServiceDeleteResponse>(`/services/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      query: mode ? { mode } : undefined,
+    });
+  }
+
+  /** 批量排序（admin）。 */
+  reorderServices(order: Array<{ id: string; sortOrder: number }>): Promise<ServiceListResponse> {
+    return this.request<ServiceListResponse>('/services/reorder', {
+      method: 'POST',
+      body: { order },
+      timeoutMs: SLOW_TIMEOUT_MS,
+    });
+  }
+
+  /** 强制重新发现（admin）：返回最新列表与来源状态。 */
+  discoverServices(): Promise<ServiceListResponse> {
+    return this.request<ServiceListResponse>('/services/discover', {
+      method: 'POST',
+      body: {},
+      timeoutMs: SLOW_TIMEOUT_MS,
+    });
+  }
+
+  /**
+   * 一次性健康探测（admin 显式授权动作）。
+   *
+   * 目标可以是已保存的 `healthTarget`（不传则该参数省略），或本次显式传入的 URL；
+   * 两种都会在后端重新校验（拒绝云元数据地址等）。
+   */
+  probeServiceHealth(id: string, healthTarget?: string): Promise<ServiceHealthResponse> {
+    return this.request<ServiceHealthResponse>(`/services/${encodeURIComponent(id)}/health`, {
+      method: 'POST',
+      body: healthTarget ? { healthTarget } : {},
+      timeoutMs: SLOW_TIMEOUT_MS,
+    });
+  }
+
+  // ------------------------------------------------------------ 聚合搜索
+
+  /** 按角色过滤的聚合搜索（服务 / 容器 / 设备 / 工具）。 */
+  search(q: string, limit?: number): Promise<ServiceSearchResponse> {
+    return this.request<ServiceSearchResponse>('/search', { query: { q, limit } });
   }
 
   // ------------------------------------------------------------ 用户

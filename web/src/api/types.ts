@@ -492,6 +492,214 @@ export interface ToolListResponse {
   source: SourceStatus;
 }
 
+// ---------------------------------------------------------------- 服务注册表（Sprint 1）
+
+/**
+ * 服务相关的类型 —— 与 `server/src/modules/services/types.ts` **逐字段一致**。
+ *
+ * 三层的区分刻意保留（不要合并）：
+ * - `ServiceView`：长期事实 + 用户配置（数据库那一行 + 实时算出的入口与状态）；
+ * - `ServiceEntryView`：入口候选（实时计算，不落库），全部候选都保留供诊断；
+ * - `ServiceStatusView`：容器 / 可达 / 健康三个**独立**维度，不允许退化成"服务挂了"。
+ */
+
+/** 入口类型（rank 越小越优先：用户指定 > Serve > Tailnet > LAN > 仅本机）。 */
+export type ServiceEntryKind = 'user' | 'serve' | 'tailnet' | 'lan' | 'localhost';
+/** 容器维度：`null` 表示没有容器绑定（纯 serve / 手工服务）。 */
+export type ContainerState = 'running' | 'stopped' | 'absent';
+/** 健康维度：`skipped` = 没配置健康检查（默认状态，不探测）。 */
+export type ServiceHealth = 'ok' | 'fail' | 'unknown' | 'skipped';
+export type ServiceSourceType = 'docker' | 'serve' | 'manual';
+export type ServiceVisibility = 'visible' | 'hidden';
+export type ServiceDeleteMode = 'deleted' | 'hidden' | 'reset';
+
+/** 单个入口候选。 */
+export interface ServiceEntryView {
+  kind: ServiceEntryKind;
+  label: string;
+  url: string;
+  /** 越小越优先（0 用户指定 / 1 Serve / 2 Tailnet / 3 LAN / 4 仅本机） */
+  rank: number;
+  /** 是否可从当前访问者之外到达；"仅本机"恒为 false */
+  accessible: boolean;
+  detail: string | null;
+}
+
+/** 三维状态：容器运行 / 入口可达 / 健康检查，**分开表示**。 */
+export interface ServiceStatusView {
+  container: ContainerState | null;
+  reachable: boolean | null;
+  health: ServiceHealth;
+  reasons: string[];
+}
+
+/** 服务当前关联的容器（可空：纯 serve 路由或手工服务）。 */
+export interface ServiceContainerRef {
+  id: string;
+  name: string;
+  state: string;
+  image: string;
+}
+
+export interface ServiceView {
+  id: string;
+  slug: string;
+  displayName: string;
+  description: string | null;
+  icon: string | null;
+  category: string | null;
+  sourceType: ServiceSourceType;
+  /** 稳定来源标识（**不含容器 ID**） */
+  sourceRef: string;
+  bindingRefs: string[];
+  visibility: ServiceVisibility;
+  favorite: boolean;
+  sortOrder: number;
+  /** 管理员指定并验证过的首选入口（优先级最高，可空） */
+  preferredUrl: string | null;
+  /** 首选入口 = 第一个可达候选；一个都没有则 null */
+  entry: string | null;
+  entries: ServiceEntryView[];
+  entryCount: number;
+  status: ServiceStatusView;
+  container: ServiceContainerRef | null;
+  /** true = 用户改过展示属性（自动发现不再覆盖） */
+  userEdited: boolean;
+  healthTarget: string | null;
+  healthPath: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 数据源可用性：服务墙必须把它透出，不能"静默为空"。 */
+export interface ServiceDiscoveryState {
+  dockerAvailable: boolean;
+  serveAvailable: boolean;
+  serveDetail: string | null;
+  /** 本次发现的时间（ISO） */
+  discoveredAt: string;
+  /** 面向人的发现说明（降级原因等） */
+  notes: string[];
+}
+
+export interface ServiceListResponse {
+  items: ServiceView[];
+  total: number;
+  categories: string[];
+  discovery: ServiceDiscoveryState;
+  generatedAt: string;
+}
+
+/** 详情页的诊断数据：为什么这个服务是现在这个样子。 */
+export interface ServiceDiagnostics {
+  containerPorts: Array<{
+    containerPort: number;
+    protocol: string;
+    hostIp: string;
+    hostPort: number | null;
+    reachability: string;
+    url: string | null;
+  }>;
+  serveRoutes: Array<{
+    host: string;
+    port: number;
+    path: string;
+    url: string;
+    proxy: string;
+    targetPort: number | null;
+  }>;
+  notes: string[];
+}
+
+export interface ServiceDetailResponse {
+  service: ServiceView;
+  /** 全部候选入口（含不可达的） */
+  candidates: ServiceEntryView[];
+  diagnostics: ServiceDiagnostics;
+}
+
+export type ServiceSearchKind = 'service' | 'container' | 'device' | 'tool';
+
+export interface ServiceSearchHit {
+  kind: ServiceSearchKind;
+  id: string;
+  title: string;
+  subtitle: string | null;
+  url: string | null;
+  keywords: string[];
+}
+
+export interface ServiceSearchResponse {
+  items: ServiceSearchHit[];
+  query: string;
+}
+
+/** 一次性健康探测结果（实时计算，不落库为信任）。 */
+export interface ServiceHealthView {
+  state: 'ok' | 'fail';
+  statusCode: number | null;
+  durationMs: number;
+  detail: string | null;
+  at: string;
+}
+
+export interface ServiceHealthResponse {
+  service: ServiceView;
+  health: ServiceHealthView;
+}
+
+export interface ServiceDeleteResponse {
+  ok: true;
+  mode: ServiceDeleteMode;
+  service: ServiceView | null;
+}
+
+/** `GET /api/services` 的查询参数。 */
+export interface ServiceListParams {
+  query?: string;
+  category?: string;
+  /** 只看收藏 */
+  favorite?: boolean;
+  /** 含隐藏服务（仅 admin 生效） */
+  includeHidden?: boolean;
+}
+
+/**
+ * `POST /api/services` 请求体（新建手工服务）。
+ *
+ * 字段名与后端严格校验的键一一对应（`serviceCreateBodySchema`，`.strict()` + 未知字段拒绝）。
+ * **注意**：创建时可选字段只接受 `string`（不接受 `null`）—— 空值必须**整个省略该键**，
+ * 这一点与 `PATCH` 不同（PATCH 的 `null` 表示"清空该字段"）。
+ */
+export interface ServiceCreateRequest {
+  displayName: string;
+  description?: string;
+  icon?: string;
+  category?: string;
+  preferredUrl?: string;
+  healthTarget?: string;
+  healthPath?: string;
+}
+
+/** `PATCH /api/services/:id` 请求体：上述展示属性任意子集 + 管理字段。 */
+export interface ServiceUpdateRequest {
+  displayName?: string;
+  description?: string | null;
+  icon?: string | null;
+  category?: string | null;
+  preferredUrl?: string | null;
+  healthTarget?: string | null;
+  healthPath?: string | null;
+  visibility?: ServiceVisibility;
+  sortOrder?: number;
+  favorite?: boolean;
+}
+
+/** `POST /api/services/reorder` 请求体。 */
+export interface ServiceReorderRequest {
+  order: Array<{ id: string; sortOrder: number }>;
+}
+
 // ---------------------------------------------------------------- 概览
 
 export interface OverviewResponse {
