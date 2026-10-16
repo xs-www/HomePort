@@ -90,7 +90,7 @@ npm run dev:web
 
 # 测试与类型检查
 npm test                      # 一次跑 server 与 web 两个工作区的单测（Vitest）
-                              # 当前规模：server 31 文件 / 594 用例，web 10 文件 / 172 用例
+                              # 当前规模：server 34 文件 / 643 用例，web 10 文件 / 172 用例
 npm run typecheck             # server + web 两个工作区
 npm run build                 # 生产构建（先 web 后 server：web/dist + server/dist）
 npm run test:e2e              # Playwright 冒烟 12 条（smoke 10 + 安全响应头 2；默认端口 8988，
@@ -334,7 +334,7 @@ Linux/NAS 上该域名才会解析。
 | 后端 | Node.js 22 · TypeScript · Fastify 5 · dockerode · better-sqlite3 · zod |
 | 前端 | React 19 · Vite 6 · TypeScript · Tailwind CSS 4 · React Router 7 |
 | 打包 | 四阶段 Dockerfile（alpine，非 root，tini）；镜像由 CI 多架构构建（amd64 + arm64） |
-| 测试 | `npm test` 一次跑 server 与 web 两个工作区的 Vitest 单测（**766 个用例**：server 594 + web 172），`npm run test:e2e` 跑 Playwright 冒烟 **12 条**（首启初始化 / 登录 / 关键页面 / 权限 / 服务墙 / 历史与告警 / 安全响应头） |
+| 测试 | `npm test` 一次跑 server 与 web 两个工作区的 Vitest 单测（**815 个用例**：server 643 + web 172），`npm run test:e2e` 跑 Playwright 冒烟 **12 条**（首启初始化 / 登录 / 关键页面 / 权限 / 服务墙 / 历史与告警 / 安全响应头） |
 | CI | [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：typecheck + 单测 + 构建 + E2E（PR 与 master push） |
 
 架构与逐函数说明见 [docs/static/](docs/static/README.md)。

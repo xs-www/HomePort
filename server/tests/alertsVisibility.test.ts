@@ -40,10 +40,12 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp, type AppHandle } from '../src/app.js';
 import { loadConfig, type PortalConfig } from '../src/config.js';
 import { createSilentLogger } from '../src/logger.js';
+import type { HealthProbeResult } from '../src/modules/services/healthProbe.js';
 import { maskRuleTarget, sumSuppressedVisible, alertEventVisibilityWhere, type AlertEventVisibility } from '../src/modules/alerts/service.js';
 import type { AlertEventListResponse, AlertRuleView, AlertSummaryView } from '../src/modules/alerts/types.js';
 import type { SystemSnapshot } from '../src/modules/system/types.js';
 import { loadVisibleServiceRefs } from '../src/modules/visibility/serviceVisibility.js';
+import { makeContainerList } from './support/serviceFixtures.js';
 
 const SETUP_TOKEN = 'ALERT-VISIBILITY-SETUP-TOKEN';
 const ADMIN_PASSWORD = 'AlertVisAdmin2026!';
@@ -598,6 +600,27 @@ describe('共享可见性实现 · 纯函数边界', () => {
  *
  * 这一组刻意走**真实调度器**（`handle.scheduler.tickOnce`）：suppressed 的唯一来源是
  * 引擎的记账，手工调 `recordTick` 只能测个空壳。
+ *
+ * ## 外部数据源必须全部换掉（复审驳回的阻断项：本组曾在默认 hookTimeout 下超时）
+ *
+ * `tickOnce` 一次会经三条路径读**外部世界**：宿主采样（`ctx.system.snapshot`）、
+ * Docker（`ctx.containers.list`，发现与容器列表各一次）、HTTP 探测（`healthProbe`）。
+ * 只换宿主快照时，剩下两条会真的去连宿主 Docker endpoint —— 在没有 Docker（或
+ * Docker Desktop 抖动）的开发机上每轮 tick 都要等到超时，两次 tick 直接把
+ * `beforeAll` 顶过 30s，于是整组 6 条 suppressed 用例全被跳过。
+ *
+ * 换法照抄 `schedulerIntegration.test.ts` / `metricsApi.test.ts` 的既有三件套，
+ * 只把**外部世界**换掉，被测逻辑一行不动（四个替换点见 `isolateTickDataSources`）：
+ * - `ctx.system.snapshot` → 假宿主快照（内存 95%，本组 suppressed 的宿主来源）；
+ * - `ctx.containers.list` → `makeContainerList([], { dockerAvailable: false })`
+ *   （本组不测容器，容器维度明确"不可用"）；
+ * - `ctx.services` → **保持生产那一个实例**（这正是被审的地方）：它是
+ *   `repository.listAll()` 读 DB + `role='viewer'` 过滤，本身不产生任何外部调用
+ *   （发现与容器列表走上面那个假 `containers`），因此隐藏/删除**立刻**反映到
+ *   可见集合里 —— 换成静态 `EMPTY_SERVICES` 会把"按可见性求和"这件事架空；
+ * - 健康监视器的**探测** → 注入的固定 `fail`（监视器实例本身仍是生产那一个，
+ *   状态机与连续失败计数都是真的）。于是本组每轮 tick 是**零出站请求**，
+ *   不靠"回环端口恰好连不上"这种宿主相关的巧合。
  * ==================================================================== */
 
 /** 固定的 unix 秒刻度（不依赖墙钟；只用于 duration/silence 比较）。 */
@@ -605,6 +628,18 @@ const TICK_1 = 1_700_006_000;
 const TICK_2 = TICK_1 + 60;
 const TICK_3 = TICK_2 + 60;
 const FIXTURE_ISO = '2026-10-15T00:00:00.000Z';
+
+/**
+ * 本组两轮 `tickOnce` 的墙钟耗时（ms）。
+ *
+ * 复审驳回的症状是"这个 `beforeAll` 被外部数据源顶过 30s 的 `hookTimeout`，整组被跳过"。
+ * 隔离修好之后，两轮 tick 只做内存与 SQLite 的活，实测在毫秒量级。把耗时记下来并在
+ * 夹具自检里断言一个**宽松但有判别力**的上界：真去连 Docker（单次 30s 级超时）必然撞破它，
+ * 而正常实现离它两个数量级。这样"跑得快"不是靠 reviewer 看时间戳，而是用例本身在管。
+ */
+let lastTickMs = 0;
+/** 两轮 tick 的耗时上界（ms）：正常 ~10²ms，连一次真 Docker 就是 10⁴ms 级。 */
+const TICK_BUDGET_MS = 5_000;
 
 /** 假宿主读数：内存百分比可控，用来让 `memory_percent` 规则稳定触发（它是宿主自有目标）。 */
 function fakeSystemSnapshot(memoryPercent: number): SystemSnapshot {
@@ -713,37 +748,124 @@ function breakRegistry(): () => void {
   };
 }
 
+/**
+ * 本组专用的外部世界隔离（换法照抄 `schedulerIntegration.test.ts` 的三件套，
+ * 外加一个注入探测）。
+ *
+ * 为什么在组内装而不是全局装：只有本组真的跑 `tickOnce`。装在这里，别的组
+ * （包括那条"把注册表换成抛错桩"的 fail-closed 用例）读路径行为一个字不变。
+ *
+ * 四件事，全部只换"外部世界"，被测逻辑一行不动：
+ * 1. `ctx.system.snapshot` → 假宿主快照（内存 95%，本组 suppressed 的宿主来源）；
+ * 2. `ctx.containers.list` → 容器列表明确为空且"Docker 不可用"。
+ *    这正是复审驳回的阻断项：原来只换宿主快照，`tickOnce` 仍会经这里去连宿主
+ *    Docker endpoint，在没有 Docker 的开发机上每轮等到超时，两轮把 `beforeAll` 顶过
+ *    30s `hookTimeout`，整组 6 条 suppressed 用例全被跳过；
+ * 3. `ctx.services`（可见性来源）→ **保持生产那一个实例**：`loadVisibleServiceRefs`
+ *    与健康监视器读的都是同一个注册表对象，而 `serviceRegistry.list()` 本身不产生
+ *    外部调用（发现与容器列表走上面那个假 `containers`），因此隐藏/删除**立刻**
+ *    反映到可见集合里。换成静态 `EMPTY_SERVICES` 会把"按可见性求和"这件事架空；
+ * 4. 健康监视器的**探测** → 注入的固定 `fail`（见 `overrideHealthProbe`）：
+ *    监视器仍是生产那一个实例（状态机、连续失败计数、`visibleRefs` 都是真的），
+ *    只把"探测结果从哪来"换掉，于是每轮 tick 零出站请求、也不依赖"回环端口恰好
+ *    连不上"这种宿主相关的巧合。
+ */
+/**
+ * 把健康监视器的**探测**换成注入实现，返回还原函数。
+ *
+ * 为什么改 `deps.probe` 而不是 `handle.health = new HealthMonitor(...)`：调度器与
+ * 告警快照来源在装配期就捕获了那个 `HealthMonitor` **实例**，换 `handle` 上的引用
+ * 对它们无效（实测：换完仍然走真实探测）。`deps` 上的字段是同一个对象上的方法，
+ * 换它才对所有持有者生效 —— 与 `schedulerIntegration.test.ts` 换 `ctx.containers.list`
+ * 是同一条思路，只是这里要够到的是私有依赖，所以用一次结构化断言（`src` 不动）。
+ *
+ * 换的只有"探测结果从哪来"；健康状态机、连续失败计数、规则评估、记账全是真的。
+ */
+function overrideHealthProbe(probe: (target: string) => Promise<HealthProbeResult>): () => void {
+  const deps = (handle.health as unknown as { deps: { probe: (target: string, options?: { timeoutMs?: number }) => Promise<HealthProbeResult> } }).deps;
+  const original = deps.probe;
+  deps.probe = (target: string) => probe(target);
+  return () => {
+    deps.probe = original;
+  };
+}
+
+/** 本组注入的探测结果：恒失败（"这个服务连续探测不通"）。**不发出站请求**。 */
+async function failingProbe(): Promise<HealthProbeResult> {
+  return {
+    state: 'fail',
+    statusCode: null,
+    durationMs: 0,
+    detail: '测试夹具：探测注入为失败（不发出站请求）',
+    at: FIXTURE_ISO,
+  };
+}
+
+function isolateTickDataSources(): { restore: () => void } {
+  const realSnapshot = handle.ctx.system.snapshot;
+  const realContainersList = handle.ctx.containers.list;
+  const realProbeIntervalSec = handle.config.health.probeIntervalSec;
+  handle.ctx.system.snapshot = async () => fakeSystemSnapshot(95);
+  // 假夹具：本组不测容器，容器维度明确"不可用"。三个持有者（注册表 / 健康监视器 /
+  // 告警快照）拿到的都是 `ctx.containers` 这**同一个对象**，所以换这一处就全换了。
+  handle.ctx.containers.list = (async () => makeContainerList([], { dockerAvailable: false })) as typeof handle.ctx.containers.list;
+  // 探测节流钉成 1s：间隔为 0 时监视器**根本不会排上探测**，服务就永远拿不到
+  // "连续失败"，本组会静默退化成 0 并失去判别力。这是"把输入的隐性来源显式钉住"，
+  // 与 `schedulerIntegration.test.ts` 钉 `sampleIntervalSec` 同一个理由。
+  handle.config.health.probeIntervalSec = 1;
+  const restoreProbe = overrideHealthProbe(failingProbe);
+  return {
+    restore: () => {
+      restoreProbe();
+      handle.ctx.system.snapshot = realSnapshot;
+      handle.ctx.containers.list = realContainersList;
+      handle.config.health.probeIntervalSec = realProbeIntervalSec;
+    },
+  };
+}
+
 describe('告警读接口 · suppressed 按可见性求和（非零夹具 + 隐藏/删除/fail-closed）', () => {
   let suppressedServiceId: string;
   let suppressedRef: string;
-  let restoredSnapshot: typeof handle.ctx.system.snapshot;
+  let restoreSources: (() => void) | null = null;
 
   beforeAll(async () => {
-    // 一个会探测失败的服务（回环关闭端口：探通与否都失败）+ 两条规则显式打开
+    // 一个健康探测被注入成"一直失败"的服务 + 两条规则显式打开
+    // （healthTarget 仍然填了真实形态的回环地址：它只是"这个服务有健康目标"的配置证据，
+    //  探测本身由 isolateTickDataSources 注入，不会真的发出站请求）
     const created = await createService(SUPPRESSED_NAME, 'http://127.0.0.1:1/');
     suppressedServiceId = created.id;
     suppressedRef = created.sourceRef;
 
-    // 宿主自有来源：内存 95% 让 memory_percent 规则触发（默认关闭，这里显式打开）
-    restoredSnapshot = handle.ctx.system.snapshot;
-    handle.ctx.system.snapshot = async () => fakeSystemSnapshot(95);
+    // 宿主自有来源：内存 95% 让 memory_percent 规则触发（默认关闭，这里显式打开）；
+    // 同时把 Docker 与宿主采样换成假夹具（见 isolateTickDataSources 的注释）
+    const restore = isolateTickDataSources().restore;
+    restoreSources = restore;
     await patchRule('rule-memory-percent', { enabled: true, threshold: 1, durationSec: 0 });
     await patchRule('rule-service-health', { enabled: true, threshold: 1, durationSec: 0 });
 
     // 第一轮：两条规则各开一个 episode（宿主内存 + 该服务）
-    await handle.scheduler.tickOnce(TICK_1);
     // 第二轮：两条都已有未恢复行 → 各被压掉 1 次（这才是 suppressed 的唯一来源）
+    // 两轮一起计时：这个数字是本组"确实只做内存 + SQLite 的活"的证据（见 TICK_BUDGET_MS）
+    const tickStartedAt = Date.now();
+    await handle.scheduler.tickOnce(TICK_1);
     await handle.scheduler.tickOnce(TICK_2);
+    lastTickMs = Date.now() - tickStartedAt;
   });
 
   afterAll(() => {
-    handle.ctx.system.snapshot = restoredSnapshot;
+    restoreSources?.();
+    restoreSources = null;
   });
 
   it('夹具自检：压掉次数非零，且按 target 归因正确（宿主 1 + 该服务 1）', async () => {
     const last = handle.scheduler.lastSummary()?.alerts;
     expect(last?.suppressed).toBe(2);
     expect(last?.suppressedByTarget).toEqual({ host: 1, [`service:${suppressedRef}`]: 1 });
+    // 隔离自检：两轮 tick 的墙钟耗时必须在预算内。真的去连宿主 Docker endpoint
+    // （单次超时就 10⁴ms 级）必然撞破它 —— 复审驳回的正是"`beforeAll` 撞 30s
+    // `hookTimeout`、6 条 suppressed 用例全被跳过"这个症状
+    expect(lastTickMs, '两轮 tick 必须只做内存 + SQLite 的活（外部数据源已全部换掉）').toBeLessThan(TICK_BUDGET_MS);
 
     const body = (await getSummary(viewer)).body;
     // 判别力前提：数字必须非零，否则"按可见性求和"这件事根本测不到（0 怎么过滤都是 0）
