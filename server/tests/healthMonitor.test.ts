@@ -8,6 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import { HealthMonitor } from '../src/modules/health/monitor.js';
 import type { HealthProbeResult } from '../src/modules/services/healthProbe.js';
+import type { ServiceHealthState } from '../src/modules/health/types.js';
 import type { ServiceListResponse, ServiceView } from '../src/modules/services/types.js';
 import type { ContainerSummary } from '../src/modules/docker/types.js';
 import { loadConfig } from '../src/config.js';
@@ -450,6 +451,104 @@ describe('健康监视器 · 失败与降级（探测失败不清空既有状态
     // 既有判定保留（取数失败 ≠ 服务消失）
     expect(harness.monitor.state('docker:alpha')?.verdict).toBe('healthy');
     expect(harness.monitor.view().notes.join(' ')).toContain('服务列表不可用：docker socket 不可用');
+  });
+});
+
+describe('健康监视器 · 成功读到空列表必须清理（P1 回归）', () => {
+  /** viewer 视角下"还在的服务"：隐藏/删除后这个数组里就没有它了（假 registry 不自己过滤）。 */
+  const alpha = serviceWithTarget('alpha', 'http://127.0.0.1:8080/health');
+  const secret = makeServiceView({
+    sourceRef: 'docker:secret',
+    displayName: 'Secret Service',
+    healthTarget: 'http://127.0.0.1:8090/health',
+    container: { id: 'c-secret', name: 'secret', state: 'running', image: 'secret:latest' },
+  });
+  const containers = [makeContainer({ id: 'c-alpha', name: 'alpha' }), makeContainer({ id: 'c-secret', name: 'secret' })];
+
+  it('隐藏最后一个服务后：状态与服务名一起清除，view() 里连名字都不再出现', async () => {
+    const harness = createHarness({ services: [alpha, secret], containers, intervalSec: () => 60 });
+
+    await harness.monitor.tick(T0);
+    // 基线：两个服务都在，标签是用户看到的名字
+    expect(harness.monitor.view().services.map((item) => item.sourceRef)).toEqual(['docker:alpha', 'docker:secret']);
+    expect(harness.monitor.view().services.find((item) => item.sourceRef === 'docker:secret')?.label).toBe('Secret Service');
+
+    // 隐藏 secret（viewer 列表里不再有它）→ 状态与名字都必须消失
+    harness.setServices([alpha]);
+    await harness.monitor.tick(T0 + 1_000);
+    expect(harness.monitor.states().map((state) => state.sourceRef)).toEqual(['docker:alpha']);
+    expect(harness.monitor.state('docker:secret')).toBeNull();
+    expect(JSON.stringify(harness.monitor.view())).not.toContain('docker:secret');
+    expect(JSON.stringify(harness.monitor.view())).not.toContain('Secret Service');
+
+    // 再隐藏最后一个（成功读到空列表）→ 全部清空，旧服务名不得残留
+    harness.setServices([]);
+    await harness.monitor.tick(T0 + 2_000);
+    expect(harness.monitor.states()).toEqual([]);
+    expect(harness.monitor.view().services).toEqual([]);
+    const serialized = JSON.stringify(harness.monitor.view());
+    expect(serialized).not.toContain('docker:secret');
+    expect(serialized).not.toContain('Secret Service');
+    expect(serialized).not.toContain('docker:alpha');
+    expect(harness.monitor.view().notes.join(' ')).toContain('还没有可监测的服务');
+
+    // 之后的 tick 不会让旧状态"复活"（内存里已经没有它们的标签了）
+    await harness.monitor.tick(T0 + 62_000);
+    expect(harness.monitor.states()).toEqual([]);
+  });
+
+  it('删除全部服务后集合为空（区别于"读取失败"）', async () => {
+    const harness = createHarness({ services: [alpha, secret], containers, intervalSec: () => 60 });
+    await harness.monitor.tick(T0);
+    expect(harness.monitor.states()).toHaveLength(2);
+
+    harness.setServices([]); // 服务被删除（成功读到空列表）
+    const result = await harness.monitor.tick(T0 + 60_000);
+    expect(result.evaluated).toBe(0);
+    expect(harness.monitor.states()).toEqual([]);
+    expect(harness.monitor.view().services).toEqual([]);
+    // 清理 ≠ 降级：列表读取是成功的，不该报"服务列表不可用"
+    expect(harness.monitor.view().notes.join(' ')).not.toContain('服务列表不可用');
+  });
+
+  it('服务列表读取失败：旧状态与服务名都保留，并在 notes 里说明原因', async () => {
+    const harness = createHarness({ services: [alpha, secret], containers, intervalSec: () => 60 });
+    await harness.monitor.tick(T0);
+    expect(harness.monitor.view().services).toHaveLength(2);
+
+    harness.setServices(async () => {
+      throw new Error('docker socket 不可用');
+    });
+    const result = await harness.monitor.tick(T0 + 60_000);
+
+    expect(result.evaluated).toBe(0);
+    // 取数失败不是"服务消失"：状态与名字都原样保留
+    expect(harness.monitor.states().map((state) => state.sourceRef)).toEqual(['docker:alpha', 'docker:secret']);
+    expect(harness.monitor.view().services.find((item) => item.sourceRef === 'docker:secret')?.label).toBe('Secret Service');
+    expect(harness.monitor.view().notes.join(' ')).toContain('服务列表不可用：docker socket 不可用');
+  });
+
+  it('读路径纵深防御：即使 reconcile 漏清，view()/states() 也不发出不在可见集合里的状态', async () => {
+    const harness = createHarness({ services: [alpha, secret], containers, intervalSec: () => 60 });
+    await harness.monitor.tick(T0);
+    const leaked = harness.monitor.state('docker:secret');
+    expect(leaked).not.toBeNull();
+
+    harness.setServices([alpha]);
+    await harness.monitor.tick(T0 + 1_000);
+
+    // 模拟"写路径又出问题"：绕过 dropStaleStates 直接塞回一个已不可见的状态与标签
+    const internals = harness.monitor as unknown as {
+      statesByRef: Map<string, ServiceHealthState>;
+      labelsByRef: Map<string, { serviceId: string; label: string }>;
+    };
+    internals.statesByRef.set('docker:ghost', { ...(leaked as ServiceHealthState), sourceRef: 'docker:ghost' });
+    internals.labelsByRef.set('docker:ghost', { serviceId: leaked?.serviceId ?? 'svc-ghost', label: 'Secret Service' });
+
+    expect(harness.monitor.states().map((state) => state.sourceRef)).toEqual(['docker:alpha']);
+    expect(harness.monitor.state('docker:ghost')).toBeNull();
+    expect(JSON.stringify(harness.monitor.view())).not.toContain('docker:ghost');
+    expect(JSON.stringify(harness.monitor.view())).not.toContain('Secret Service');
   });
 });
 

@@ -10,20 +10,62 @@
  * - 参数校验：未知 metric / range / target 一律 400 且带 `allowed` / `fieldErrors`；
  * - **API 不做单位换算**：percent 与 bytes 各自返回自己的 unit 与量级；
  *   以及缺测语义：没有数据的窗口 `count = 0` 且其余字段为 null（不是 0）。
+ *
+ * ## 为什么时间与数据源都被钉死（这次修的就是这条）
+ *
+ * 曾经的写法用**真实墙钟**取 T0（`minuteStart(Date.now()) - 120`）并依赖**真实宿主
+ * 采样器 / 真实 Docker**：于是"跑测试的时刻"与"这台机器恰好采到什么"成了输入的一部分。
+ * 实测症状：23:01 跑测试时 T0 已经落到上一个整点，整点滚动凭空多出一条 hour 行，
+ * 而断言仍写着"hour 窗口为空"，必然红；CPU 首次采样有没有基线也时有时无。
+ *
+ * 现在三件事都是固定量：
+ * 1. `EPOCH` 是固定常量（选它是**为了确定性，不是为了回避边界**）；
+ * 2. `vi.setSystemTime(EPOCH)` 把被测进程看到的 `Date` 钉住 —— 采样器的读侧时钟
+ *    （`history()` / `storage()` / `availableTargets()` 都用它）因此不再读真实墙钟；
+ * 3. 宿主 / 容器 / 服务注册表三个数据源全部换成注入的假夹具（见 `nextFakeSnapshot`），
+ *    不碰真实 `/proc`、真实 Docker、真实服务发现。
+ *
+ * 跨整点这件事由 `schedulerIntegration.test.ts` 的专门用例**显式覆盖**；本文件则
+ * **显式断言"本夹具不跨整点"**（`hoursRolledUp === 0`、没有 hour 行），两边都不靠运气。
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp, type AppHandle } from '../src/app.js';
 import { loadConfig, type PortalConfig } from '../src/config.js';
 import { createSilentLogger } from '../src/logger.js';
+import { hourStart, minuteStart } from '../src/modules/metrics/buckets.js';
+import { bucketAtToIso } from '../src/modules/metrics/history.js';
 import type { MetricCatalogView, MetricHistoryView, MetricStorageView } from '../src/modules/metrics/types.js';
+import type { ServiceListResponse } from '../src/modules/services/types.js';
+import type { SystemSnapshot } from '../src/modules/system/types.js';
+import { makeContainerList } from './support/serviceFixtures.js';
 
 const SETUP_TOKEN = 'METRICS-SETUP-TOKEN';
 const ADMIN_PASSWORD = 'MetricsAdmin2026!';
 const VIEWER_PASSWORD = 'MetricsViewer2026!';
+
+/* ------------------------------------------------------------------ *
+ * 固定时间：本文件唯一的"现在"
+ * ------------------------------------------------------------------ */
+
+/**
+ * 固定 epoch（unix 秒）＝ `2023-11-14T22:13:20Z`。
+ *
+ * 为什么是它：与 `metricsSampler.test.ts` 用的是同一个常量，取值只要求"好算、
+ * 落在整点内"，**不是**为了绕开整点边界 —— 跨边界是被 `schedulerIntegration.test.ts`
+ * 主动覆盖的行为（见那里 22:59:30 → 23:00:30 的用例）。
+ */
+const EPOCH = 1_700_000_000;
+/** 落库/查询所在的整分钟 = 22:13:00Z（`EPOCH` 所在分钟的起点）。 */
+const T0 = minuteStart(EPOCH);
+/** 唯一一个落库的分钟桶的 ISO 形式；用纯函数换算，本文件不写 `new Date(...)`。 */
+const T0_ISO = bucketAtToIso(T0);
+/** 1h / 24h 两个窗口的起点（都由固定 `EPOCH` 推出，因此可以写死断言）。 */
+const ONE_HOUR = 3600;
+const ONE_DAY = 86_400;
 
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'homeport-metrics-'));
 
@@ -38,6 +80,102 @@ const testConfig: PortalConfig = loadConfig({
   session: { ttlHours: 12, rememberTtlHours: 24, cookieName: 'hp_session' },
   metrics: { sampleIntervalSec: 30, minuteRetentionHours: 24, hourRetentionDays: 30, containerLimit: 10 },
 });
+
+/* ------------------------------------------------------------------ *
+ * 假数据源（真实拓扑形状，不碰 /proc、Docker、服务发现）
+ * ------------------------------------------------------------------ */
+
+/** 夹具里的常量时间串（本文件禁止 `new Date(...)`，因此时间字面量都写成常量）。 */
+const FIXTURE_ISO = '1970-01-01T00:00:00.000Z';
+
+/** 夹具读数：CPU 之外的读数两次采样都在，因此落库序列数是确定值。 */
+const FAKE_CPU_PERCENT = 41.5;
+const FAKE_MEMORY_PERCENT = 50;
+const FAKE_MEMORY_USED_BYTES = 8_589_934_592;
+const FAKE_DISK_LABEL = 'volume1';
+const FAKE_DISK_PERCENT = 10;
+const FAKE_DISK_USED_BYTES = 100_020_488_601;
+
+/** 落库的序列数：内存% + 内存字节 + 磁盘% + 磁盘字节（CPU 第一次没有基线 → 不落库）。 */
+const FLUSHED_SERIES = 4;
+
+/** 固定的假宿主快照（形状与真实 `SystemSnapshot` 一致）。 */
+function fakeSnapshot(cpuPercent: number | null): SystemSnapshot {
+  return {
+    generatedAt: FIXTURE_ISO,
+    host: {
+      hostname: 'nas',
+      platform: 'linux',
+      kernel: '6.1.0',
+      arch: 'x64',
+      cpuModel: 'test',
+      cpuCores: 4,
+      uptimeSec: 1000,
+      bootedAt: FIXTURE_ISO,
+      osLabel: 'Linux',
+      hostIsLinux: true,
+    },
+    cpu: { percent: cpuPercent, perCore: [], loadAvg: [0, 0, 0] },
+    memory: {
+      usedBytes: FAKE_MEMORY_USED_BYTES,
+      totalBytes: 17_179_869_184,
+      availableBytes: 8_589_934_592,
+      percent: FAKE_MEMORY_PERCENT,
+      cachedBytes: 0,
+      swapUsedBytes: 0,
+      swapTotalBytes: 0,
+    },
+    disks: [
+      {
+        mount: '/volume1',
+        label: FAKE_DISK_LABEL,
+        fsType: 'ext4',
+        usedBytes: FAKE_DISK_USED_BYTES,
+        totalBytes: 1_000_204_886_016,
+        availableBytes: 900_184_397_415,
+        percent: FAKE_DISK_PERCENT,
+        error: null,
+      },
+    ],
+    gpu: null,
+    sources: {
+      cpu: { available: true, mode: 'host-proc', detail: null },
+      memory: { available: true, mode: 'host-proc', detail: null },
+      disk: { available: true, mode: 'statfs', detail: null },
+      gpu: { available: false, mode: 'none', detail: null },
+    },
+  };
+}
+
+let snapshotCalls = 0;
+
+/**
+ * 假宿主数据源：**第一次采样 CPU 没有基线**（`percent === null`），第二次才有读数。
+ *
+ * 这精确复现文档明确允许的合法状态：*"CPU 首次采样只存在于 live target 上、
+ * `lastSeenAt === null`"* —— 它既不是缺测也不是 0。把它**确定性地构造出来**，
+ * 比留给真实宿主采样器决定"这次有没有基线"要诚实得多：
+ * 断言可以写死"CPU 是 live-only、其余两条宿主序列已落库"。
+ */
+async function nextFakeSnapshot(): Promise<SystemSnapshot> {
+  snapshotCalls += 1;
+  return fakeSnapshot(snapshotCalls === 1 ? null : FAKE_CPU_PERCENT);
+}
+
+/** 空的服务注册表：本文件不测容器/服务指标，明确"没有服务"即可，不触发现实发现流程。 */
+const EMPTY_SERVICES: ServiceListResponse = {
+  items: [],
+  total: 0,
+  categories: [],
+  discovery: {
+    dockerAvailable: false,
+    serveAvailable: false,
+    serveDetail: '测试夹具：不接真实 Docker / tailscale serve',
+    discoveredAt: FIXTURE_ISO,
+    notes: [],
+  },
+  generatedAt: FIXTURE_ISO,
+};
 
 let handle: AppHandle;
 let app: FastifyInstance;
@@ -111,11 +249,12 @@ async function getHistory(
   };
 }
 
-/** 采样一次的秒级时刻（对齐到整分钟，便于数桶）。 */
-const MINUTE_MS = 60_000;
-const T0 = Math.floor(Date.now() / MINUTE_MS) * 60 - 120; // 当前分钟往前 2 分钟（秒）
-
 beforeAll(async () => {
+  // 把被测进程看到的 `Date` 钉在固定 epoch：采样器的读侧时钟（history/storage/catalog）
+  // 默认就是 `Date.now`，所以这一个动作就消除了"跑测试的时刻"这个隐藏输入。
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(EPOCH * 1000);
+
   handle = await buildApp({
     config: testConfig,
     logger: createSilentLogger(),
@@ -127,6 +266,14 @@ beforeAll(async () => {
   });
   app = handle.app;
   await app.ready();
+
+  // 只换"外部世界"：三个数据源都换成假夹具。换法是**改同一个对象上的方法** ——
+  // 采样器在装配期捕获的就是 `ctx.system` / `ctx.containers` / `ctx.services`
+  // 这三个对象本身，因此改方法对所有持有者生效（与 schedulerIntegration.test.ts 同理）；
+  // 路由、鉴权、CSRF、SQLite、装配流程全是真的。
+  handle.ctx.system.snapshot = nextFakeSnapshot;
+  handle.ctx.containers.list = async () => makeContainerList([], { dockerAvailable: false });
+  handle.ctx.services.list = async () => EMPTY_SERVICES;
 
   const bootstrap = await inject({
     method: 'POST',
@@ -148,12 +295,14 @@ beforeAll(async () => {
 
   // 手工跑两次采样（间隔一分钟）：唯一一次落库发生在第二个 tick 上。
   // 不启动后台调度器，因此落库时刻完全由测试决定。
+  // 两次都落在 22:13 这一分钟所在的**同一个整点**内 → 不产生任何 hour 行（下面显式断言）。
   await handle.metrics.tick(T0);
   await handle.metrics.tick(T0 + 60);
 });
 
 afterAll(async () => {
   await handle.close();
+  vi.useRealTimers();
   try {
     fs.rmSync(TMP_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   } catch (error) {
@@ -234,26 +383,44 @@ describe('历史指标 API · catalog', () => {
     expect(body.scheduler?.lastTickAt).toBeNull(); // 后台没跑过（手工 tick 不是调度器那轮）
   });
 
-  it('target 列表来自"库里出现过的行 + 本进程刚采到的"，且已包含刚采到的宿主 target', async () => {
+  it('target 列表 = 库里出现过的行 + 本进程刚采到的；CPU 的 live-only 状态被显式断言', async () => {
     const response = await inject({ method: 'GET', url: '/api/metrics/catalog', cookie: viewer.cookie });
     const body = response.json() as MetricCatalogView;
 
+    // 假数据源 + 固定 epoch 之后，这张表是**确定值**：5 条宿主序列（CPU 只有 live target），
+    // 容器/服务两条线在夹具里明确为空 → 一个容器/服务 target 都不该出现。
+    expect(body.targets.map((target) => `${target.metric}|${target.target}`)).toEqual([
+      'host.cpu.percent|host',
+      'host.disk.percent|disk:volume1',
+      'host.disk.used_bytes|disk:volume1',
+      'host.memory.percent|host',
+      'host.memory.used_bytes|host',
+    ]);
+
     const hosts = body.targets.filter((target) => target.target === 'host');
-    const hostMetrics = hosts.map((target) => target.metric);
-    // 内存百分比与内存字节一定采得到（os.totalmem/freemem 始终可用）
-    expect(hostMetrics).toContain('host.memory.percent');
-    expect(hostMetrics).toContain('host.memory.used_bytes');
-    // CPU 百分比要两次采样做差：进程刚启动的头几秒可能还没有基线 ——
-    // 那种情况必须**没有行**（缺测不写 0），所以这里给的是上界而不是等号
-    expect(hostMetrics.length).toBeGreaterThanOrEqual(2);
-    expect(hostMetrics.length).toBeLessThanOrEqual(3);
+    expect(hosts.map((target) => target.metric)).toEqual([
+      'host.cpu.percent',
+      'host.memory.percent',
+      'host.memory.used_bytes',
+    ]);
+
+    // CPU 是本夹具里**刻意**的"首次采样没有基线"：它只存在于 live target 上、库里没有行，
+    // 因此 `lastSeenAt === null`。这是文档明确允许的**合法状态**（既不是缺测也不是 0），
+    // 所以这里断言的是"谁有行谁没有"，而不是含糊的"全都非空"。
+    const cpu = hosts.find((target) => target.metric === 'host.cpu.percent');
+    expect(cpu?.lastSeenAt, 'CPU 只有 live target（还没落库）→ lastSeenAt 必须是 null').toBeNull();
+    const flushed = hosts.filter((target) => target.metric !== 'host.cpu.percent');
+    expect(
+      flushed.map((target) => target.lastSeenAt),
+      '落过库的两条宿主序列必须报出桶时刻（不是 null）',
+    ).toEqual([T0_ISO, T0_ISO]);
+
     expect(hosts.every((target) => target.targetLabel === '宿主' && target.unit !== undefined)).toBe(true);
-    expect(hosts.every((target) => target.lastSeenAt !== null)).toBe(true);
     expect(
       body.metrics.find((metric) => metric.key === 'host.memory.used_bytes')?.availableTargets,
     ).toBe(1);
     // 目录里的 seriesPerMinute 与 target 列表同源（前端选中的目标一定能查到历史）
-    expect(body.targets.every((target) => hostMetrics.includes(target.metric) || target.target !== 'host')).toBe(true);
+    expect(body.targets.every((target) => hosts.some((host) => host.metric === target.metric) || target.target !== 'host')).toBe(true);
   });
 });
 
@@ -290,7 +457,7 @@ describe('历史指标 API · history 校验', () => {
     const wrongKind = await getHistory('metric=host.cpu.percent&target=disk:C&range=1h');
     expect(wrongKind.statusCode).toBe(400);
 
-    // 形态对但库里没有（服务指标还没采过任何服务）
+    // 形态对但库里没有、本进程也没采到（夹具里没有服务，因此这个 service target 从未出现过）
     const neverSeen = await getHistory('metric=service.health.up_ratio&target=service:docker:homeport/nope&range=1h');
     expect(neverSeen.statusCode).toBe(400);
     const error = neverSeen.error as {
@@ -313,13 +480,17 @@ describe('历史指标 API · history 数据与单位', () => {
     expect(view.unit).toBe('bytes');
     expect(view.resolution).toBe('minute');
     expect(view.points).toHaveLength(1);
-    expect(view.points[0]?.at).toBe(new Date(T0 * 1000).toISOString()); // 落库的是第一个整分钟
+    expect(view.points[0]?.at, '落库的是 22:13 这个整分钟（由固定 epoch 推出）').toBe(T0_ISO);
     expect(view.points[0]?.samples).toBe(1);
     expect(view.points[0]?.expected).toBe(2);
     expect(view.points[0]?.partial).toBe(true);
+    // 窗口两端也钉死：都由固定 epoch 推出，不受运行时刻影响
+    expect(view.from).toBe(bucketAtToIso(T0 - ONE_DAY));
+    expect(view.to).toBe(T0_ISO);
     expect(view.gaps).toEqual({ missingBuckets: 1439, partialBuckets: 1 });
     expect(view.summary.count).toBe(1);
     expect(view.summary.latest).toBe(view.points[0]?.value);
+    expect(view.summary.latestAt).toBe(T0_ISO);
     expect(view.sampling.expectedPerBucket).toBe(2);
   });
 
@@ -331,6 +502,8 @@ describe('历史指标 API · history 数据与单位', () => {
     expect(percentView.unit).toBe('percent');
     const bytesValue = bytesView.points[0]?.value ?? 0;
     const percentValue = percentView.points[0]?.value ?? -1;
+    expect(bytesValue).toBe(FAKE_MEMORY_USED_BYTES); // 夹具读数字节数原样透出
+    expect(percentValue).toBe(FAKE_MEMORY_PERCENT); // 百分比原样透出，没有被换算
     expect(bytesValue).toBeGreaterThan(1024 * 1024); // 字节量级
     expect(percentValue).toBeGreaterThanOrEqual(0);
     expect(percentValue).toBeLessThanOrEqual(100); // 百分比量级
@@ -341,39 +514,53 @@ describe('历史指标 API · history 数据与单位', () => {
   });
 
   it('没有数据的窗口：count = 0 且 min/max/avg/latest 全为 null（绝不用 0 冒充）', async () => {
-    // disk 指标在本机可能一个都没采到（容器化/无挂载点配置）；无论如何都要"空就空"
-    const result = await getHistory('metric=host.disk.percent&target=disk:C&range=1h');
-    if (result.statusCode === 400) {
-      // 该 target 从未出现过 → 400 也是诚实答案（下面用已知存在的 target 再验一次空窗口）
-      const fallback = await getHistory('metric=host.memory.used_bytes&target=host&range=7d');
-      expect(fallback.statusCode).toBe(200);
-      expect(fallback.json?.resolution).toBe('hour');
-      // 只有 1 分钟的 minute 行，还没滚动出任何 hour 行 → 空窗口
-      expect(fallback.json?.points).toEqual([]);
-      expect(fallback.json?.summary).toEqual({
-        count: 0,
-        min: null,
-        max: null,
-        avg: null,
-        latest: null,
-        latestAt: null,
-      });
-      expect(fallback.json?.gaps).toEqual({ missingBuckets: 168, partialBuckets: 0 });
-      return;
-    }
-    const view = result.json!;
-    expect(view.summary.count).toBe(0);
-    expect(view.summary.avg).toBeNull();
-    expect(view.summary.avg).not.toBe(0);
+    // CPU 只存在于 live target 上（第一次采样没有基线，见上面的假数据源）：库里一行都没有，
+    // 因此任何窗口都必须是"空窗口" —— 这正是"缺测不写 0"在 API 上的样子。
+    const minute = await getHistory('metric=host.cpu.percent&target=host&range=1h');
+    expect(minute.statusCode, minute.body).toBe(200);
+    expect(minute.json?.resolution).toBe('minute');
+    expect(minute.json?.points).toEqual([]);
+    expect(minute.json?.summary).toEqual({
+      count: 0,
+      min: null,
+      max: null,
+      avg: null,
+      latest: null,
+      latestAt: null,
+    });
+    expect(minute.json?.gaps).toEqual({ missingBuckets: 60, partialBuckets: 0 });
+
+    // 小时级同理：两次 tick 都落在 22:13 所在的那一小时里（下面 storage 用例显式断言
+    // `hoursRolledUp === 0`），因此一条 hour 行都不会有 → 7d 视图必然是空窗口。
+    const hours = await getHistory('metric=host.memory.used_bytes&target=host&range=7d');
+    expect(hours.statusCode, hours.body).toBe(200);
+    expect(hours.json?.resolution).toBe('hour');
+    expect(hours.json?.points).toEqual([]);
+    expect(hours.json?.summary).toEqual({
+      count: 0,
+      min: null,
+      max: null,
+      avg: null,
+      latest: null,
+      latestAt: null,
+    });
+    expect(hours.json?.gaps).toEqual({ missingBuckets: 168, partialBuckets: 0 });
   });
 
-  it('数据源状态是"尚未采集"时明确说出来，而不是假装可用', async () => {
-    // container 指标：本环境没有 Docker → 采集报错、没有来源状态
+  it('数据源状态如实透出（不是硬编码 available: true），live-only 序列也不例外', async () => {
+    // CPU 在库里没有行，但"数据源状态"来自本进程最近一次采集 → 必须老实报 host-proc。
+    // （"尚未采集 → available: false / mode: none"那条分支由 metricsHistory.test.ts 直接覆盖。）
     const result = await getHistory('metric=host.cpu.percent&target=host&range=1h');
     expect(result.statusCode).toBe(200);
     const view = result.json!;
-    expect(view.source.available).toBe(true); // 本机 /proc（或容器视图）可用
-    expect(view.source.mode).not.toBe('none');
+    expect(view.source.available).toBe(true);
+    expect(view.source.mode).toBe('host-proc');
+    expect(view.points, '还没落库的 live-only 序列在窗口里没有点').toEqual([]);
+
+    // 磁盘走 statfs（与宿主 /proc 不是同一个来源，必须分别报出）
+    const diskView = (await getHistory('metric=host.disk.used_bytes&target=disk:volume1&range=1h')).json!;
+    expect(diskView.source.mode).toBe('statfs');
+    expect(diskView.points[0]?.value).toBe(FAKE_DISK_USED_BYTES);
   });
 });
 
@@ -383,28 +570,28 @@ describe('历史指标 API · storage', () => {
     expect(response.statusCode, response.body).toBe(200);
     const body = response.json() as MetricStorageView;
 
-    // 每个"确实采到读数"的序列恰好一行；CPU 百分比可能因为还没有基线而没采到，
-    // 所以断言"行数 = 上次 flush 的行数"这条等式，而不是写死 3
-    expect(body.rows.minute).toBeGreaterThanOrEqual(2);
-    expect(body.rows.minute).toBeLessThanOrEqual(3);
+    // 序列数是确定值（假数据源）：宿主 5 条读数里 CPU 第一次没有基线 → 落库 4 行；
+    // 两次 tick 同处一个整点 → 一条 hour 行都没有。不写"2..3 之间"的模糊区间。
+    expect(body.rows.minute).toBe(FLUSHED_SERIES);
+    expect(body.rows.hour).toBe(0);
     expect(body.rows.total).toBe(body.rows.minute + body.rows.hour);
     expect(body.rows.minute).toBe(body.lastTick?.bucketsFlushed);
     expect(body.size.pageSize).toBeGreaterThan(0);
     expect(body.size.bytes).toBeGreaterThan(0);
     expect(body.size.megabytes).toBeGreaterThan(0);
 
-    expect(body.bounds.minute.newestAt).toBe(new Date(T0 * 1000).toISOString());
-    expect(body.bounds.minute.oldestAt).toBe(new Date(T0 * 1000).toISOString());
+    expect(body.bounds.minute.newestAt).toBe(T0_ISO);
+    expect(body.bounds.minute.oldestAt).toBe(T0_ISO);
+    expect(body.bounds.hour.newestAt, '没有跨过整点 → 没有 hour 行').toBeNull();
+    expect(body.bounds.hour.oldestAt).toBeNull();
 
     expect(body.retention.minuteHours).toBe(24);
     expect(body.retention.hourDays).toBe(30);
-    // 清理截止时刻按**当前时钟**算（而不是按最后一次落库的时刻），并且两端都对齐到桶起点：
-    // 用响应自己的 generatedAt 推导，避免测试在分钟边界上抖动
-    const generatedAtSec = Math.floor(Date.parse(body.generatedAt) / 1000);
-    const nowMinute = Math.floor(generatedAtSec / 60) * 60;
-    const nowHour = Math.floor(generatedAtSec / 3600) * 3600;
-    expect(body.retention.minuteCutoffAt).toBe(new Date((nowMinute - 24 * 3600) * 1000).toISOString());
-    expect(body.retention.hourCutoffAt).toBe(new Date((nowHour - 30 * 86_400) * 1000).toISOString());
+    // 清理截止时刻按**被测进程的时钟**算，并且两端都对齐到桶起点。
+    // 时钟被 `vi.setSystemTime` 钉在 EPOCH 上，所以这里可以直接写死等式。
+    expect(body.generatedAt).toBe(bucketAtToIso(EPOCH));
+    expect(body.retention.minuteCutoffAt).toBe(bucketAtToIso(minuteStart(EPOCH) - 24 * ONE_HOUR));
+    expect(body.retention.hourCutoffAt).toBe(bucketAtToIso(hourStart(EPOCH) - 30 * ONE_DAY));
 
     // 预算：有实测序列数时按实测外推，数字必须落在 §1.1 的公式上
     expect(body.budget.basis).toBe('observed');
@@ -416,10 +603,12 @@ describe('历史指标 API · storage', () => {
     expect(body.budget.withinBudget).toBe(true);
     expect(body.budget.note).toContain('估算');
 
-    // 数据源不可用只会被记成错误、不抛；无论本机有没有 Docker，下列不变量都必须成立
-    expect(body.lastTick?.at).not.toBeNull();
-    expect(body.lastTick?.collected).toBeGreaterThanOrEqual(2);
-    expect(Array.isArray(body.lastTick?.errors)).toBe(true);
+    // 最近一次采样摘要是"真数"：第二次 tick 采到 5 条读数（含 CPU）、落库 4 行、无 hour 滚动
+    expect(body.lastTick?.at).toBe(bucketAtToIso(T0 + 60));
+    expect(body.lastTick?.collected).toBe(FLUSHED_SERIES + 1);
+    expect(body.lastTick?.bucketsFlushed).toBe(FLUSHED_SERIES);
+    expect(body.lastTick?.hoursRolledUp, '本夹具不跨整点：这是显式断言，不是"恰好没跨"').toBe(0);
+    expect(body.lastTick?.errors).toEqual([]);
     // 落库的序列数不可能超过这一轮真正采到的读数数（采集失败不会凭空写行）
     expect(body.rows.minute).toBeLessThanOrEqual(body.lastTick?.collected ?? 0);
   });

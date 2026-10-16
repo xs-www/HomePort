@@ -96,6 +96,16 @@ interface TrackedService {
   target: string | null;
 }
 
+/**
+ * 服务列表的读取结果。
+ *
+ * **必须**把"读失败"和"成功读到空列表"分成两种结果，否则监视器无法回答
+ * "用户把服务全隐藏/全删了"与"这一次没读到服务列表"这个致命的问题：
+ * 两者的 `items` 都是空数组，但前者要求**清空**旧状态（含服务名），后者要求**保留**。
+ * 用 `ok` 这个判别字段承载区别，而不是靠"是否为空"去猜。
+ */
+type ServiceListViewResult = { ok: true; views: ServiceView[] } | { ok: false; views: [] };
+
 export class HealthMonitor {
   private readonly deps: HealthMonitorDeps;
   private readonly log: Logger;
@@ -103,6 +113,12 @@ export class HealthMonitor {
   /** 服务健康状态：**只在内存**（进程重启即清空，重启后重新攒连续计数）。 */
   private readonly statesByRef = new Map<string, ServiceHealthState>();
   private readonly labelsByRef = new Map<string, { serviceId: string; label: string }>();
+  /**
+   * 最近一次**成功读取**到的可见服务集合（viewer 视角）。`null` = 还没有过成功读取，
+   * 此时读路径不做过滤（无数据可漏）。读失败时**保持上一次的集合不变**：
+   * 失败的读不能证明任何服务消失，扩大可见集合只会制造泄漏。
+   */
+  private visibleRefs: Set<string> | null = null;
   private containerSnapshot: { atMs: number; value: ContainerListResult } | null = null;
   private lastContainerError: string | null = null;
   private lastRegistryError: string | null = null;
@@ -129,7 +145,8 @@ export class HealthMonitor {
     const concurrency = this.concurrency();
     const hostRequest = backgroundHostRequest(this.deps.config);
 
-    const views = await this.loadServices(hostRequest);
+    const loaded = await this.loadServices(hostRequest);
+    const views = loaded.views;
     const tracked: TrackedService[] = views
       .map((view) => ({
         sourceRef: view.sourceRef,
@@ -173,7 +190,17 @@ export class HealthMonitor {
       this.labelsByRef.set(item.sourceRef, { serviceId: item.serviceId, label: item.label });
     }
 
-    if (tracked.length > 0) this.dropStaleStates(tracked);
+    // 只有**成功读取**的服务列表才是"当前可见服务集合"的真相：
+    // - 成功且非空 → 回收不在集合里的旧状态；
+    // - 成功且**为空** → 用户把服务全隐藏/全删了，必须清掉**全部**旧状态，
+    //   连 `labelsByRef` 里的服务名一起清（只清状态会留下名字，等于把 hidden 服务
+    //   的名字继续透给 viewer —— 这正是 P1 缺陷）。
+    // - 读失败（`ok === false`）→ **不碰**任何既有状态，`visibleRefs` 也保持不变，
+    //   原因写在 `lastRegistryError` → 由 `view().notes` 说明（取数抖动 ≠ 服务消失）。
+    if (loaded.ok) {
+      this.visibleRefs = new Set(tracked.map((item) => item.sourceRef));
+      this.dropStaleStates(tracked);
+    }
     this.lastRunAt = at;
 
     return {
@@ -185,13 +212,28 @@ export class HealthMonitor {
     };
   }
 
-  /** 当前跟踪到的全部服务状态（按 sourceRef 稳定排序）。 */
+  /**
+   * 当前跟踪到的全部服务状态（按 sourceRef 稳定排序）。
+   *
+   * 纵深防御：即便将来 reconcile（`dropStaleStates`）再出问题，这里也**绝不**把
+   * "已不在最近一次成功读取的可见服务集合里"的状态发出去 —— 泄漏服务名是 P1 级问题，
+   * 不能只靠写路径一处保证。集合为空 = 一个都不发（`null` = 还没成功读过，不过滤）。
+   */
   states(): ServiceHealthState[] {
-    return [...this.statesByRef.values()].sort((a, b) => (a.sourceRef < b.sourceRef ? -1 : a.sourceRef > b.sourceRef ? 1 : 0));
+    return [...this.statesByRef.values()]
+      .filter((state) => this.isVisible(state.sourceRef))
+      .sort((a, b) => (a.sourceRef < b.sourceRef ? -1 : a.sourceRef > b.sourceRef ? 1 : 0));
   }
 
+  /** 单个服务的状态；同样受可见集合约束（不可见 = 当作不存在，不返回名字或判定）。 */
   state(sourceRef: string): ServiceHealthState | null {
+    if (!this.isVisible(sourceRef)) return null;
     return this.statesByRef.get(sourceRef) ?? null;
+  }
+
+  /** 读路径的可见性判据：还没成功读过（`null`）时不做过滤，否则必须在集合里。 */
+  private isVisible(sourceRef: string): boolean {
+    return this.visibleRefs === null || this.visibleRefs.has(sourceRef);
   }
 
   probeStats(): HealthProbeStats {
@@ -269,18 +311,34 @@ export class HealthMonitor {
    *
    * 用 viewer 而不是 admin 是刻意的：hidden 是用户"我不想看到它"的明确表达，
    * 后台却继续采它的健康指标并把名字写进 `/api/health/monitor`，等于绕过用户的隐藏。
+   *
+   * 返回值**带 `ok` 判别位**：`list()` 抛错 = 读失败；`list()` 正常返回（哪怕
+   * `items` 为空）= 读成功。这个区别不能靠"数组是否为空"事后猜 —— 用户隐藏掉最后一个
+   * 服务时 `items` 同样是空数组，那一次必须清理旧状态（见 `tick()`）。
+   *
+   * 顺带说明为什么"读失败 → 保留旧状态"在真实数据源上不会误伤：服务视图是
+   * `repository.listAll()`（DB）逐条构建的，Docker 抖动只会让 `discovery.dockerAvailable`
+   * 变 false、容器维度退化为 unknown，**不会**让 DB 里的服务从 `items` 消失。
+   * 所以"非空列表 + 数据源降级"的场景本来就会被正常保留；真正的空列表只可能来自
+   * "确实没有可见服务"。取数彻底失败（Docker/发现异常导致 `list()` 抛错）才走 `ok: false`。
    */
-  private async loadServices(request: HostContextRequest): Promise<ServiceView[]> {
+  private async loadServices(request: HostContextRequest): Promise<ServiceListViewResult> {
     try {
       const response = await this.deps.registry.list(request, {}, 'viewer');
+      if (!Array.isArray(response?.items)) {
+        // 契约破损（没有 items 数组）不能当成"服务全没了"：那是把响应错误当成用户意图。
+        this.lastRegistryError = '服务列表响应缺少 items 数组';
+        this.log.warn('健康监视器：服务列表响应不合法', { error: this.lastRegistryError });
+        return { ok: false, views: [] };
+      }
       this.lastRegistryError = null;
-      return response.items;
+      return { ok: true, views: response.items };
     } catch (error) {
       // 服务列表取不到（发现失败 / Docker 不可用）：本 tick 不评估任何服务，
       // 但**已有的健康状态原样保留** —— 取数失败不等于服务恢复或消失。
       this.lastRegistryError = error instanceof Error ? error.message : String(error);
       this.log.warn('健康监视器：服务列表获取失败', { error: this.lastRegistryError });
-      return [];
+      return { ok: false, views: [] };
     }
   }
 
@@ -454,11 +512,15 @@ export class HealthMonitor {
   }
 
   /**
-   * 丢掉"本次快照里已经不存在的服务"的状态。
+   * 丢掉"本次**成功读取**的服务快照里已经不存在的服务"的状态与标签。
    *
-   * 仅在服务列表**非空**时执行：空列表通常意味着发现失败 / Docker 刚重启，
-   * 此时清空会把所有连续失败计数抹掉，故障期间的告警随之消失 —— 那是更坏的结果。
-   * 同时按上限淘汰最久未评估的条目，保证内存有界。
+   * 调用方（`tick()`）只在服务列表**读取成功**时调用，且**空列表也调用**：
+   * - 空列表 = 用户把服务全隐藏/全删了 → 必须连服务名（`labelsByRef`）一起清干净，
+   *   只清状态会留下名字，等于把 hidden 服务的名字继续发给 viewer（P1 缺陷的根因）；
+   * - 读取失败时不调用（见 `tick()`），否则数据源抖动会把连续失败计数抹掉、
+   *   故障期间的告警随之消失。
+   *
+   * 另外按上限淘汰最久未评估的条目，保证内存有界。
    */
   private dropStaleStates(tracked: readonly TrackedService[]): void {
     const alive = new Set(tracked.map((item) => item.sourceRef));

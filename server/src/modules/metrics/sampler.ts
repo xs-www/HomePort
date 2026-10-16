@@ -31,6 +31,13 @@
  * - 桶内样本不足 → 写行并标 `samples < expected`（前端显示为 partial）。
  *
  * 任何情况下都不会写 `value = 0` 来表示"不知道"。
+ *
+ * ## 读路径的可见性（不可省）
+ *
+ * 采集用 viewer 视角只保证"隐藏之后不再新增样本"；**隐藏之前**已落库的行与进程内
+ * `liveTargets` 仍在。因此 `availableTargets()` 与 `resolveTarget()` 会按**当前**
+ * viewer 可见服务集合再过一次（见 `visibleServiceRefs`）：不可见与"从未采集过"
+ * 返回同一个 null，API 层据此返回同一种 400 —— 不泄露存在性。
  */
 import type { PortalConfig } from '../../config.js';
 import type { Db } from '../../db/database.js';
@@ -70,6 +77,7 @@ import {
 import {
   METRIC_CATALOG,
   matchesTargetPattern,
+  metricByKey,
   type MetricCatalogView,
   type MetricDefinition,
   type MetricHistoryView,
@@ -376,8 +384,15 @@ export class MetricsSampler {
     return this.lastResult;
   }
 
-  /** 目录里的可用 target：库中出现过的 + 本进程刚采到但还没落库的。 */
-  availableTargets(): MetricTargetView[] {
+  /**
+   * 目录里的可用 target：库中出现过的 + 本进程刚采到但还没落库的，
+   * **再按"当前可见性"过滤**（见 `visibleServiceRefs`）。
+   *
+   * 过滤只可能**减少**条目：宿主/磁盘 target 恒在（它们不属于任何服务）。
+   * 因此"藏掉一个服务后再看目录"是安全的默认方向：看不到就是看不到，
+   * 不会因为多一次可见性读取而多出条目。
+   */
+  async availableTargets(): Promise<MetricTargetView[]> {
     const since = hourStart(this.clock()) - 30 * 24 * HOUR_SECONDS;
     const merged = new Map<string, MetricTargetView>();
     for (const row of this.repo.listTargets(since)) {
@@ -392,20 +407,42 @@ export class MetricsSampler {
     for (const [key, live] of this.liveTargets) {
       if (!merged.has(key)) merged.set(key, live);
     }
-    return [...merged.values()].sort((left, right) => {
-      if (left.metric !== right.metric) return left.metric < right.metric ? -1 : 1;
-      return left.target < right.target ? -1 : left.target > right.target ? 1 : 0;
-    });
+
+    // 只有真的存在"服务类 target"时才去问注册表：纯宿主/磁盘的目录（例如没有
+    // Docker 的环境）完全不触碰服务层，行为与改动前逐字节一致。
+    const candidates = [...merged.values()];
+    const needsVisibility = candidates.some((target) => !this.isHostOwnedTarget(target.metric));
+    const visible = needsVisibility ? await this.visibleServiceRefs() : null;
+
+    return candidates
+      .filter((target) => this.targetVisible(target.metric, target.target, visible))
+      .sort((left, right) => {
+        if (left.metric !== right.metric) return left.metric < right.metric ? -1 : 1;
+        return left.target < right.target ? -1 : left.target > right.target ? 1 : 0;
+      });
   }
 
   /**
-   * 校验并解析 target：形态必须匹配，且**确实出现过**（库里有行或本进程刚采到）。
+   * 校验并解析 target：形态必须匹配、**确实出现过**（库里有行或本进程刚采到），
+   * 且对服务/容器类 target 还必须是**当前可见**的。
    *
-   * @returns 展示标签；未知 target 返回 null（API 层据此返回 400）
+   * 这是 `GET /api/metrics/history` 的唯一校验闸门：不可见与"从未出现过"
+   * 在这里是**同一个返回值 null**，API 层因此产出一模一样的 400
+   * （`VALIDATION_FAILED` + `targetPattern`）—— 调用者无法从响应里区分
+   * "这个服务存在但你无权看" 与 "这个 target 从来没采过"。
+   *
+   * @returns 展示标签；未知/不可见 target 返回 null（API 层据此返回 400）
    */
-  resolveTarget(metric: MetricDefinition, target: string): string | null {
+  async resolveTarget(metric: MetricDefinition, target: string): Promise<string | null> {
     if (!matchesTargetPattern(metric, target)) return null;
     if (target === HOST_TARGET) return HOST_TARGET_LABEL;
+    // 宿主/磁盘 target 到此直接查标签：它们的响应与可见性无关，保持原样。
+    // 服务/容器 target 必须先过当前可见性——**在做任何存在性查找之前**，
+    // 否则"库里曾经有过"本身就是存在性证据。
+    if (!this.isHostOwnedTarget(metric.key)) {
+      const visible = await this.visibleServiceRefs();
+      if (!this.targetVisible(metric.key, target, visible)) return null;
+    }
     const live = this.liveTargets.get(`${metric.key}|${target}`);
     if (live) return live.targetLabel;
     return this.repo.findLatestTargetLabel(metric.key, target);
@@ -434,9 +471,9 @@ export class MetricsSampler {
     });
   }
 
-  /** 目录（含可用 target、range 表、采样状态与调度状态）。 */
-  catalog(scheduler: MetricSchedulerView | null = null): MetricCatalogView {
-    const targets = this.availableTargets();
+  /** 目录（含可用 target、range 表、采样状态与调度状态）。target 已按当前可见性过滤。 */
+  async catalog(scheduler: MetricSchedulerView | null = null): Promise<MetricCatalogView> {
+    const targets = await this.availableTargets();
     const intervalSec = this.intervalSec();
     const limit = this.deps.config.metrics.containerLimit;
     return {
@@ -588,6 +625,78 @@ export class MetricsSampler {
       });
       return 'unknown';
     }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 读路径的可见性（S2 修复：hidden 服务不得经历史接口泄漏）
+   * ---------------------------------------------------------------- */
+
+  /**
+   * 读路径的"当前 viewer 可见服务"集合。
+   *
+   * ## 为什么读路径必须自己再判一次
+   *
+   * 采集侧固定 `role: 'viewer'` 只保证"隐藏之后不再产生新样本"。但**隐藏之前**
+   * 已经写进 `metric_buckets` 的历史行与进程内 `liveTargets` 仍然带着服务名 ——
+   * 只靠采集视角，被隐藏的服务会被 catalog 继续列出、被 history 继续查到，
+   * 直到历史数据过期。这正是"读接口绕过当前可见性"的泄漏面。
+   *
+   * ## 为什么不缓存（也不复用任何 TTL 缓存）
+   *
+   * 可见性是 `services.visibility` 这一行 DB 事实，读它不产生任何 Docker 调用
+   * （`ServiceRegistryService.list` 内部的发现与容器列表各自走**既有**的 TTL 缓存）。
+   * 加一层缓存只会把"隐藏"的生效时刻推迟到 TTL 之后，而这段时间恰恰就是泄漏窗口；
+   * 用一个可观测的泄漏窗口去省一次列表读，是拿安全换性能 —— 这里不做。
+   *
+   * ## 来源与采集时一致
+   *
+   * viewer 视角 + 与采集同一个 `backgroundHostRequest(config)`，因此"隐藏服务在
+   * 采集侧不可见"与"在读取侧不可见"用的是同一套判定，不会出现两套口径。
+   *
+   * @returns 可见服务的 `sourceRef` 集合；注册表读失败时返回 `null`
+   *   （调用方按 **fail-closed** 处理：服务/容器类 target 一律视为不可见）。
+   *   宿主与磁盘指标不经过这个判定，因此注册表抖动不会影响它们。
+   */
+  private async visibleServiceRefs(): Promise<ReadonlySet<string> | null> {
+    try {
+      const listed = await this.deps.registry.list(this.hostRequest, {}, 'viewer');
+      return new Set(listed.items.map((item) => item.sourceRef));
+    } catch (error) {
+      this.log.warn('读取服务可见性失败：服务/容器类 target 按不可见处理（宿主与磁盘指标不受影响）', {
+        error: errorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * 这个 metric 的 target 是否属于**宿主自身**（host / disk）。
+   *
+   * 宿主与磁盘不属于任何服务，可见性过滤必须原样放过它们（行为与响应保持不变）。
+   * metric key 不在目录里（契约变更后的历史行）按"非宿主"处理：fail-closed。
+   */
+  private isHostOwnedTarget(metricKey: string): boolean {
+    const metric = metricByKey(metricKey);
+    if (!metric) return false;
+    return metric.targetKind === 'host' || metric.targetKind === 'disk';
+  }
+
+  /**
+   * 一个 target 是否允许出现在读响应里。
+   *
+   * 服务/容器 target 里带的就是服务的稳定身份：`service:<sourceRef>` 与
+   * `container:<sourceRef>`（`containerServiceRef` 与服务的 `sourceRef` 同源），
+   * 因此必须命中**当前**可见集合；`visible === null`（注册表不可用）时一律拒绝，
+   * 宁可少列一个也不泄露一个。
+   */
+  private targetVisible(metricKey: string, target: string, visible: ReadonlySet<string> | null): boolean {
+    if (this.isHostOwnedTarget(metricKey)) return true;
+    if (visible === null) return false;
+    const metric = metricByKey(metricKey);
+    if (!metric) return false;
+    const prefix = metric.targetKind === 'container' ? 'container:' : 'service:';
+    if (!target.startsWith(prefix)) return false;
+    return visible.has(target.slice(prefix.length));
   }
 
   /** 当前采样间隔（秒）；非法值回退到 60，避免 expected 变成 NaN。 */

@@ -69,6 +69,8 @@ export function registerMetricsRoutes(
   /** 目录：指标清单 + 可用 target + range 表 + 采样状态（前端据此渲染选择器）。 */
   app.get('/catalog', async (request) => {
     requireAuth(request);
+    // target 列表由采样器按**当前** viewer 可见服务集合过滤（hidden 服务不出现在这里，
+    // 名字也不出现）——见 `MetricsSampler.availableTargets`。
     return deps.metrics.catalog(toSchedulerView(deps.scheduler));
   });
 
@@ -78,6 +80,11 @@ export function registerMetricsRoutes(
    * 两个校验都在这里做（而不是在 service 层抛 HTTP 错误）：
    * 未知 metric / 未知 range / 未知 target 一律 `VALIDATION_FAILED`，
    * 并且把"允许什么"写进 details，前端可以直接展示。
+   *
+   * **不可见与"从未采集过"走同一条分支**：`resolveTarget` 对前者也返回 null，
+   * 于是隐藏/已删除的目标得到与陌生目标逐字段一致的 400（含 `targetPattern`），
+   * 调用者无法据此判断"这个服务存在但被隐藏了"。刻意不用 404/403 ——
+   * 那等于承认该目标存在。
    */
   app.get('/history', async (request) => {
     requireAuth(request);
@@ -99,7 +106,8 @@ export function registerMetricsRoutes(
       });
     }
 
-    const targetLabel = deps.metrics.resolveTarget(metric, target);
+    // 解析 + **当前可见性**校验（宿主/磁盘 target 不受可见性影响）。
+    const targetLabel = await deps.metrics.resolveTarget(metric, target);
     if (targetLabel === null) {
       throw badRequest(`未知的指标目标 "${target}"`, {
         fieldErrors: { target: [`该指标下没有出现过的 target：${target}`] },
