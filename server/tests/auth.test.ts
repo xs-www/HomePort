@@ -10,7 +10,7 @@
  * 6. 重置密码会吊销目标用户的全部会话
  * 7. 最后一个管理员不能被删除/降级/禁用
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp, type AppHandle } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
@@ -46,6 +46,32 @@ function nextIp(): string {
   ipCounter += 1;
   return `10.9.${Math.floor(ipCounter / 250)}.${ipCounter % 250}`;
 }
+
+/**
+ * 与本文件相关、会影响设置解析的环境变量。
+ *
+ * 用例期间一律清空（结束后恢复），否则结果取决于开发者宿主机：
+ * 例如 `.env` 导出过 `PORTAL_TAILSCALE_API_TOKEN` 时，"无 Token"的用例
+ * 会拿着这个 Token 真的去访问 api.tailscale.com —— 同样的代码在 CI 上
+ * 走一条分支、在本机走另一条分支。
+ */
+const MANAGED_ENV = ['PORTAL_TAILSCALE_API_TOKEN', 'PORTAL_TAILSCALE_MODE'];
+const savedEnv = new Map<string, string | undefined>();
+
+beforeEach(() => {
+  for (const key of MANAGED_ENV) {
+    savedEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
+});
+
+afterEach(() => {
+  for (const [key, value] of savedEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  savedEnv.clear();
+});
 
 interface TestClient {
   cookie: string;
@@ -475,6 +501,22 @@ describe('接口契约', () => {
     admin = await login('admin', 'PortalAdmin2027!');
   });
 
+  /**
+   * 设置项是**跨用例的全局状态**：一旦写进运行时设置，后面所有用例都会读到它。
+   * 典型踩坑：写入 Token 的用例不清理，接着"无 Token"的用例拿到这个 Token，
+   * 于是真的去访问 api.tailscale.com —— 能不能过取决于本机有没有外网，
+   * 而且此时断言的消息完全是另一条分支（网络错误，而非"去获取 Token"）。
+   * 所以这里统一在用例结束后把这两项恢复默认。
+   */
+  afterEach(async () => {
+    await app.inject({
+      method: 'POST',
+      url: '/api/settings/reset',
+      headers: { cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { keys: ['PORTAL_TAILSCALE_API_TOKEN', 'PORTAL_TAILSCALE_MODE'] },
+    });
+  });
+
   it('/api/health 无需登录且结构完整', async () => {
     const response = await app.inject({ method: 'GET', url: '/api/health' });
     expect(response.statusCode).toBe(200);
@@ -682,6 +724,25 @@ describe('接口契约', () => {
   });
 
   it('测试 tailnet 连通性：无 Token 时给出可操作的提示而非报错', async () => {
+    // 先把环境钉成**确定状态**：api 模式 + 哪里都没有 Token。
+    //
+    // 为什么必须钉：这条用例原本假设"没配 Token 就一定报错"，但实际分支取决于宿主机——
+    //   · auto 模式 + 本机装了 tailscale CLI → 走 cli 分支并真的读到设备（ok:true，用例失败）
+    //   · 环境变量里有 Token（.env 导出过）→ 走 api 分支并真的访问 api.tailscale.com
+    // 只有把模式固定为 api 且清掉 Token，才是在验"没有 Token 时给指引"这条契约本身。
+    await app.inject({
+      method: 'PATCH',
+      url: '/api/settings',
+      headers: { cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { values: { PORTAL_TAILSCALE_MODE: 'api' } },
+    });
+    await app.inject({
+      method: 'POST',
+      url: '/api/settings/reset',
+      headers: { cookie: admin.cookie, 'x-csrf-token': admin.csrf },
+      payload: { keys: ['PORTAL_TAILSCALE_API_TOKEN'] },
+    });
+
     const response = await app.inject({
       method: 'POST',
       url: '/api/settings/test/tailscale',
@@ -689,8 +750,11 @@ describe('接口契约', () => {
       payload: {},
     });
     expect(response.statusCode).toBe(200);
-    const body = response.json() as { ok: boolean; message: string; source: { detail: string | null } };
+    const body = response.json() as { ok: boolean; mode: string; message: string; source: { detail: string | null } };
     expect(body.ok).toBe(false);
+    expect(body.mode).toBe('api');
+    // 没有 Token 就不该发起请求，提示里应说明"缺 Token"（而不是网络不可达）
+    expect(body.source.detail).toContain('Token');
     // 消息里应告诉用户去哪里拿 Token
     expect(body.message).toMatch(/Token|令牌|Keys/i);
   });
