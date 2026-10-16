@@ -107,7 +107,9 @@
       → `docker volume create homeport-data` + `cp -a` 迁数据 → `up -d --remove-orphans`
       清掉旧容器。实测账号/会话/偏好全部保留，`homeport-portal` `Up (healthy)`
 - [x] 推送公开仓库前清除历史中的明文 admin 密码（工作区打码 + `filter-branch` 重写历史）
+- [x] 已推送至 `https://github.com/xs-www/HomePort.git`（分支 `master`，首推提交 `37f27e0`）
 - [ ] 数据卷 `homeport-data` 缺 Compose 归属标签，每次 `up` 会打印一条无害告警（有意保留，见 changelog）
+- [ ] **建议轮换 admin 密码**：原明文曾进入 git 历史（现已清除）与本机磁盘，按安全惯例应视为已暴露
 
 ## 待办
 
@@ -165,6 +167,9 @@
 - [ ] 主题自定义色板
 - [ ] 导出审计日志为 CSV
 - [ ] 支持 PostgreSQL（当前 SQLite 足够，仅在多实例部署时才有必要）
+- [ ] **补 `LICENSE` 文件**：`package.json` 已声明 `"license": "MIT"`，但没有 LICENSE 文件，
+      默认等于"保留所有权利"，与声明不一致（公开仓库尤其明显）
+- [ ] 仓库尚未配置 CI（与「技术债」中的 CI 项合并考虑）
 
 ## 技术债
 

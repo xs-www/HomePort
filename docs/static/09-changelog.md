@@ -953,20 +953,56 @@ curl.exe -s http://127.0.0.1:8899/api/health
 
 1. 工作区打码：`todo.md` 与本文档中的明文 → `********`。
 2. 历史清除：环境无 `git-filter-repo`，改用内置 `git filter-branch` 对全部提交重写
-   （仓库当时**无 remote、仅 5 个提交、无人拉取过**，改写 SHA 无外部影响，代价为零）。
-3. 验证：`git log --all -S '<原密码>'` 返回空。
-4. 推送后再复核远端不含该串。
+   （仓库当时**无 remote、仅 5 个提交、无人拉取过**，改写 SHA 无外部影响，代价为零）：
+
+   ```bash
+   git filter-branch -f --tree-filter \
+     "sed -i 's/<原密码>/********/g' todo.md 2>/dev/null || true" -- --all
+   ```
+
+3. 清理备份引用并回收对象（**必须做**，否则旧 blob 仍可经 `refs/original/` 读到）：
+
+   ```bash
+   git for-each-ref --format='%(refname)' refs/original/ | xargs -n1 git update-ref -d
+   git reflog expire --expire=now --all && git gc --prune=now
+   ```
+
+4. 验证与推送：
+
+   ```bash
+   git log --all -S '<原密码>' --oneline          # → 空
+   foreach ($c in git rev-list --all) { git grep -n '<原密码>' $c }   # → 逐个提交穷尽扫描，全空
+   git fsck --unreachable                          # → 无不可达提交
+
+   git remote add origin https://github.com/xs-www/HomePort.git
+   git push -u origin master
+   # → * [new branch] master -> master（远端原为空仓库）
+
+   git fetch origin && git grep -n '<原密码>' origin/master   # → 空（远端复核）
+   git rev-parse HEAD origin/master                # → 两者同为 37f27e0
+   ```
+
+### 推送结果
+
+| 项 | 值 |
+| --- | --- |
+| 仓库 | `https://github.com/xs-www/HomePort.git`（推送前为空仓库） |
+| 分支 | `master`（沿用既有本地分支名，未改 `main`） |
+| 首推提交 | `37f27e0`（重写后的新 SHA） |
+| 提交数 / 跟踪文件数 | 6 / 111 |
+| 远端复核 | `origin/master` 中无明文密码；`.env` 未被上传（仅 `.env.example`） |
+
+> **踩坑记录**：首次穷尽扫描时仍命中 3 个"旧 SHA" —— 因为当时 `refs/original/` 备份引用还在，
+> `git rev-list --all` 依然能走到旧提交。**清理备份引用并 `gc` 之后重扫才为真正的空**。
+> 只跑 `-S` 而不清引用会得到"已清除"的错觉。
 
 ### 影响与后续
 
 - 历史的提交 SHA 已全部改变（`filter-branch` 的必然结果）；因从未推送，无协作者受影响。
-- **建议仍轮换该密码**：它此前存在于本机 git 对象库中（`filter-branch` 的备份 ref
-  `refs/original/` 需一并清理，见下方命令），且曾以明文写在磁盘上。
-
-```bash
-git for-each-ref --format='%(refname)' refs/original/ | xargs -n1 git update-ref -d
-git reflog expire --expire=now --all && git gc --prune=now --aggressive
-```
+- **建议仍轮换该密码**：它此前以明文存在于本机 git 对象库与磁盘上，
+  且本会话中该值曾出现在工具输出里。轮换流程见 `08-operations.md` §5。
+- 仓库尚无 `LICENSE` 文件，而 `package.json` 已声明 `"license": "MIT"` ——
+  无 LICENSE 文件时默认"保留所有权利"，与声明不一致，建议补一份（已记入 `todo.md`）。
 
 ### 已知限制 / 后续
 
