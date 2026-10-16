@@ -1,0 +1,102 @@
+# ==============================================================================
+# CI 质量门禁：类型检查 + 单元测试 + 构建 + E2E
+#
+# 设计要点（Sprint 0 / S0-02）：
+#
+# 1. **没有 paths-ignore**。这是刻意的：如果 CI 只在代码变动时跑，
+#    纯文档 PR 就不会产生任何 check，而一旦分支保护要求"check 必须通过"，
+#    这类 PR 会永久停在 pending。宁可多跑一次也不要出现卡死的 PR。
+# 2. **不引用任何 secret**，权限只有 `contents: read`。
+#    外部 fork 的 PR 也会跑到本工作流，因此这里绝不能出现生产密钥。
+#    镜像发布（含 `packages: write` 与 `secrets.GITHUB_TOKEN`）留在
+#    `docker-publish.yml`，且只由 push/tag 触发，PR 触发不了。
+# 3. **E2E 用真实生产构建 + 真实 HTTP 服务**（`e2e/start-server.mjs` 会先
+#    `npm run build`），并且刻意把 Docker/Tailscale 数据源指向不可用地址，
+#    验证"数据源故障时页面降级而不是白屏"。
+# ==============================================================================
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# 同一分支上新的推送取消仍在跑的旧 CI，避免排队
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小权限：本工作流不需要写任何东西
+permissions:
+  contents: read
+
+jobs:
+  # ---- 质量门禁：镜像发布依赖这个 job（见 docker-publish.yml）----
+  quality:
+    name: 类型检查 · 单元测试 · 构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # 用 npm ci 而不是 npm install：锁文件即事实，避免 CI 上悄悄装到不同版本
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck（server + web）
+        run: npm run typecheck
+
+      - name: Unit tests（server + web）
+        run: npm test
+
+      - name: Production build（web + server）
+        run: npm run build
+
+      - name: 校验构建产物存在
+        run: |
+          test -f web/dist/index.html
+          test -f server/dist/index.js
+          echo "构建产物就绪：web/dist/index.html, server/dist/index.js"
+
+  # ---- E2E 冒烟：首启初始化 → 登录 → 关键页面 → 权限 ----
+  e2e:
+    name: E2E 冒烟（Playwright）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: quality
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 只装 chromium，省时间；--with-deps 装系统库（headless shell 需要）
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E
+        run: npm run test:e2e
+
+      - name: 上传 E2E 报告（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

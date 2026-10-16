@@ -15,6 +15,12 @@
 #   containerd 镜像存储未启用）拉取时会报 "no match for platform in manifest"。
 #   多架构 manifest list 本身没问题，但**必须**保持 attestation 关闭，
 #   否则较老 Docker 依旧会挑不中平台。本镜像的消费方正是这类设备，故关闭。
+#
+# 质量门禁（Sprint 0 / S0-02）：
+#   `build-and-push` 依赖同文件的 `quality` job（typecheck + 单元测试 + 构建）。
+#   测试不过就没有镜像被推送 —— 这是"只有测试通过才触发构建发布"的落点。
+#   本工作流**没有 pull_request 触发**，因此外部 fork 的 PR 拿不到
+#   `secrets.GITHUB_TOKEN` 与 `packages: write`，生产密钥不会暴露给 PR。
 # ==============================================================================
 
 name: Build & Push Image
@@ -51,7 +57,41 @@ env:
   PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
+  # ---- 质量门禁：不过就不发布镜像 ----
+  # 这里重复了 ci.yml 的步骤而不是复用 ci.yml：两个工作流的触发条件不同
+  # （本文件有 paths-ignore，ci.yml 没有），且发布门禁必须**自证**——
+  # 依赖另一个工作流的结论会引入"那个工作流被跳过/改名后门禁静默失效"的风险。
+  # 任何一边改了步骤，`server/tests/ciWorkflow.test.ts` 会把不一致打红。
+  quality:
+    name: 类型检查 · 单元测试 · 构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck（server + web）
+        run: npm run typecheck
+
+      - name: Unit tests（server + web）
+        run: npm test
+
+      - name: Production build（web + server）
+        run: npm run build
+
   build-and-push:
+    needs: quality
     runs-on: ubuntu-latest
     permissions:
       contents: read
