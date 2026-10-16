@@ -1224,9 +1224,10 @@ curl -s http://127.0.0.1:18899/api/health      # → status:ok
 
 ### 已知限制 / 后续
 
-1. **NAS 实际部署仍未执行（阻塞于访问方式）**：本机无 ssh config，NAS 的
-   2375/2376 未开放，因此无法取得 NAS 的 shell 或 Docker API。
-   已交付 `docker-compose.nas.yml` 与四步发现脚本，具备执行条件即可落地。
+1. **NAS 部署按用户决定暂缓（非技术阻塞）**：本机确实够不到 NAS（无 ssh config、
+   2375/2376 未开放），但用户在 2026-10-16 明确选择"暂不部署，先把镜像备好"。
+   镜像已多架构就绪并验证可拉取、可运行；`docker-compose.nas.yml` 与四步发现脚本均已交付，
+   待要部署时按 `08-operations.md` §3.2 执行即可，无前置条件缺失。
 2. `docker-compose.nas.yml` 里的默认路径（`/volume1`、tailscale 路径）是**占位值**，
    必须按发现脚本的实际结果修改；绿联 UGOS 的卷路径可能与群晖不同。
 3. 多架构构建耗时明显上升（QEMU 下 arm64 需重编 `better-sqlite3`），
