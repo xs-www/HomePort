@@ -1098,6 +1098,7 @@ docker buildx build --platform linux/arm64 -t homeport:arm64-preflight --load .
 # 2) 触发 CI 并观察
 git push origin master                      # run #1
 # → completed / success，耗时 5 分 48 秒，全部步骤（含 Log in / Build and push）通过
+# run #2（改 workflow 加 paths-ignore 后）同样 success，且有 gha 缓存后明显更快
 
 # 3) 匿名拉取（验证包可见性，未使用任何凭据）
 docker pull ghcr.io/xs-www/homeport:latest
