@@ -633,7 +633,16 @@ describe('BackgroundScheduler · 单飞与失败隔离', () => {
     errors: [],
   };
   const healthResult = { at: new Date(0).toISOString(), evaluated: 0, probed: 0, skippedForConcurrency: 0, failures: 0 };
-  const alertResult = { at: new Date(0).toISOString(), evaluated: 0, opened: 0, reopened: 0, resolved: 0, suppressed: 0 };
+  const alertResult = {
+    at: new Date(0).toISOString(),
+    evaluated: 0,
+    opened: 0,
+    reopened: 0,
+    resolved: 0,
+    suppressed: 0,
+    // 本用例只测调度器单飞，不关心告警明细；字段按 `AlertTickResult` 填全
+    suppressedByTarget: {},
+  };
 
   it('上一轮未结束时重入返回 skipped（不排队、不并发）', async () => {
     let release: () => void = () => {};

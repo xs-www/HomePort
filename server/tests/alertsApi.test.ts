@@ -562,7 +562,7 @@ describe('告警 API · GET /api/alerts/summary（§7）', () => {
     handle.db.prepare("DELETE FROM alert_events WHERE id LIKE 'ev-top-%'").run();
   });
 
-  it('composeAlertSummary：装了引擎就用引擎的真实计数（suppressed / evaluatedAt）', () => {
+  it('composeAlertSummary：装了引擎就用引擎的真实计数（suppressed / evaluatedAt），且 suppressed 按可见性求和', () => {
     const base: AlertSummaryView = {
       open: 1,
       unacknowledged: 1,
@@ -571,17 +571,32 @@ describe('告警 API · GET /api/alerts/summary（§7）', () => {
       top: [],
       evaluatedAt: null,
     };
-    const composed = composeAlertSummary(base, { lastTickAt: () => T0_ISO, suppressedTotal: () => 7 });
+    // 7 次压掉 = 宿主磁盘 5 次 + 某服务目标 2 次（后者要能被可见性剔掉）
+    const engine = {
+      lastTickAt: () => T0_ISO,
+      suppressedByTarget: () => new Map<string, number>([['disk:C:', 5], ['service:docker:gitea', 2]]),
+    };
+
+    const composed = composeAlertSummary(base, engine, new Set(['docker:gitea']));
     expect(composed.suppressed).toBe(7);
     expect(composed.evaluatedAt).toBe(T0_ISO);
     expect(composed.open).toBe(1);
 
+    // 目标不可见 / 注册表不可用（fail-closed）→ 只计宿主自有目标：
+    // 数字里留着隐藏目标的贡献，等于用"suppressed 在涨"承认它存在
+    expect(composeAlertSummary(base, engine, new Set()).suppressed).toBe(5);
+    expect(composeAlertSummary(base, engine, null).suppressed).toBe(5);
+
     // 引擎在但还没 tick 过 → evaluatedAt 退回服务层的值
-    expect(composeAlertSummary({ ...base, evaluatedAt: '2026-10-15T11:00:00.000Z' }, { lastTickAt: () => null, suppressedTotal: () => 0 }).evaluatedAt).toBe(
-      '2026-10-15T11:00:00.000Z',
-    );
+    expect(
+      composeAlertSummary(
+        { ...base, evaluatedAt: '2026-10-15T11:00:00.000Z' },
+        { lastTickAt: () => null, suppressedByTarget: () => new Map() },
+        null,
+      ).evaluatedAt,
+    ).toBe('2026-10-15T11:00:00.000Z');
     // 没引擎 → 原样返回
-    expect(composeAlertSummary(base, null)).toBe(base);
+    expect(composeAlertSummary(base, null, null)).toBe(base);
   });
 });
 

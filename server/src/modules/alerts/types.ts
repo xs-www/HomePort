@@ -230,6 +230,17 @@ export interface AlertTickResult {
   resolved: number;
   /** 因"同一 (rule,target) 已有未恢复 episode"而未产生新通知的触发次数。 */
   suppressed: number;
+  /**
+   * 本轮的 `suppressed` **按 target 拆开**（键 = `disk:<标签>` / `host` /
+   * `container:<ref>` / `service:<ref>`）。
+   *
+   * 为什么不能只给一个总数：读接口要按**当前可见性**求和 —— 隐藏/已删除的服务
+   * 对 `suppressed` 的贡献必须从 viewer 看到的数字里去掉，否则"这个数在涨"
+   * 本身就是"有个你看不见的东西在反复失败"的证据。一个总数没法归因，也就没法过滤。
+   *
+   * 这是**记账**，不是判定：哪些触发被压掉、episode 怎么开怎么恢复，一行都没变。
+   */
+  suppressedByTarget: Record<string, number>;
 }
 
 /* ------------------------------------------------------------------ *

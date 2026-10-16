@@ -356,8 +356,13 @@ export class AlertEngine {
   /** duration 计时（内存，重启即重新计时——规格明确接受）。 */
   private readonly pendingSince = new Map<string, number>();
   private lastTickAtValue: string | null = null;
-  /** 自进程启动以来被"已有未恢复行"压掉的触发次数（`summary().suppressed` 的来源）。 */
-  private suppressedTotalValue = 0;
+  /**
+   * 自进程启动以来被"已有未恢复行"压掉的触发次数，**按 target 记账**。
+   *
+   * 存明细而不是一个总数：读接口（`/api/alerts/summary`）要按**当前可见性**求和，
+   * 隐藏/已删除服务的贡献必须能被剔除（见 `AlertTickResult.suppressedByTarget`）。
+   */
+  private readonly suppressedByTargetValue = new Map<string, number>();
   private warnedMissingSnapshot = false;
 
   constructor(deps: AlertEngineDeps) {
@@ -371,9 +376,14 @@ export class AlertEngine {
     return this.lastTickAtValue;
   }
 
-  /** 累计被压掉的触发次数（`summary().suppressed`）。 */
-  suppressedTotal(): number {
-    return this.suppressedTotalValue;
+  /**
+   * 累计被压掉的触发次数**按 target 的明细**（只读快照）。
+   *
+   * 读路径必须用它而不是总数：一个没有归因的数字没法按可见性过滤。
+   * 返回新 Map，调用方改不动引擎内部状态。
+   */
+  suppressedByTarget(): ReadonlyMap<string, number> {
+    return new Map(this.suppressedByTargetValue);
   }
 
   /**
@@ -395,6 +405,8 @@ export class AlertEngine {
     let reopened = 0;
     let resolved = 0;
     let suppressed = 0;
+    /** 本轮按 target 的被压掉明细（与 `suppressed` 同源，见 `bumpSuppressed`）。 */
+    const suppressedThisTick: Record<string, number> = {};
 
     for (const rule of rules) {
       const outcome = evaluateRule(rule, snap, nowMs, this.pendingSince);
@@ -415,24 +427,47 @@ export class AlertEngine {
         const key = episodeKey(rule.id, candidate.target);
         if (openEpisodes.has(key)) {
           suppressed += 1;
+          this.bumpSuppressed(candidate.target, suppressedThisTick);
           continue;
         }
         const written = this.recordTrigger(rule, candidate, nowMs, at);
         if (written === 'opened') opened += 1;
         else if (written === 'reopened') reopened += 1;
-        else suppressed += 1;
+        else {
+          suppressed += 1;
+          this.bumpSuppressed(candidate.target, suppressedThisTick);
+        }
       }
     }
 
     this.lastTickAtValue = at;
-    this.suppressedTotalValue += suppressed;
-    const result: AlertTickResult = { at, evaluated, opened, reopened, resolved, suppressed };
+    const result: AlertTickResult = {
+      at,
+      evaluated,
+      opened,
+      reopened,
+      resolved,
+      suppressed,
+      // 按 target 拆开本轮被压掉的触发（读路径据此按可见性求和；判定语义一行没动）
+      suppressedByTarget: suppressedThisTick,
+    };
     try {
       this.deps.onTick?.(result);
     } catch (error) {
       this.log.warn('告警 tick 回调失败', { error });
     }
     return result;
+  }
+
+  /**
+   * 记一次"被压掉"：累计总数与按目标明细、以及**本轮**明细一起加。
+   *
+   * 明细的键就是 `AlertTickResult.suppressedByTarget` 的键（target 原文），
+   * 于是读路径能按 `disk:` / `host` / `container:` / `service:` 前缀做可见性判定。
+   */
+  private bumpSuppressed(target: string, thisTick: Record<string, number>): void {
+    this.suppressedByTargetValue.set(target, (this.suppressedByTargetValue.get(target) ?? 0) + 1);
+    thisTick[target] = (thisTick[target] ?? 0) + 1;
   }
 
   private async captureSnapshot(nowMs: number): Promise<AlertSnapshot> {

@@ -36,7 +36,7 @@ import type { PortalConfig } from '../../config.js';
 import type { Logger } from '../../logger.js';
 import type { AuditRepository } from '../../db/users.js';
 import { badRequest, notFound } from '../../http/errors.js';
-import { CONTAINER_TARGET_PREFIX, SERVICE_TARGET_PREFIX } from '../visibility/serviceVisibility.js';
+import { CONTAINER_TARGET_PREFIX, SERVICE_TARGET_PREFIX, serviceRefOfTarget } from '../visibility/serviceVisibility.js';
 import { mergeBuiltinRules, compareAlertRules, validateRulePatch } from './rules.js';
 import {
   toAlertEventView,
@@ -86,12 +86,110 @@ export interface AlertEventQuery {
  */
 export type AlertEventVisibility = ReadonlySet<string> | null;
 
+/** 磁盘 target 前缀（`disk:C:`）；与 `service:` / `container:` 一起构成读路径的 target 词汇表。 */
+const DISK_TARGET_PREFIX = 'disk:';
+
 /**
- * 宿主自有事件的判据：target 不属于任何服务（`host` / `disk:<标签>`）。
+ * **宿主自有** target：`host` / `disk:<标签>`。
  *
- * 用 target 前缀而不是 kind 做判据：**泄漏面由 target 决定**（名字就在 target/target_label 里），
- * 而 kind 只是"哪条规则触发的"。前缀写法上再叠一次 kind 校验（见下），
- * 于是"kind 说是磁盘、target 却指向服务"的手工脏行也落不进可见集合。
+ * 它们不属于任何服务，因此可见性过滤必须原样放过（事件、规则 target、suppressed 三处一致）。
+ * 判据是 target 前缀而不是 kind：**泄漏面由 target 决定**（名字就在 target / target_label 里）。
+ *
+ * **已知残留（本轮不修）**：本判据是**白名单**方向（"就是 `host` 或 `disk:` 才算宿主自有"），
+ * 于是空串 / 未知前缀（`weird:secret`）这类手工脏行落不进宿主自有 ⇒ 走可见性判定 ⇒ fail-closed 剔出。
+ * 而 SQL 形态 `HOST_OWNED_EVENT_SQL` 是**黑名单**方向（"不是服务类前缀就算宿主"），同一批脏行
+ * 在那里会被**当宿主放出**。两者都保守，但方向相反 —— 脏行在事件列表与 `suppressed` 计数上
+ * 因此可能不一致。要统一得先裁定"未知前缀到底算不算一个目标"，本轮不动，见那边的注释。
+ */
+export function isHostOwnedAlertTarget(target: string): boolean {
+  return target === 'host' || target.startsWith(DISK_TARGET_PREFIX);
+}
+
+/**
+ * 读路径上"这个 target 允不允许出现"的**唯一判据**（事件 / 规则 target / suppressed 共用）。
+ *
+ * - 宿主自有（`host` / `disk:<标签>`）→ 允许；
+ * - `service:<ref>` / `container:<ref>` → 必须命中**当前**可见集合；
+ * - 其它（空串、未知前缀、脏行）→ **不允许**（宁可少显示，也不泄露一行）；
+ * - `visible === null`（注册表读失败 / 装配缺依赖）→ 只允许宿主自有（fail-closed）。
+ */
+export function isAlertTargetVisible(target: string, visible: AlertEventVisibility): boolean {
+  if (isHostOwnedAlertTarget(target)) return true;
+  if (visible === null) return false;
+  const ref = serviceRefOfTarget(target);
+  return ref !== null && visible.has(ref);
+}
+
+/**
+ * 规则 `target` 的**读路径遮蔽**：不可见 → `null`。
+ *
+ * 为什么规则 target 也要遮蔽：它同样写着服务的稳定身份（`service:<sourceRef>` /
+ * `container:<sourceRef>`）。只按库里的行返回，viewer 就能拿 `/api/alerts/rules`
+ * 把被隐藏或已删除的服务**枚举**出来 —— 与事件快照是同一个泄漏面，只是载体不同。
+ *
+ * 为什么遮蔽成 `null` 而不是别的：HTTP 契约里 `target` 只有 `string | null`，
+ * `null` 是既有的"未限定目标"取值；**不能**引入第三种状态（如 `service:<hidden>`），
+ * 那等于直接承认"这里有一个你看不到的目标存在"。
+ *
+ * 与 `/events`、`/summary`、`/api/metrics/*` 同一口径：不分角色、读时求值、fail-closed。
+ *
+ * **但它的调用方（`rules()`）区分角色**：只有 viewer 的读会走这里（见 `AlertRuleReadOptions`）——
+ * 规则是**配置**、事件是**快照**，两者不是同一类东西，别把口径互相套用。
+ */
+export function maskRuleTarget(target: string | null, visible: AlertEventVisibility): string | null {
+  if (target === null) return null;
+  return isAlertTargetVisible(target, visible) ? target : null;
+}
+
+/**
+ * 规则读路径的口径开关（`rules()` 的第二个入参）——**必填，没有默认值**。
+ *
+ * 之所以不给默认值：这是"给谁看"的裁定，默认值等于让某个调用方**默认**走某一种口径，
+ * 而那正是"悄悄多显示一个服务"或"悄悄对 admin 说假话"的来源。每个调用点都必须表态。
+ */
+export interface AlertRuleReadOptions {
+  /**
+   * 是否按可见性遮蔽服务类 target（`service:` / `container:` → `null`）。
+   *
+   * - `true`（**viewer**）：必须遮蔽 —— 否则 viewer 靠规则列表就能枚举出隐藏/已删除的服务。
+   * - `false`（**admin**）：保留真值 —— 规则是 admin 自己写的配置，对作者本人遮蔽保护不了
+   *   任何东西，只会让界面说假话（见 `rules()` 的注释）；此时 `visible` 参数**完全不被读**。
+   */
+  maskServiceTargets: boolean;
+}
+
+/**
+ * 把"被压掉触发次数"的**按 target 明细**按可见性求和。
+ *
+ * 为什么必须按明细求和（而不是直接用总数）：`suppressed` 是 viewer 看得到的数字，
+ * 隐藏服务每次被压掉都让它涨一点 —— **数字本身就是在暴露"有个你看不见的东西在反复失败"**。
+ * 明细里的 `service:<ref>` / `container:<ref>` 只有命中当前可见集合才计入，
+ * 宿主自有（`disk:` / `host`）恒计入，`visible === null` 时只计宿主自有（fail-closed）。
+ *
+ * 非有限值与非正值直接跳过：宁可少报，也不让脏数据把数字撑起来。
+ */
+export function sumSuppressedVisible(
+  byTarget: Iterable<readonly [string, number]>,
+  visible: AlertEventVisibility,
+): number {
+  let total = 0;
+  for (const [target, count] of byTarget) {
+    if (!Number.isFinite(count) || count <= 0) continue;
+    if (isAlertTargetVisible(target, visible)) total += count;
+  }
+  return total;
+}
+
+/**
+ * 宿主自有事件的判据（SQL 形态）：target 不属于任何服务（`host` / `disk:<标签>`）。
+ *
+ * 与 `isHostOwnedAlertTarget` 是同一条规则的两种形态：这里是给 SQL 用的
+ * （"不是 `service:` / `container:` 前缀"），那里是给内存判据用的（"是 `host` 或 `disk:` 前缀"）。
+ *
+ * **二者方向相反，这是已知残留（本轮不修，详见 `isHostOwnedAlertTarget` 的注释）**：
+ * 本式是**黑名单**（"不是服务类前缀就算宿主"）⇒ 空串 / 未知前缀（`weird:secret`）这类脏行
+ * 会被**当宿主放出**；内存判据是**白名单** ⇒ 同样的行被 fail-closed 剔出。于是同一批脏行
+ * 在事件列表与 `suppressed` 计数上可能不一致。原注释曾写成"同一个方向"，与实现不符，按实修正。
  */
 const HOST_OWNED_EVENT_SQL = "(target NOT LIKE 'service:%' AND target NOT LIKE 'container:%')";
 
@@ -129,8 +227,14 @@ export class AlertsService {
   private readonly clock: () => number;
   /** 上次告警 tick 时间：由装配处通过 `recordTick` / `recordEvaluatedAt` 写入。 */
   private evaluatedAt: string | null = null;
-  /** 自进程启动以来被"已有未恢复行"压掉的触发次数（`summary().suppressed`）。 */
-  private suppressedTotal = 0;
+  /**
+   * 自进程启动以来被"已有未恢复行"压掉的触发次数，**按 target 记账**。
+   *
+   * 与引擎同形（见 `AlertEngine.suppressedByTarget`）：`summary().suppressed` 必须能按
+   * 当前可见性求和，所以这里也只保留明细。装配方接了引擎时读路径优先用引擎那份
+   * （见 `composeAlertSummary`），这份是"没接引擎"时的退化来源。
+   */
+  private readonly suppressedByTarget = new Map<string, number>();
 
   constructor(deps: AlertsServiceDeps) {
     this.deps = deps;
@@ -185,11 +289,35 @@ export class AlertsService {
     return missing.length;
   }
 
-  /** 全部规则（内置在前，按 kind 顺序）。未调用 `ensureBuiltinRules()` 时可以是空数组。 */
-  rules(): AlertRuleView[] {
-    return this.listRuleRows()
+  /**
+   * 全部规则（内置在前，按 kind 顺序）。未调用 `ensureBuiltinRules()` 时可以是空数组。
+   *
+   * **服务类 `target` 只对 viewer 遮蔽**（`options.maskServiceTargets` → `maskRuleTarget`）：
+   * `service:<ref>` / `container:<ref>` 指向隐藏或已删除的服务时返回 `null`，否则 viewer
+   * 读一次规则列表就能把看不见的服务**枚举**出来 —— 与事件快照是同一个泄漏面。
+   *
+   * **为什么 admin 保留真值（本仓唯一区分角色的读路径）**：规则是 admin 自己写的**配置**
+   * （`PATCH /rules/:id` 的入参），对**作者本人**遮蔽保护不了任何东西，只会让界面说假话
+   * —— `web/src/components/AlertRuleForm.tsx` 把空 target 渲染成"· 适用于全部目标"，
+   * 隐藏服务的定向规则会对 admin 显示成"适用全部目标"。该端点本身就是 admin 可 PATCH /
+   * viewer 只读，角色分支与端点自身语义一致。
+   *
+   * 与**事件/快照**类读路径的区别（别互相套用）：`/events`、`/summary`、`/api/metrics/*`
+   * 返回的是"触发时落库的快照"，对谁都只给当前可见的那几条 ⇒ 那三处**不分角色**
+   * （见 `api/alerts.ts` 文件头注释）。配置与快照是两类东西，口径不同是有意的。
+   *
+   * 响应形状一个字都没变（仍是 13 个字段，`target` 仍是 `string | null`）；
+   * 宿主类 target（`disk:` / `host`）与 `null` 在两种角色下都原样返回。
+   *
+   * @param visible 当前可见服务集合（`null` = 读失败 → fail-closed，只放行宿主类 target）
+   * @param options `maskServiceTargets: false`（admin）时**完全不读 `visible`**，也不遮蔽
+   */
+  rules(visible: AlertEventVisibility, options: AlertRuleReadOptions): AlertRuleView[] {
+    const rows = this.listRuleRows()
       .sort(compareAlertRules)
       .map(toAlertRuleView);
+    if (!options.maskServiceTargets) return rows;
+    return rows.map((rule) => ({ ...rule, target: maskRuleTarget(rule.target, visible) }));
   }
 
   /**
@@ -197,6 +325,10 @@ export class AlertsService {
    *
    * 校验在**落库之前**完成：非法值直接 `VALIDATION_FAILED`，什么都不写
    * （不静默截断 —— 被悄悄改小的阈值比报错危险得多）。
+   *
+   * 返回的视图**不做 target 遮蔽**（写路径，与 `rules(visible, options)` 的读路径不同）：
+   * 入参就是调用方自己提交的配置，把"你刚写的 target"回显成 null 只会让人以为没保存上；
+   * 且这条路径要求 admin + CSRF，而 admin 经管理接口（`includeHidden`）本来就能看隐藏服务。
    */
   updateRule(id: string, patch: AlertRulePatch, actor: string): AlertRuleView {
     const row = this.ruleById(id);
@@ -324,6 +456,11 @@ export class AlertsService {
    * 四个计数（`open` / `unacknowledged` / `bySeverity` / `top`）**全部**按当前可见性过滤：
    * 只过滤 `top` 而留着计数，等于用数字告诉 viewer "有一条你看不见的未恢复告警"。
    *
+   * `suppressed` **同样按可见性求和**（`sumSuppressedVisible`）：它虽然不指名字，
+   * 但"这个数在涨"就说明有个目标在反复失败 —— 隐藏服务的贡献留在里面
+   * 等于换了一种方式泄漏存在性。装配方接了引擎时由 `composeAlertSummary` 用引擎的
+   * 明细覆盖本值（一个数只有一个来源），没接引擎时才用这里的退化值。
+   *
    * @param visible 当前可见服务集合（`null` = 读失败 → fail-closed）
    */
   summary(visible: AlertEventVisibility): AlertSummaryView {
@@ -356,7 +493,8 @@ export class AlertsService {
     return {
       open: counts.open,
       unacknowledged: counts.unacknowledged,
-      suppressed: this.suppressedTotal,
+      // 按目标明细 + 当前可见性求和（见方法注释：数字涨落本身也是存在性信号）
+      suppressed: sumSuppressedVisible(this.suppressedByTarget, visible),
       bySeverity: { warning: Number(bySeverity.warning ?? 0), critical: Number(bySeverity.critical ?? 0) },
       top: top.map((row) => ({
         id: row.id,
@@ -369,12 +507,27 @@ export class AlertsService {
     };
   }
 
-  /** 装配处（或引擎 `onTick`）记录一次 tick 结果，供 `summary()` 使用。 */
-  recordTick(result: { at: string; suppressed: number }): void {
+  /**
+   * 装配处（或引擎 `onTick`）记录一次 tick 结果，供 `summary()` 使用。
+   *
+   * 累计的是**按 target 的明细**（`result.suppressedByTarget`），不是一个总数：
+   * 读路径要按当前可见性求和，只有明细才能把隐藏/已删除服务的贡献剔出去。
+   *
+   * 形参**刻意不收** `suppressed` 总数（引擎的 `AlertTickResult` 里虽然有，但这里不读）：
+   * 收一个不参与记账的数，只会让调用方以为"传总数也行"，而那正是**静默丢计数**
+   * （数字看着在动，viewer 的 `suppressed` 却纹丝不动）。只认明细，且**必填** ——
+   * 没有归因的增量宁可一条都不入账，也不能让无主的数字混进 viewer 看到的 `suppressed`
+   * （那等于换一种方式承认"有个你看不见的东西在反复失败"）。
+   * 只想记评估时间、不涉及计数时用 `recordEvaluatedAt()`。
+   */
+  recordTick(result: { at: string; suppressedByTarget: Record<string, number> }): void {
     this.evaluatedAt = result.at;
     // 累计而不是"上次的值"：徽标旁边的解释是"共压掉 N 次"，
     // 只报上一轮的话，绝大多数时刻都会显示 0，等于没有信息。
-    this.suppressedTotal += Number.isFinite(result.suppressed) ? result.suppressed : 0;
+    for (const [target, count] of Object.entries(result.suppressedByTarget)) {
+      if (!Number.isFinite(count) || count <= 0) continue;
+      this.suppressedByTarget.set(target, (this.suppressedByTarget.get(target) ?? 0) + count);
+    }
   }
 
   /** 只记录评估时间（不需要 suppressed 时的轻量入口）。 */

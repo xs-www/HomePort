@@ -32,6 +32,12 @@
  * （`visibility.test.ts` 里对 metrics 的行为就是这样钉住的：
  * "admin 会话同样看不到"。要"看全部"请走 `includeHidden` 的管理接口，读路径不开特例）。
  *
+ * **这条 `不分角色` 只管事件/快照类读路径**（`/events`、`/summary`、`/api/metrics/*`）：
+ * 它们返回的是"触发时落库的快照"，对谁都只能给当前可见的那几条。
+ * `/rules` 是**配置**类接口（admin 写的、admin 可 PATCH），它**区分角色**：viewer 的服务类
+ * `target` 遮蔽成 `null`，admin 保留真值（理由见 `/rules` handler 的注释）。配置与快照是
+ * 两类东西，口径不同是有意的 —— 不要拿这一处的角色分支去推翻那三处的 `不分角色`。
+ *
  * 校验 schema 写在本文件而不是 `http/schemas.ts`：那是既有共享文件（本轮不许改），
  * 且这里的规则校验真正的主场在 `modules/alerts/rules.ts`（`validateRulePatch`），
  * zod 只负责"形状 + 边界"。
@@ -44,6 +50,7 @@ import { idParamSchema, parseOrThrow } from '../http/schemas.js';
 import { backgroundHostRequest } from '../modules/docker/backgroundContext.js';
 import type { HealthMonitorView } from '../modules/health/types.js';
 import type { AlertsService, AlertEventVisibility } from '../modules/alerts/service.js';
+import { sumSuppressedVisible } from '../modules/alerts/service.js';
 import type { AlertRuleListResponse, AlertRulePatch, AlertSummaryView } from '../modules/alerts/types.js';
 import { loadVisibleServiceRefs, type ServiceVisibilityRegistry } from '../modules/visibility/serviceVisibility.js';
 
@@ -67,15 +74,27 @@ export interface AlertRoutesContext {
 }
 
 /**
+ * 告警域的"状态透出"入口（引擎的最小依赖面）。
+ *
+ * `evaluatedAt` 与 `suppressed` 的真相在引擎里（只有它每轮 tick 才知道压掉了几次、
+ * 上次评估在什么时候）。这里要的是**按 target 的明细**而不是一个总数：
+ * 总数没法按可见性过滤，隐藏服务的贡献会混进 viewer 看到的数字（见 `sumSuppressedVisible`）。
+ */
+export interface AlertSummaryEngine {
+  lastTickAt(): string | null;
+  suppressedByTarget(): ReadonlyMap<string, number>;
+}
+
+/**
  * 告警域的路由依赖（**由本模块定义形状**，装配方只负责把对象传进来）。
  *
- * `engine` / `scheduler` 是可选的"状态透出"入口：`summary().evaluatedAt` 与
- * `suppressed` 的真实来源是引擎（它才知道"这一轮压掉了几次"）；没有引擎时
- * 退化为 `AlertsService` 自己记录的值（装配期没人调 `recordTick` 时就是 0/null）。
+ * `engine` / `scheduler` 是可选的"状态透出"入口；没有引擎时 `suppressed` /
+ * `evaluatedAt` 退化为 `AlertsService` 自己记录的值（装配期没人调 `recordTick` 时就是 0/null），
+ * 那一份同样是按 target 记账并按可见性求和的，不会因为"没接引擎"就漏。
  */
 export interface AlertRouteDeps {
   alerts: AlertsService;
-  engine?: { lastTickAt(): string | null; suppressedTotal(): number } | null;
+  engine?: AlertSummaryEngine | null;
   /** 后台调度器：当前不读它的字段，仅接受装配方传入（透出后台状态由 /api/metrics 负责）。 */
   scheduler?: unknown;
   /**
@@ -147,13 +166,24 @@ async function loadAlertsVisibility(ctx: AlertRoutesContext): Promise<AlertEvent
  * 为什么需要合成：`suppressed` 与 `evaluatedAt` 的真相在引擎里（只有它每轮 tick
  * 才知道压掉了几次、上次评估在什么时候），而其余计数在数据库里（服务层查得到）。
  * 装配方传了引擎就用引擎的值 —— 不做 `Math.max` 之类的"折中"，一个数只能有一个来源。
+ *
+ * `suppressed` **必须按当前可见性求和**（`sumSuppressedVisible`）：它是一个 viewer
+ * 看得到的数字，"隐藏服务的贡献留在里面"等于用数字承认"有个你看不见的东西在反复失败"。
+ * 因此这里收的是引擎的**按 target 明细**，而不是一个总数 —— 总数无法归因，也就无法过滤。
+ *
+ * @param visible 当前可见服务集合（`null` = 读失败 → fail-closed，只计宿主自有目标）
  */
 export function composeAlertSummary(
   summary: AlertSummaryView,
-  engine: { lastTickAt(): string | null; suppressedTotal(): number } | null | undefined,
+  engine: AlertSummaryEngine | null | undefined,
+  visible: AlertEventVisibility,
 ): AlertSummaryView {
   if (!engine) return summary;
-  return { ...summary, suppressed: engine.suppressedTotal(), evaluatedAt: engine.lastTickAt() ?? summary.evaluatedAt };
+  return {
+    ...summary,
+    suppressed: sumSuppressedVisible(engine.suppressedByTarget(), visible),
+    evaluatedAt: engine.lastTickAt() ?? summary.evaluatedAt,
+  };
 }
 
 export function registerAlertRoutes(app: FastifyInstance, ctx: AlertRoutesContext, deps: AlertRouteDeps): void {
@@ -164,19 +194,42 @@ export function registerAlertRoutes(app: FastifyInstance, ctx: AlertRoutesContex
   /**
    * 规则列表：四条内置 + 当前配置（未启用也返回，`enabled` 字段说明状态）。
    *
-   * **不做可见性过滤**（与本轮收口的 `/events`、`/summary` 不同）：`rule.target` 是
-   * **管理员自己写的配置**（`PATCH /rules/:id` 的入参，按 kind 校验过前缀），
-   * 不是"发现出来的服务名"；把它按可见性抹成 null 会让 viewer 看到一份与
-   * 实际规则不一致的配置（"这条规则到底盯的是什么"会说不清）。这是刻意的边界，
-   * 不是漏改 —— 本轮的泄漏面是**触发时落库的事件快照**。
+   * **服务类 `target` 只对 viewer 遮蔽**（`AlertsService.rules(visible, { maskServiceTargets })`
+   * → `maskRuleTarget`）：`rule.target` 里写的是服务的稳定身份（`service:<ref>` /
+   * `container:<ref>`），只按库里的行返回，viewer 就能靠规则列表把被隐藏或已删除的服务
+   * **枚举**出来 —— 与事件快照是同一个泄漏面，只是载体从事件行换成了规则配置行。
+   *
+   * **为什么 admin 保留真值（本仓唯一区分角色的读路径）**：规则是 admin 自己写的**配置**
+   * （`PATCH /rules/:id` 的入参），对**作者本人**遮蔽保护不了任何东西，只会让界面说假话
+   * —— `web/src/components/AlertRuleForm.tsx` 把空 target 渲染成"· 适用于全部目标"，
+   * 隐藏服务的定向规则会对 admin 显示成"适用全部目标"。本端点本身就是 admin 可 PATCH /
+   * viewer 只读，角色分支与端点自身语义一致，因此**不需要改 web/**。
+   * （`/events`、`/summary`、`/api/metrics/*` 的 `不分角色` 是**事件/快照**口径，见文件头；
+   * 规则是配置，不适用 —— 两者不要互相套用。）
+   *
+   * 遮蔽成 `null`（契约里既有的"未限定目标"取值），**不引入第三种状态**：
+   * `service:<hidden>` 之类等于直接承认"这里有一个你看不到的目标存在"。
+   * 宿主类 target（`disk:<标签>` / `host`）与 null 在两种角色下都原样返回；
+   * 响应形状（13 个字段）不变。读时求值，viewer 侧注册表读失败 fail-closed。
    */
   app.get('/rules', async (request) => {
-    requireAuth(request);
-    const response: AlertRuleListResponse = { items: deps.alerts.rules() };
+    const session = requireAuth(request);
+    // 只有 viewer 的读需要可见集合：admin 那条路径**根本不读** `visible`（见 `rules()`），
+    // 所以这里也不去查注册表 —— 免得 admin 的请求白付一次 `registry.list`，
+    // 还因为注册表偶发不可用而记一条与他无关的 warn。
+    const maskServiceTargets = session.user.role !== 'admin';
+    const visible = maskServiceTargets ? await loadAlertsVisibility(ctx) : null;
+    const response: AlertRuleListResponse = { items: deps.alerts.rules(visible, { maskServiceTargets }) };
     return response;
   });
 
-  /** 部分更新规则（admin）。非法阈值 → 400，未知规则 → 404。 */
+  /**
+   * 部分更新规则（admin）。非法阈值 → 400，未知规则 → 404。
+   *
+   * 响应里的 `target` **不遮蔽**：这是写路径，回显的是调用方自己提交/保存的配置
+   * （把"你刚写的 target"变成 null 只会让人以为没保存上），且要求 admin + CSRF，
+   * 而 admin 经管理接口（`includeHidden`）本来就能看到隐藏服务。
+   */
   app.patch('/rules/:id', async (request) => {
     const session = requireAuth(request);
     ctx.users.assertAdmin(session.user);
@@ -208,11 +261,13 @@ export function registerAlertRoutes(app: FastifyInstance, ctx: AlertRoutesContex
   /**
    * 徽标用摘要（含 `suppressed` 与 `evaluatedAt`）。
    *
-   * 这两个字段优先取引擎的真实值（见 `composeAlertSummary`）；其余计数在服务层
-   * 按**当前可见性**统计（`open` / `unacknowledged` / `bySeverity` / `top` 一致过滤）。
+   * 这两个字段优先取引擎的真实值（见 `composeAlertSummary`），并**按当前可见性求和**；
+   * 其余计数在服务层同样按**当前可见性**统计
+   * （`open` / `unacknowledged` / `bySeverity` / `top` / `suppressed` 一致过滤）。
    */
   app.get('/summary', async (request) => {
     requireAuth(request);
-    return composeAlertSummary(deps.alerts.summary(await loadAlertsVisibility(ctx)), deps.engine);
+    const visible = await loadAlertsVisibility(ctx);
+    return composeAlertSummary(deps.alerts.summary(visible), deps.engine, visible);
   });
 }

@@ -40,19 +40,24 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp, type AppHandle } from '../src/app.js';
 import { loadConfig, type PortalConfig } from '../src/config.js';
 import { createSilentLogger } from '../src/logger.js';
-import { alertEventVisibilityWhere, type AlertEventVisibility } from '../src/modules/alerts/service.js';
-import type { AlertEventListResponse, AlertSummaryView } from '../src/modules/alerts/types.js';
+import { maskRuleTarget, sumSuppressedVisible, alertEventVisibilityWhere, type AlertEventVisibility } from '../src/modules/alerts/service.js';
+import type { AlertEventListResponse, AlertRuleView, AlertSummaryView } from '../src/modules/alerts/types.js';
+import type { SystemSnapshot } from '../src/modules/system/types.js';
 import { loadVisibleServiceRefs } from '../src/modules/visibility/serviceVisibility.js';
 
 const SETUP_TOKEN = 'ALERT-VISIBILITY-SETUP-TOKEN';
 const ADMIN_PASSWORD = 'AlertVisAdmin2026!';
 const VIEWER_PASSWORD = 'AlertVisViewer2026!';
 
-/** 名字刻意独一无二：对整段 JSON 做 `not.toContain` 才有判别力。 */
+/** 服务名刻意独一无二：对整段 JSON 做 `not.toContain` 才有判别力。 */
 const SERVICE_NAME = '绝密告警服务-Zx9-不得泄漏';
 const CONTAINER_LABEL = '绝密容器-Q3-不得泄漏';
 const GHOST_LABEL = '幽灵服务-不得泄漏';
 const DISK_LABEL = 'C:';
+/** 第二组夹具：专门用来把 suppressed 压出非零值、并把规则 target 指向它。 */
+const SUPPRESSED_NAME = '被压掉的绝密服务-Sx4-不得泄漏';
+/** 第三组夹具：只用来验规则 target 的遮蔽（隐藏/删除/fail-closed）。 */
+const RULE_TARGET_NAME = '规则目标绝密服务-Rt6-不得泄漏';
 
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'homeport-alerts-visibility-'));
 
@@ -557,5 +562,367 @@ describe('共享可见性实现 · 纯函数边界', () => {
       source: 'test',
     });
     expect(failed).toBeNull();
+  });
+
+  it('maskRuleTarget / sumSuppressedVisible：宿主自有放行，服务类按可见集合，未知前缀 fail-closed', () => {
+    const visible = new Set(['docker:gitea']);
+
+    // 宿主自有（磁盘/内存）与"未限定目标"原样放行
+    expect(maskRuleTarget('disk:C:', visible)).toBe('disk:C:');
+    expect(maskRuleTarget('host', visible)).toBe('host');
+    expect(maskRuleTarget(null, visible)).toBeNull();
+    // 服务类：可见 → 原样；不可见 / 空集合 / 注册表不可用（fail-closed）→ null
+    expect(maskRuleTarget('service:docker:gitea', visible)).toBe('service:docker:gitea');
+    expect(maskRuleTarget('container:docker:gitea', visible)).toBe('container:docker:gitea');
+    expect(maskRuleTarget('service:docker:secret', visible)).toBeNull();
+    expect(maskRuleTarget('service:docker:gitea', new Set())).toBeNull();
+    expect(maskRuleTarget('service:docker:gitea', null)).toBeNull();
+    // 未知前缀（手工脏行）不是"宿主自有"，同样遮蔽：宁可少显示，也不泄露一行
+    expect(maskRuleTarget('weird:secret', visible)).toBeNull();
+
+    const byTarget: Array<readonly [string, number]> = [['disk:C:', 2], ['host', 1], ['service:docker:gitea', 3], ['service:docker:secret', 5]];
+    expect(sumSuppressedVisible(byTarget, visible)).toBe(6);
+    expect(sumSuppressedVisible(byTarget, new Set())).toBe(3);
+    expect(sumSuppressedVisible(byTarget, null)).toBe(3);
+    // 非有限值 / 非正值不入账
+    expect(sumSuppressedVisible([['disk:C:', Number.NaN], ['disk:C:', -1], ['disk:C:', 2]], visible)).toBe(2);
+  });
+});
+
+/* ==================================================================== *
+ * 复审驳回的两项 P1（同一组收口，2026-10 追加）
+ *
+ * 1. `suppressed` 不能只报一个"全局总数"：隐藏/删除的服务每被压掉一次都会让它涨，
+ *    数字本身就成了存在性证据。要求：非零夹具 + 隐藏/删除/fail-closed 全覆盖。
+ * 2. `rule.target` 里同样写着服务的稳定身份，viewer 读一次规则列表就能枚举隐藏服务。
+ *
+ * 这一组刻意走**真实调度器**（`handle.scheduler.tickOnce`）：suppressed 的唯一来源是
+ * 引擎的记账，手工调 `recordTick` 只能测个空壳。
+ * ==================================================================== */
+
+/** 固定的 unix 秒刻度（不依赖墙钟；只用于 duration/silence 比较）。 */
+const TICK_1 = 1_700_006_000;
+const TICK_2 = TICK_1 + 60;
+const TICK_3 = TICK_2 + 60;
+const FIXTURE_ISO = '2026-10-15T00:00:00.000Z';
+
+/** 假宿主读数：内存百分比可控，用来让 `memory_percent` 规则稳定触发（它是宿主自有目标）。 */
+function fakeSystemSnapshot(memoryPercent: number): SystemSnapshot {
+  return {
+    generatedAt: FIXTURE_ISO,
+    host: {
+      hostname: 'nas',
+      platform: 'linux',
+      kernel: '6.1.0',
+      arch: 'x64',
+      cpuModel: 'test',
+      cpuCores: 4,
+      uptimeSec: 1000,
+      bootedAt: FIXTURE_ISO,
+      osLabel: 'Linux',
+      hostIsLinux: true,
+    },
+    cpu: { percent: 41.5, perCore: [], loadAvg: [0, 0, 0] },
+    memory: {
+      usedBytes: 8_589_934_592,
+      totalBytes: 17_179_869_184,
+      availableBytes: 8_589_934_592,
+      percent: memoryPercent,
+      cachedBytes: 0,
+      swapUsedBytes: 0,
+      swapTotalBytes: 0,
+    },
+    // 不提供磁盘读数：本组只靠内存（宿主自有）与服务（服务类）两个来源区分贡献
+    disks: [],
+    gpu: null,
+    sources: {
+      cpu: { available: true, mode: 'host-proc', detail: null },
+      memory: { available: true, mode: 'host-proc', detail: null },
+      disk: { available: false, mode: 'none', detail: '测试夹具：不提供磁盘读数' },
+      gpu: { available: false, mode: 'none', detail: null },
+    },
+  };
+}
+
+async function createService(displayName: string, healthTarget?: string): Promise<{ id: string; sourceRef: string }> {
+  const response = await inject({
+    method: 'POST',
+    url: '/api/services',
+    cookie: admin.cookie,
+    csrf: admin.csrf,
+    body: healthTarget === undefined ? { displayName } : { displayName, healthTarget },
+  });
+  expect(response.statusCode, response.body).toBe(201);
+  const created = response.json() as { id: string; sourceRef: string };
+  return created;
+}
+
+async function setVisibilityOf(id: string, visibility: 'visible' | 'hidden'): Promise<void> {
+  const response = await inject({
+    method: 'PATCH',
+    url: `/api/services/${id}`,
+    cookie: admin.cookie,
+    csrf: admin.csrf,
+    body: { visibility },
+  });
+  expect(response.statusCode, response.body).toBe(200);
+  expect((response.json() as { visibility?: string }).visibility).toBe(visibility);
+}
+
+/** 手工服务是**真删**（自动服务才是改 hidden）：覆盖"已删除"这一条可见性判据。 */
+async function deleteService(id: string): Promise<void> {
+  const response = await inject({ method: 'DELETE', url: `/api/services/${id}`, cookie: admin.cookie, csrf: admin.csrf });
+  expect(response.statusCode, response.body).toBe(200);
+  expect((response.json() as { mode?: string }).mode).toBe('deleted');
+}
+
+async function patchRule(id: string, patch: Record<string, unknown>): Promise<void> {
+  const response = await inject({
+    method: 'PATCH',
+    url: `/api/alerts/rules/${id}`,
+    cookie: admin.cookie,
+    csrf: admin.csrf,
+    body: patch,
+  });
+  expect(response.statusCode, response.body).toBe(200);
+}
+
+async function getRules(client: Client): Promise<{ statusCode: number; body: string }> {
+  const response = await inject({ method: 'GET', url: '/api/alerts/rules', cookie: client.cookie });
+  return { statusCode: response.statusCode, body: response.body };
+}
+
+function rulesOf(body: string): AlertRuleView[] {
+  return (JSON.parse(body) as { items: AlertRuleView[] }).items;
+}
+
+function ruleOf(items: AlertRuleView[], id: string): AlertRuleView {
+  const found = items.find((rule) => rule.id === id);
+  if (!found) throw new Error(`规则 ${id} 不在响应里`);
+  return found;
+}
+
+/** 把注册表读路径打成"抛错"，验证 fail-closed（`try/finally` 里必须还原）。 */
+function breakRegistry(): () => void {
+  const original = handle.ctx.services.list.bind(handle.ctx.services);
+  handle.ctx.services.list = async () => {
+    throw new Error('registry down（测试夹具）');
+  };
+  return () => {
+    handle.ctx.services.list = original;
+  };
+}
+
+describe('告警读接口 · suppressed 按可见性求和（非零夹具 + 隐藏/删除/fail-closed）', () => {
+  let suppressedServiceId: string;
+  let suppressedRef: string;
+  let restoredSnapshot: typeof handle.ctx.system.snapshot;
+
+  beforeAll(async () => {
+    // 一个会探测失败的服务（回环关闭端口：探通与否都失败）+ 两条规则显式打开
+    const created = await createService(SUPPRESSED_NAME, 'http://127.0.0.1:1/');
+    suppressedServiceId = created.id;
+    suppressedRef = created.sourceRef;
+
+    // 宿主自有来源：内存 95% 让 memory_percent 规则触发（默认关闭，这里显式打开）
+    restoredSnapshot = handle.ctx.system.snapshot;
+    handle.ctx.system.snapshot = async () => fakeSystemSnapshot(95);
+    await patchRule('rule-memory-percent', { enabled: true, threshold: 1, durationSec: 0 });
+    await patchRule('rule-service-health', { enabled: true, threshold: 1, durationSec: 0 });
+
+    // 第一轮：两条规则各开一个 episode（宿主内存 + 该服务）
+    await handle.scheduler.tickOnce(TICK_1);
+    // 第二轮：两条都已有未恢复行 → 各被压掉 1 次（这才是 suppressed 的唯一来源）
+    await handle.scheduler.tickOnce(TICK_2);
+  });
+
+  afterAll(() => {
+    handle.ctx.system.snapshot = restoredSnapshot;
+  });
+
+  it('夹具自检：压掉次数非零，且按 target 归因正确（宿主 1 + 该服务 1）', async () => {
+    const last = handle.scheduler.lastSummary()?.alerts;
+    expect(last?.suppressed).toBe(2);
+    expect(last?.suppressedByTarget).toEqual({ host: 1, [`service:${suppressedRef}`]: 1 });
+
+    const body = (await getSummary(viewer)).body;
+    // 判别力前提：数字必须非零，否则"按可见性求和"这件事根本测不到（0 怎么过滤都是 0）
+    expect(summaryOf(body).suppressed).toBe(2);
+    expect(body).toContain(`"suppressed":2`);
+    expect(summaryOf((await getSummary(admin)).body).suppressed).toBe(2);
+  });
+
+  it('隐藏后：该服务的贡献从数字里消失（宿主贡献留着，数字不是被清零）', async () => {
+    await setVisibilityOf(suppressedServiceId, 'hidden');
+
+    const body = (await getSummary(viewer)).body;
+    expect(summaryOf(body).suppressed).toBe(1);
+    expect(body).not.toContain(SUPPRESSED_NAME);
+    expect(body).not.toContain(suppressedRef);
+    // 同一口径：admin 与 viewer 拿到同一个数字（与 /events、/summary、/api/metrics/* 一致）
+    expect(summaryOf((await getSummary(admin)).body).suppressed).toBe(1);
+
+    // 隐藏不改写历史：事件行仍在库里、仍是"未恢复"（引擎不假恢复）
+    const row = handle.db.prepare('SELECT resolved_at FROM alert_events WHERE target = ?').get(`service:${suppressedRef}`) as
+      | { resolved_at: string | null }
+      | undefined;
+    expect(row).toBeTruthy();
+    expect(row?.resolved_at).toBeNull();
+  });
+
+  it('隐藏之后继续 tick：隐藏目标一次都不再计入（累计值仍等于宿主贡献）', async () => {
+    await handle.scheduler.tickOnce(TICK_3);
+
+    // 本轮只有宿主内存被压掉：隐藏目标既没被评估、更没进任何数字
+    const last = handle.scheduler.lastSummary()?.alerts;
+    expect(last?.suppressed).toBe(1);
+    expect(last?.suppressedByTarget).toEqual({ host: 1 });
+    // 累计：宿主 2 次 + 该服务 1 次（后者必须被剔除）
+    expect(summaryOf((await getSummary(viewer)).body).suppressed).toBe(2);
+  });
+
+  it('恢复可见后：同一个数字原样回来（宿主 2 + 该服务 1）', async () => {
+    await setVisibilityOf(suppressedServiceId, 'visible');
+    expect(summaryOf((await getSummary(viewer)).body).suppressed).toBe(3);
+  });
+
+  it('删除后：贡献再次消失（删除与隐藏走同一条可见性判据）', async () => {
+    await deleteService(suppressedServiceId);
+
+    const body = (await getSummary(viewer)).body;
+    expect(summaryOf(body).suppressed).toBe(2);
+    expect(body).not.toContain(SUPPRESSED_NAME);
+    expect(body).not.toContain(suppressedRef);
+  });
+
+  it('注册表读失败：suppressed fail-closed（只计宿主自有目标，服务类一律剔除）', async () => {
+    const restore = breakRegistry();
+    try {
+      const body = (await getSummary(viewer)).body;
+      expect(summaryOf(body).suppressed).toBe(2);
+    } finally {
+      restore();
+    }
+    // 还原后仍是 2（该服务已删，宿主贡献 2 是稳定值）
+    expect(summaryOf((await getSummary(viewer)).body).suppressed).toBe(2);
+  });
+});
+
+describe('告警读接口 · 规则 target 对 viewer 遮蔽 / 对 admin 保留真值（隐藏/删除/fail-closed）', () => {
+  let targetServiceId: string;
+  let targetRef: string;
+
+  beforeAll(async () => {
+    const created = await createService(RULE_TARGET_NAME);
+    targetServiceId = created.id;
+    targetRef = created.sourceRef;
+
+    // 四条内置规则各挂一个 target：两条服务类（要遮蔽）+ 两条宿主类（不受影响）
+    await patchRule('rule-service-health', { target: `service:${targetRef}` });
+    await patchRule('rule-container-exit', { target: `container:${targetRef}` });
+    await patchRule('rule-disk-percent', { target: `disk:${DISK_LABEL}` });
+    await patchRule('rule-memory-percent', { target: 'host' });
+  });
+
+  it('可见时：服务/容器类 target 原样返回，宿主类不受影响，形状仍是冻结的 13 字段', async () => {
+    const response = await getRules(viewer);
+    expect(response.statusCode, response.body).toBe(200);
+    const items = rulesOf(response.body);
+
+    expect(items).toHaveLength(4);
+    expect(Object.keys(ruleOf(items, 'rule-service-health')).sort()).toEqual([
+      'builtin',
+      'description',
+      'durationSec',
+      'enabled',
+      'id',
+      'kind',
+      'name',
+      'notifyRecovery',
+      'severity',
+      'silenceSec',
+      'target',
+      'threshold',
+      'updatedAt',
+    ]);
+    expect(ruleOf(items, 'rule-service-health').target).toBe(`service:${targetRef}`);
+    expect(ruleOf(items, 'rule-container-exit').target).toBe(`container:${targetRef}`);
+    expect(ruleOf(items, 'rule-disk-percent').target).toBe(`disk:${DISK_LABEL}`);
+    expect(ruleOf(items, 'rule-memory-percent').target).toBe('host');
+    expect(response.body).toContain(targetRef);
+  });
+
+  it('隐藏后：服务/容器类 target 变成 null（不是占位符），整段 JSON 里没有它的名字与身份', async () => {
+    await setVisibilityOf(targetServiceId, 'hidden');
+
+    const response = await getRules(viewer);
+    const items = rulesOf(response.body);
+    expect(ruleOf(items, 'rule-service-health').target).toBeNull();
+    expect(ruleOf(items, 'rule-container-exit').target).toBeNull();
+    // 宿主自有目标与可见性无关：照常返回
+    expect(ruleOf(items, 'rule-disk-percent').target).toBe(`disk:${DISK_LABEL}`);
+    expect(ruleOf(items, 'rule-memory-percent').target).toBe('host');
+    expect(response.body).not.toContain(targetRef);
+    expect(response.body).not.toContain(RULE_TARGET_NAME);
+
+    // admin 保留真值：规则是 admin 自己写的**配置**，对作者本人遮蔽保护不了任何东西，
+    // 只会让界面说假话（`AlertRuleForm` 把空 target 渲染成"· 适用于全部目标"）。
+    // 配置类接口区分角色，与 `/events`、`/summary`、`/api/metrics/*` 的"不分角色"
+    // 是两套口径（见 `api/alerts.ts` 文件头）。
+    const adminBody = (await getRules(admin)).body;
+    expect(ruleOf(rulesOf(adminBody), 'rule-service-health').target).toBe(`service:${targetRef}`);
+    expect(ruleOf(rulesOf(adminBody), 'rule-container-exit').target).toBe(`container:${targetRef}`);
+    expect(adminBody).toContain(targetRef);
+  });
+
+  it('注册表读失败：fail-closed（服务类 target 一律 null，宿主类照常）', async () => {
+    const restore = breakRegistry();
+    try {
+      const response = await getRules(viewer);
+      expect(response.statusCode, response.body).toBe(200);
+      const items = rulesOf(response.body);
+      expect(ruleOf(items, 'rule-service-health').target).toBeNull();
+      expect(ruleOf(items, 'rule-container-exit').target).toBeNull();
+      expect(ruleOf(items, 'rule-disk-percent').target).toBe(`disk:${DISK_LABEL}`);
+      expect(ruleOf(items, 'rule-memory-percent').target).toBe('host');
+      expect(response.body).not.toContain(targetRef);
+
+      // admin 的读**根本不看可见集合** ⇒ 注册表挂了也不影响他。
+      // 这不是 fail-open，而是那条路径压根不读这份数据（角色分支在路由层就分开了）。
+      const adminItems = rulesOf((await getRules(admin)).body);
+      expect(ruleOf(adminItems, 'rule-service-health').target).toBe(`service:${targetRef}`);
+      expect(ruleOf(adminItems, 'rule-container-exit').target).toBe(`container:${targetRef}`);
+    } finally {
+      restore();
+    }
+  });
+
+  it('恢复可见后：target 原样回来（遮蔽是读时求值，没动库里的配置）', async () => {
+    await setVisibilityOf(targetServiceId, 'visible');
+
+    const items = rulesOf((await getRules(viewer)).body);
+    expect(ruleOf(items, 'rule-service-health').target).toBe(`service:${targetRef}`);
+    expect(ruleOf(items, 'rule-container-exit').target).toBe(`container:${targetRef}`);
+
+    // 库里的行从来没被改写：读路径遮蔽不是"把配置清空"
+    const stored = handle.db.prepare('SELECT target FROM alert_rules WHERE id = ?').get('rule-service-health') as { target: string | null };
+    expect(stored.target).toBe(`service:${targetRef}`);
+  });
+
+  it('删除后：target 再次遮蔽（已删除的服务不能靠规则配置被枚举出来）', async () => {
+    await deleteService(targetServiceId);
+
+    const response = await getRules(viewer);
+    const items = rulesOf(response.body);
+    expect(ruleOf(items, 'rule-service-health').target).toBeNull();
+    expect(ruleOf(items, 'rule-container-exit').target).toBeNull();
+    expect(ruleOf(items, 'rule-disk-percent').target).toBe(`disk:${DISK_LABEL}`);
+    expect(response.body).not.toContain(targetRef);
+    expect(response.body).not.toContain(RULE_TARGET_NAME);
+
+    // 服务被真删之后 admin 仍见真值：他读的是**自己写的配置**，不是"当前可发现的服务"
+    const adminItems = rulesOf((await getRules(admin)).body);
+    expect(ruleOf(adminItems, 'rule-service-health').target).toBe(`service:${targetRef}`);
+    expect(ruleOf(adminItems, 'rule-container-exit').target).toBe(`container:${targetRef}`);
   });
 });

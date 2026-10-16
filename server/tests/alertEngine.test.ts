@@ -803,16 +803,21 @@ describe('告警业务出口 · ensureBuiltinRules（§5.3）', () => {
   it('第一次补齐四条、第二次返回 0（幂等）', () => {
     const { db } = initDatabase({ file: ':memory:' });
     const service = new AlertsService({ db, audit: new AuditRepository(db), logger: createSilentLogger(), clock: () => T0 });
+    // `rules(visible, { maskServiceTargets })` 的两个入参只影响 `service:` / `container:`
+    // 类的 target 遮蔽；内置四条规则的 target 都是 null，所以这里传"空可见集合 + viewer 口径"
+    // 不影响本用例的任何断言（角色分支本身由 `alertsVisibility.test.ts` 的 API 用例钉住）。
+    const noVisibleServices = new Set<string>();
+    const viewerRead = { maskServiceTargets: true };
 
-    expect(service.rules()).toEqual([]); // 迁移只建结构，不塞业务数据
+    expect(service.rules(noVisibleServices, viewerRead)).toEqual([]); // 迁移只建结构，不塞业务数据
     expect(service.ensureBuiltinRules(T0_ISO)).toBe(4);
-    const afterFirst = service.rules();
+    const afterFirst = service.rules(noVisibleServices, viewerRead);
     expect(afterFirst).toHaveLength(4);
     expect(afterFirst.every((rule) => rule.enabled === false && rule.builtin)).toBe(true);
 
     expect(service.ensureBuiltinRules(T0_ISO)).toBe(0);
-    expect(service.rules()).toHaveLength(4);
-    expect(service.rules().map((rule) => rule.id)).toEqual(afterFirst.map((rule) => rule.id));
+    expect(service.rules(noVisibleServices, viewerRead)).toHaveLength(4);
+    expect(service.rules(noVisibleServices, viewerRead).map((rule) => rule.id)).toEqual(afterFirst.map((rule) => rule.id));
     db.close();
   });
 });
