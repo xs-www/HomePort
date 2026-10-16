@@ -3,10 +3,13 @@
  * 管理员、用户、设置（含已加密的敏感项）必须无损，且能正常登录。
  *
  * 做法是"真实回落"而不是造一个假库：
- *   1. 用当前代码建一个**文件库**（v3），写入管理员 / viewer / 一条普通设置 / 一条敏感设置；
- *   2. 用 SQLite 把库**退回 v2 形态** —— 删掉 v3 新增的 4 个列与 2 张表，
- *      并删除 `schema_migrations` 里 version=3 的记录；
- *   3. 用当前代码**重新启动**同一个文件库 → v3 迁移自动重放。
+ *   1. 用当前代码建一个**文件库**（当前版本），写入管理员 / viewer / 一条普通设置 / 一条敏感设置；
+ *   2. 用 SQLite 把库**退回 v2 形态** —— 删掉 v3 新增的 4 个列与 2 张表、
+ *      删掉 v4 新增的 3 张表，并删除 `schema_migrations` 里 version 3 与 4 的记录；
+ *   3. 用当前代码**重新启动**同一个文件库 → v3（以及后续版本）迁移自动重放。
+ *
+ * 注意：**v4 及其之后的版本也会一起重放**，因此这里断言的是"迁移链整体前滚"，
+ * 而不是"库里只有 v3"。v3 的专有断言（TOTP 列/表可用）仍然逐条保留。
  *
  * 这样测的是「升级时真实发生的事」：迁移在**已有数据**上重放、密钥文件被复用、
  * 加密的敏感值仍能读出。比"新建空库跑一遍迁移"强得多。
@@ -19,6 +22,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp, type AppHandle } from '../src/app.js';
 import { loadConfig, type PortalConfig } from '../src/config.js';
+import { MIGRATIONS } from '../src/db/database.js';
 import { createSilentLogger } from '../src/logger.js';
 import { createSecretBox, loadOrCreateKey } from '../src/modules/settings/secretBox.js';
 
@@ -127,7 +131,7 @@ beforeAll(async () => {
 
   await before.close();
 
-  // ---- 阶段 2：把库退回 v2 形态 ----
+  // ---- 阶段 2：把库退回 v2 形态（同时抹掉 v4 引入的服务注册表，让整条迁移链重放）----
   const raw = new Database(DB_PATH);
   const tables = raw
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'totp_%'")
@@ -141,7 +145,10 @@ beforeAll(async () => {
     ALTER TABLE users DROP COLUMN totp_last_counter;
     DROP TABLE totp_recovery_codes;
     DROP TABLE totp_challenges;
-    DELETE FROM schema_migrations WHERE version = 3;
+    DROP TABLE service_bindings;
+    DROP TABLE services;
+    DROP TABLE service_preferences;
+    DELETE FROM schema_migrations WHERE version IN (3, 4);
   `);
   const applied = raw.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number };
   expect(applied.v).toBe(2); // 确认已退回 v2
@@ -166,7 +173,7 @@ describe('迁移 v3 · 既有部署升级后无损', () => {
   let app: FastifyInstance;
 
   beforeAll(async () => {
-    // ---- 阶段 3：重新启动同一个库，v3 迁移重放 ----
+    // ---- 阶段 3：重新启动同一个库，v3 迁移重放（后续版本的迁移一并前滚）----
     handle = await startApp();
     app = handle.app;
   });
@@ -177,8 +184,11 @@ describe('迁移 v3 · 既有部署升级后无损', () => {
 
   it('迁移在已有数据上重放成功，v3 的列与表都回来了', () => {
     const raw = new Database(DB_PATH, { readonly: true });
+    // 最高版本是**当前迁移链的末端**（v4 = services_registry），
+    // 这里不再硬编码 3：v3 的存在由下面的列/表断言保证。
     const maxVersion = raw.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number };
-    expect(maxVersion.v).toBe(3);
+    expect(maxVersion.v).toBe(Math.max(...MIGRATIONS.map((migration) => migration.version)));
+    expect(maxVersion.v).toBeGreaterThanOrEqual(3);
 
     const columns = raw.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
     const names = columns.map((column) => column.name);
