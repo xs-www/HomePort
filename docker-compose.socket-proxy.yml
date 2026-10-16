@@ -1,0 +1,97 @@
+# ==============================================================================
+# HomePort（母港）— **可选**的「只读 Docker socket 代理」覆盖文件（Sprint 0 · S0-04）
+#
+#   docker compose -f docker-compose.yml -f docker-compose.socket-proxy.yml up -d --build
+#
+# 为什么需要它
+# ------------
+# 默认 compose 把宿主的 docker.sock 以 `:ro` 挂进容器。但 `:ro` 只是**挂载层面**的
+# 只读：Docker 的 HTTP API 完全看不到挂载选项，容器内的进程依然可以对 socket 发
+# `POST /containers/{id}/stop` 这类**写请求**。也就是说，`:ro` 挡得住"改写 socket 文件"，
+# 挡不住"通过 socket 指挥 Docker 守护进程"。
+#
+# 真正的最小权限做法是：门户不再直连 socket，而是连一个**只放行读取接口**的代理。
+# 本文件就是那个代理（HAProxy 实现，逐接口开关）。
+#
+# 效果与代价
+# ----------
+# - 门户照常 list / inspect / logs / stats / info；
+# - 任何写操作（POST / DELETE / EXEC / BUILD / SECRETS …）在代理层被拒，与门户代码
+#   是否有漏洞无关 —— 这是**结构性**保证，比"代码里只调只读方法"更硬；
+# - 代价：多一个约 20MB 的容器、每次 Docker API 调用多一跳 HTTP（同 compose 网络内，<1ms）。
+#
+# 放行清单是**按代码实际用到的接口**列的（见 server/src/modules/docker/provider.ts）：
+#   GET /version、GET /info、GET /containers/json、GET /containers/{id}/json、
+#   GET /containers/{id}/logs、GET /containers/{id}/stats
+# 因此只开 CONTAINERS / INFO / VERSION / PING。以后门户要展示镜像、网络或卷的**额外**
+# 信息时，再把对应开关置 1（例如 `IMAGES: 1`、`NETWORKS: 1`），不要图省事全开。
+#
+# 注意：`tecnativa/docker-socket-proxy` 的开关名与 Docker API 分组一一对应，
+# 未列出的分组默认就是**关闭**（拒绝），所以下面显式写 0 的项只是"写清楚意图"。
+# ==============================================================================
+
+services:
+  docker-socket-proxy:
+    # 多架构镜像（amd64 / arm64 / armv7 / 386 / ppc64le / s390x），已核对 manifest，
+    # NAS 常见的 arm64 可直接用。
+    # 实测校验过的 digest（2026-10 拉取）：
+    #   tecnativa/docker-socket-proxy@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
+    # 追求可复现部署时把下面这行换成上面的 @sha256 形式（多架构仍然生效）。
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: homeport-docker-proxy
+    restart: unless-stopped
+
+    environment:
+      # ---- 唯一放行的读接口 ----
+      CONTAINERS: 1   # /containers/json、/containers/{id}/json|logs|stats
+      INFO: 1         # /info（概览页的容器数、Docker 版本）
+      VERSION: 1      # /version（门户用它做连通性探活）
+      PING: 1         # /_ping（健康检查用）
+
+      # ---- 显式关闭的写接口（门户从不调用）----
+      POST: 0         # 所有写操作的总开关（stop/start/rm/create/exec…）
+      EXEC: 0         # docker exec
+      BUILD: 0        # 构建镜像
+      COMMIT: 0
+      AUTH: 0         # 认证配置（改 registry 凭据）
+
+      # ---- 显式关闭的**读**接口（门户目前用不到）----
+      IMAGES: 0       # 门户只从 /containers/json 取镜像名，不需要 /images/*
+      NETWORKS: 0     # 网络信息从 inspect 的 NetworkSettings 里拿
+      VOLUMES: 0      # 挂载信息从 inspect 的 Mounts 里拿
+      EVENTS: 0       # 门户用轮询而不是事件流
+
+      SECRETS: 0      # swarm secrets
+      CONFIGS: 0      # swarm configs
+      SERVICES: 0     # swarm services
+      NODES: 0        # swarm nodes
+      TASKS: 0
+      SWARM: 0
+      PLUGINS: 0      # 插件安装/卸载
+      SYSTEM: 0       # /system/* 管理端点
+      DISTRIBUTION: 0 # push/pull 镜像
+
+    volumes:
+      # 代理进程自己需要访问 socket；这里依然加 :ro 做纵深防御
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
+
+    # 刻意**不 publish** 到宿主端口：2375 只在 compose 网络内可见，
+    # 由门户容器通过服务名访问。发布出去等于把 Docker API 摆到局域网上。
+    expose:
+      - "2375"
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  homeport:
+    environment:
+      # 门户改走代理；其余配置与默认 compose 完全一致
+      DOCKER_ENDPOINT: "tcp://docker-socket-proxy:2375"
+    depends_on:
+      - docker-socket-proxy
