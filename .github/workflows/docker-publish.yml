@@ -7,13 +7,14 @@
 #   - sha-<短> （每次提交，便于回滚到具体版本）
 #   - v1.2.3   （打 tag 时，配合 semver）
 #
-# 为什么只构建 linux/arm64：目标部署机是 NAS（family-nas）。
-# 需要 amd64 时把下面的 PLATFORMS 改成 linux/amd64,linux/arm64 即可。
+# 同时构建 linux/amd64 与 linux/arm64，产出多架构 manifest list，
+# 使 x86 主机与 NAS（family-nas）拉同一个标签即可各取所需架构。
 #
 # 为什么关掉 provenance / sbom：
 #   这两项会产出 attestation manifest。较老的 Docker（如 NAS 上的 20.10，
 #   containerd 镜像存储未启用）拉取时会报 "no match for platform in manifest"。
-#   本镜像的消费方正是这类设备，故默认关闭；如需溯源可改为 true。
+#   多架构 manifest list 本身没问题，但**必须**保持 attestation 关闭，
+#   否则较老 Docker 依旧会挑不中平台。本镜像的消费方正是这类设备，故关闭。
 # ==============================================================================
 
 name: Build & Push Image
@@ -44,8 +45,8 @@ env:
   # 因此不能直接用 ${{ github.repository }}（会得到 xs-www/HomePort 而报
   # "repository name must be lowercase"）。
   IMAGE_NAME: ${{ github.repository_owner }}/homeport
-  # 目标架构。多架构写成 linux/amd64,linux/arm64
-  PLATFORMS: linux/arm64
+  # 目标架构。只出单架构时写 linux/arm64 或 linux/amd64 可显著缩短构建时间。
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   build-and-push:
