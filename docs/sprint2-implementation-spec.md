@@ -712,3 +712,18 @@ E2E 里 `buildApp` 走 `backgroundJobs: false`（或 E2E 服务端显式开启�
 `07-data-model.md`（迁移 v5 逐列）、`02-configuration.md`（6 个新键）、
 `05-web-modules.md`（新页面/组件/纯函数）、`08-operations.md`（采集开销、库增长、
 告警运维）、`todo.md`，以及 `IMPLEMENTATION_REPORT_S2.md`。
+
+## 13. 本规格与实现的措辞差异（归档时逐条核实，**以代码与 `docs/static/03` 为准**）
+
+冻结契约的价值在于"说清意图"，但下面几处**措辞**与最终实现不一致。逐条核实后记录在此，
+避免后来者拿规格当逐字真相：
+
+| 规格原文 | 实现事实 |
+| --- | --- |
+| §1.1 "一小时的 tick 只产生 2 次批量写" | **算错了**：真实是 60 次 flush + 1 次整点 rollup = **61 次/小时**（另每小时 1 次保留清理）。见 §1.1 的勘误块；可证判据是"写事务数与 tick 密度无关（1861）" |
+| §3 `clock?: () => number; // 默认 Date.now` | 默认时钟是 **unix 秒**（`Math.floor(Date.now()/1000)`），全链路秒制；`TickSummary` 的三步结果实现为 `\| null`（未执行/失败），不是恒非空 |
+| §3.1 `MetricsSampler` 依赖清单 | 漏列 **`health`**（实现必需，服务健康序列来自它）；实现另提供 `lastTick / availableTargets / resolveTarget / history / catalog / storage` |
+| §4.2 "`intervalSec` / `concurrency` 默认读 config" | 实现默认是**常量 300 / 4**，真实配置由 `app.ts` **注入闭包**读取（这样设置页改了下一轮即生效） |
+| §7 错误码只列 3 个 | 代码还会返回 `CSRF_MISMATCH`(403，缺/错 CSRF) 与 `UPSTREAM_UNAVAILABLE`(503，监视器未装配)；`limit` 越界在 HTTP 层是 **400**（服务层 `normalizeLimit()` 只是兜底） |
+| §9 示例 `new AlertsService({ db, audit })` | 实际依赖还含 `config` / `logger`（不影响契约） |
+| "`unknown` 不清零也不推进" | **只在服务级成立**（三维全 unknown 才保留计数）；**维度级**是 `state === 'fail' ? 续计 : 0`，某维失败后转 unknown 会让该维计数归零。另：**单个**容器 `state` 读不出来被判为容器维 **fail**（未知状态不能当作 running） |
