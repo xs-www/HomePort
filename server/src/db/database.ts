@@ -147,6 +147,80 @@ export const MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 4,
+    name: 'services_registry',
+    up: (db) => {
+      // 服务注册表：把「容器/端口/serve 路由」这层基础设施事实，提升为用户看到的「服务」。
+      //
+      // 设计要点（对应 Sprint 1 的 S1-01/S1-02/S1-05）：
+      //
+      // 1. **稳定身份**：`(source_type, source_ref)` 唯一，且 `source_ref` **不含容器 ID**
+      //    （用 Compose 项目/服务名或规范化容器名）。容器被重建、ID 变化时仍复用同一行，
+      //    用户改过的名称/图标/顺序/收藏因此不会丢。
+      // 2. **自动发现不得覆盖用户**：用户改过的展示属性靠 `user_edited` 标记，发现过程只写
+      //    自动字段（见 modules/services/registry.ts）。
+      // 3. **`service_bindings` 只是快照**：每次发现**重建**，可丢可重算，只用于展示与诊断。
+      //    候选入口、可达性、运行态、健康结果一律实时计算，不落库 —— 落库就会变成"缓存住的谎话"。
+      // 4. **`service_preferences`** 存单例偏好（视图模式等），不含任何权限敏感内容。
+      db.exec(`
+        CREATE TABLE services (
+          id            TEXT PRIMARY KEY,
+          slug          TEXT NOT NULL UNIQUE,
+          display_name  TEXT NOT NULL,
+          description   TEXT,
+          icon          TEXT,
+          category      TEXT,
+          preferred_url TEXT,
+          source_type   TEXT NOT NULL,
+          source_ref    TEXT NOT NULL,
+          binding_refs  TEXT NOT NULL DEFAULT '[]',
+          visibility    TEXT NOT NULL DEFAULT 'visible',
+          sort_order    INTEGER NOT NULL DEFAULT 100,
+          favorite      INTEGER NOT NULL DEFAULT 0,
+          health_target TEXT,
+          health_path   TEXT,
+          user_edited   INTEGER NOT NULL DEFAULT 0,
+          created_at    TEXT NOT NULL,
+          updated_at    TEXT NOT NULL,
+          updated_by    TEXT,
+          UNIQUE (source_type, source_ref)
+        );
+
+        CREATE TABLE service_bindings (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          service_id      TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+          kind            TEXT NOT NULL,
+          ref             TEXT NOT NULL,
+          container_id    TEXT,
+          container_name  TEXT,
+          compose_project TEXT,
+          compose_service TEXT,
+          scheme          TEXT,
+          host            TEXT,
+          port            INTEGER,
+          path            TEXT,
+          url             TEXT,
+          reachability    TEXT,
+          accessible      INTEGER NOT NULL DEFAULT 0,
+          rank            INTEGER NOT NULL DEFAULT 100,
+          created_at      TEXT NOT NULL,
+          updated_at      TEXT NOT NULL,
+          UNIQUE (service_id, kind, ref)
+        );
+        CREATE INDEX idx_service_bindings_service ON service_bindings(service_id);
+
+        CREATE TABLE service_preferences (
+          key        TEXT PRIMARY KEY,
+          value      TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX idx_services_sort ON services(visibility, sort_order, display_name);
+        CREATE INDEX idx_services_source ON services(source_type, source_ref);
+      `);
+    },
+  },
 ];
 
 export interface OpenDbOptions {
