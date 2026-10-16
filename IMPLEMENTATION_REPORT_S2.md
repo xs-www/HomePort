@@ -21,6 +21,7 @@ Sprint 2 解决两个具体缺口：**只有瞬时值、看不到历史**，以�
 | 附 | 顺带修掉两个真缺陷：设置分组漏声明（设置页少 6 个键）、`ContainerSummary` 未映射退出码（"容器异常退出"规则名不副实） | `settings/service.ts`、`docker/{types,mapper}.ts` | ✅ |
 | 附 | **规格勘误**：§1.1 我写的"每小时只 2 次批量写"是错的（真实 61 次/小时），已改正并换成机器可证判据 | `docs/sprint2-implementation-spec.md` | ✅ |
 | 附 | **验收驳回后修复三个 P1**（隐藏服务经监控/历史接口泄漏 ×2、服务端测试依赖墙钟）：可见性在**读取侧**也被强制、`state(ref)` 对不可见 ref 返回 `null`、两条装配线改用固定 epoch + 假数据源。见 §2.8 | `health/monitor.ts`、`metrics/sampler.ts`、`api/metrics.ts`、3 个测试文件 + 2 个新测试文件 | ✅ |
+| 附 | **归档自查发现的同类第三处：告警读接口**（`/api/alerts/events`、`/summary` 泄漏触发时快照与计数）→ 已收口；抽出共享 `modules/visibility/serviceVisibility.ts`，metrics 与 alerts 调同一组函数，过滤落在 SQL 层。见 §2.8 第 4 条 | `modules/visibility/serviceVisibility.ts`、`alerts/service.ts`、`api/alerts.ts`、1 个新测试文件 | ✅ |
 
 **没有新增任何依赖**（后端未引入通知/HTTP 客户端库，前端未引入图表库 —— 折线图是手写 SVG）。
 
@@ -138,13 +139,17 @@ Sprint 2 解决两个具体缺口：**只有瞬时值、看不到历史**，以�
 重启最多丢 59 分钟、1h 视图在整点前恒为空 —— 与"24h 每分钟 1 条""重启后历史保留"直接冲突。
 重启数据损失上界因此是 **1 个采样间隔**。
 
-### 2.8 验收驳回后的修复：三个 P1（本轮）
+### 2.8 验收驳回后的修复：三个 P1（+ 归档自查发现的同类第三处）
 
 Sprint 2 提交后，用户**手工复现真实场景**驳回了三个 P1。三条同属一类：
 **"看得见什么"只做了一半就被当成做完了** —— 采集侧固定 viewer 视角看着安全，
 但**读侧**与**清理路径**各留一个缺口；而测试因为把"跑测试的真实时刻"当输入，
 既挡不住缺口、自己还会时红时绿。逐项记录（现象 / 根因 / 修法 / 验证证据），
-逐项明细另见 `09-changelog.md` 最后一条。
+逐项明细另见 `09-changelog.md`。
+
+> **本节后续追加了第 4 条**：归档时自查发现**同类泄漏的第三处**（告警读接口）。
+> 它不是用户驳回项，形状却与前两条同源（又是"读侧少了一半"），因此一并收口 ——
+> 见下文"同类第三处"。
 
 #### P1-1 健康监视器把已隐藏的服务状态与**服务名**永久留在内存
 
@@ -219,6 +224,64 @@ Sprint 2 提交后，用户**手工复现真实场景**驳回了三个 P1。三�
   ③§6.1 的证据台账是**本轮之前**的，已补本轮的实测命令与结果（5 文件 / 59 用例）；
   ④§6.2 新增"用户复现驳回项的收口"三行；⑤§7 新增风险 8–12。
 
+#### 同类第三处：告警读接口泄漏触发时快照与计数（归档自查发现，已收口）
+
+- **现象**：把服务隐藏（或删除）之后，viewer 仍能在 `GET /api/alerts/events` 读到它的
+  `target` / `targetLabel` / `message`（服务名、容器名），并能在 `GET /api/alerts/summary`
+  看到"还有 N 条未恢复" —— 隐藏前触发的事件是**触发时落库的快照**，不随可见性变化。
+- **根因**：与 P1-2 同源（读侧没有可见性输入），但泄漏物不同 —— 不是"库里曾经有过的行"，
+  而是**写进事件行里的名字**；而且**计数本身就是存在性证据**（"未恢复从 3 掉到 2"
+  等于告诉 viewer 少了一条什么）。`events()` / `summary()` 原先直接按库里的行读。
+- **修法**：
+  1. **抽出唯一实现** `modules/visibility/serviceVisibility.ts`（`loadVisibleServiceRefs` /
+     `serviceRefOfTarget` / `isServiceTargetVisible` + `SERVICE_TARGET_PREFIX` /
+     `CONTAINER_TARGET_PREFIX`）；`MetricsSampler.visibleServiceRefs()` / `targetVisible()`
+     改为委托（行为逐字未变），告警与指标**调同一组函数**；`api/alerts.ts`
+     **刻意不实例化 `MetricsSampler`**（避免运行时耦合）。
+  2. **过滤落在 SQL 层**：`alertEventVisibilityWhere(visible)` 产出条件 + 位置参数
+     （`null` / 空集合 → 只放行宿主自有事件；有集合 → `宿主 OR (kind = 'service_health' AND
+     target IN (…service:…)) OR (kind = 'container_exit' AND target IN (…container:…))`，
+     前缀与 `kind` 双重校验，脏行落不进可见集合）；`eventWhere(state, visible)` 保证
+     **可见性条件总是在**，不存在"忘了加"的写法。
+  3. **`items` 先过滤再 `LIMIT`**：否则首页会被不可见事件占位，出现"看得见的事件反而翻不到"。
+  4. **计数一起过滤**：`total` / `counts` / `bySeverity` / `top` 全部只统计可见集合。
+  5. **fail-closed 两处**：注册表读失败（共享函数返回 `null`）与装配缺 `config` / `services`
+     （单独挂载路由文件时的测试场景）都按"服务/容器类事件一律不可见"处理，
+     宿主类（`host` / `disk:*`）照常；读接口**不因此变 5xx**，只记一条 warn。
+  6. **admin 沿用 metrics 已定口径**：路由无角色分支、可见集合固定 `role: 'viewer'` ——
+     admin 也看不到可见集合外的事件。
+- **有意保留的引擎语义**（源码注释写明，不要"顺手修"）：隐藏**不会**让未恢复事件假恢复
+  （`resolved_at` / `reopen_count` / duration 门控全不变）："库里仍未恢复、viewer 看不见"
+  是有意的组合语义；恢复可见后同一事件原样回来（行没被删）。运维含义：
+  **读响应里的未恢复列表 ≠ 库里的故障全集**。
+- **两个判别力实验（修复方实测，本次归档未复跑；临时代码已撤除并 grep 确认无残留）**：
+  完全不过滤 → 新文件 15 例中 **12 红**；**仅 `counts` 不过滤 → 9 红**
+  （后者正是"计数也是证据"的可区分性证明 —— 只修列表的版本过不了）。
+- **验证证据**：新增 `alertsVisibility.test.ts` **15 条**，全走 `buildApp()` + `app.inject()`
+  真实路由 / 鉴权 / SQLite：隐藏前 → 隐藏（整段 JSON 无泄漏串、四项计数一起下降、
+  `limit` 与 `state` 只在可见集合内生效、admin 同样看不到、库里的行与 `resolved_at` 未变）
+  → 恢复可见（原样回来）→ fail-closed（必抛桩，宿主事件照常，还原后恢复原样）
+  + 两条纯函数边界。`alertsApi.test.ts` **只调夹具**（补一行可见服务、`/api/alerts-unwired`
+  传真实 `handle.ctx`），**未削弱或删除任何既有断言**。
+  **归档时独立复跑**：`alertsApi` 27 + `alertsVisibility` 15 + `alertEngine` 36
+  = **3 文件 / 78 例全绿**（2026-10-16 23:34）；修复方另称 server 全量 **34 文件 / 631 例**全绿
+  （本次归档**未复跑**）。
+- **未收口 / 待裁定（照实记，不要写成已修）**：
+  ① `GET /api/alerts/rules` 的 `rule.target` —— 是**管理员自己写的规则配置**（不是触发快照），
+  按可见性抹成 `null` 会让 viewer 看到一份与实际规则不一致的配置；
+  ② `POST /api/alerts/events/:id/ack` 的**响应体** —— admin 写路径，入参是随机 UUID 的事件 ID。
+  另有一条**残留观察**：`summary` 的 `suppressed` / `evaluatedAt` 取自引擎、**不参与可见性过滤**
+  （"本轮压掉 N 次触发"仍是全量数字：不含名字、不指向具体服务，但严格说是极弱旁路信号）。
+- **被本轮更正的三处既有表述**：①本文档 §7-9 与 §8 原来把告警读接口列为"仍未收口"，
+  现已改写为"读响应已收口 + 两处待裁定"；②§7-11 原来写"`visibleServiceRefs()` 的
+  fail-closed 分支没有单测"，现在**已有覆盖**（告警真实路由的必抛桩用例 + 共享函数的
+  纯函数边界用例），但**metrics 路由级**仍没有专门断言 —— 照实记；
+  ③**归档核对代码时发现的一处既有口径不精确**（不是代码缺陷）：文档原写
+  "采集侧固定 viewer → 隐藏后不再产生新样本"，实际只覆盖**服务健康**序列；
+  `container.*` 序列仍按 `containers.list()` 照采（容器列表不看服务可见性），
+  容器类指标的隐藏**完全靠读取侧兜住**。已在 `04-api-contract.md` §6.7 / §6.9 与
+  `06-security.md` §3 就地澄清。
+
 ---
 
 ## 3. 数据库迁移 v5（升级前必读）
@@ -282,6 +345,12 @@ WAL 模式下必须用 `VACUUM INTO` 做一致性导出，或停容器后整卷�
 测试里分别断言，不能混为一谈)、`RATE_LIMITED`(429)；
 健康监视器未装配时返回 `UPSTREAM_UNAVAILABLE`(503)，而**不是**伪装成"没有服务"的空数组。
 
+> **同类第三处的收口不在这张表里**：它**没有新增接口、没有新增错误码、没有字段改名**，
+> 只收紧 `GET /api/alerts/events` 与 `GET /api/alerts/summary` 的**语义**
+> （只统计当前可见集合，`limit` 改为作用在过滤之后）—— 见 §2.8 第 4 条与
+> `04-api-contract.md` §6.9。`GET /api/alerts/rules` 的 `rule.target` 与
+> `POST /api/alerts/events/:id/ack` 的响应体仍是**待裁定**的例外。
+
 ### 4.3 后台模块的"无出站能力"是**可执行约束**
 
 `server/tests/backgroundBoundary.test.ts` 扫描 `modules/metrics|health|alerts` 与 `backgroundContext.ts`，
@@ -294,8 +363,12 @@ WAL 模式下必须用 `VACUUM INTO` 做一致性导出，或停容器后整卷�
 > 历史接口泄漏。" —— **前半句成立，后半句当时并不成立**：采集侧固定 viewer 只保证
 > "隐藏之后不再产生新样本"，**隐藏之前**已落库的行与内存 `liveTargets` 仍带着服务名，
 > 读接口照样列出与查询（这正是被驳回的 P1-2）。现在这句话才真正成立，
-> 而且落点在**两处**：采集侧（既有）+ **读取侧**（本轮新增，`MetricsSampler.visibleServiceRefs()`
-> 与 `HealthMonitor` 的 `visibleRefs` / `isVisible()`）。见 §2.8 与 `06-security.md` §3 的不变量表。
+> 而且落点在**三处**：采集侧（既有）+ **读取侧**（P1-2 修复：`MetricsSampler.visibleServiceRefs()`
+> 与 `HealthMonitor` 的 `visibleRefs` / `isVisible()`）+ **告警读取侧**（同类第三处：
+> `/api/alerts/events` 与 `/summary` 在 SQL 层过滤，见 §2.8 第 4 条）。
+> 后两处的可见性读取**共用同一份实现** `modules/visibility/serviceVisibility.ts`
+> （P1-2 时还只是 `MetricsSampler` 的私有方法，第三处修完才抽出来）。
+> 见 §2.8 与 `06-security.md` §3 的不变量表。
 
 ---
 
@@ -348,6 +421,17 @@ npx vitest run tests/clockBoundary.test.ts tests/healthMonitor.test.ts \
 # 注：全库 npm test / typecheck / E2E 由父任务在提交前统一跑，本报告不据此宣称
 ```
 
+**归档自查发现同类第三处后的新增证据（2026-10-16 23:34，本次归档独立复跑）**：
+
+```
+npx vitest run tests/alertsApi.test.ts tests/alertsVisibility.test.ts \
+  tests/alertEngine.test.ts --root server
+# → Test Files 3 passed (3)；Tests 78 passed (78)
+#   alertsApi 27 / alertsVisibility 15（新）/ alertEngine 36
+# 判别力（修复方实测，本次归档未复跑）：完全不过滤 → 新文件 15 例中 12 红；仅 counts 不过滤 → 9 红
+# 全库 npm test（34 文件 / 631 用例）与 typecheck/build/E2E 来自提交信息 `871c3dc`，本次未复跑
+```
+
 E2E 新增覆盖：历史页导航 + 空历史**不画 0 线** + 存储/保留配置真的通到接口 +
 四条内置规则默认关闭（用同源 API 断言真实值，不信界面渲染）+ 告警页 viewer 只读
 （带**有效 CSRF** 的写请求仍被 403 拒，证明是角色鉴权而非缺 CSRF）。
@@ -375,6 +459,7 @@ E2E 新增覆盖：历史页导航 + 空历史**不画 0 线** + 存储/保留�
 | 隐藏服务仍出现在 `GET /api/health/monitor`（含服务名） | ✅ 已修：成功读到空列表也全清（状态 + `labelsByRef`），读路径再拦一道；`healthMonitor.test.ts` +4 条，含"绕过 reconcile"的可区分性用例 |
 | 隐藏服务仍可经 `/api/metrics/catalog` 与 `/history` 枚举/查询 | ✅ 已修：读路径按**当前** viewer 可见集合过滤，不可见与"从未采集过"返回**逐字节一致**的 400（无 404/403）；`metricsVisibility.test.ts` 13 条 |
 | 两条服务端测试依赖墙钟（必然/可能横跨整点） | ✅ 已修：固定 epoch + 三个注入假夹具 + 显式 `hoursRolledUp === 0` + **新增跨整点用例** + `clockBoundary.test.ts` 守卫；5 文件 59 用例全绿 |
+| **同类第三处（归档自查，非用户驳回）**：隐藏服务的事件名与未恢复**计数**仍出现在 `/api/alerts/events`、`/api/alerts/summary` | ✅ 已收口：共享 `modules/visibility/serviceVisibility.ts` + SQL 层过滤（`items` 先过滤再 `LIMIT`，四项计数同口径）+ fail-closed + admin 无特例；`alertsVisibility.test.ts` 15 条（3 文件 78 例全绿）。**两处待裁定**：`rule.target` 与 ack 响应体（见 §2.8 第 4 条） |
 
 ---
 
@@ -404,24 +489,31 @@ E2E 新增覆盖：历史页导航 + 空历史**不画 0 线** + 存储/保留�
    **但该 TTL 允许设为 0（不缓存）**，那时每个 `/api/metrics/catalog` 与每个服务类
    `/api/metrics/history` 都会真的跑一遍服务发现。这是**有意的**安全优先取舍；
    若将来要优化，**不能**用"给可见性加 TTL"的办法（那等于把泄漏窗口换回来）。
-9. **告警读接口是同一类泄漏面上仍未收口的一块**：`/api/alerts/events` / `summary` 返回的
-   `target` / `target_label` 是**触发时**写进 `alert_events` 的，不随可见性变化 →
-   隐藏前产生的告警事件仍会带出服务名。且隐藏后 `health.states()` 不再包含该服务，
-   引擎"目标不在快照里 → 不动，不假恢复"的既有语义让它的未恢复告警**停在未恢复状态**
-   （既不会自动恢复、也不会再触发）。本轮范围只覆盖 `/api/metrics/*` 与 `/api/health/monitor`
-   （即用户驳回的三条 P1）。详见 `06-security.md` §9-11 与 `todo.md`。
-   修法同形，但**必须先决定"隐藏服务的未恢复告警算不算还在故障"** —— 那是产品语义，不只是过滤。
+9. **告警读接口的可见性泄漏已收口，但两处刻意留着待裁定**：`/api/alerts/events` 与 `/summary`
+   原先直接返回 `alert_events` 行 —— 其 `target` / `target_label` 是**触发时**写进库的，
+   不随可见性变化 → 隐藏前产生的告警仍会带出服务名，计数本身也是存在性证据。
+   现已按当前可见集合在 SQL 层过滤（共享 `modules/visibility/serviceVisibility.ts`，
+   fail-closed，admin 无特例）。**待裁定**：① `GET /api/alerts/rules` 的 `rule.target`
+   （管理员自写的配置，抹成 null 会让配置自相矛盾）；② `POST /api/alerts/events/:id/ack`
+   的响应体（admin 写路径）。**残留观察**：`summary.suppressed` / `evaluatedAt` 取自引擎、
+   不做可见性过滤。**未修的后果（保留）**：隐藏后 `health.states()` 不再包含该服务，
+   引擎"目标不在快照里 → 不动，不假恢复"让它的未恢复告警**停在未恢复状态**
+   —— 读侧看不见 ≠ 引擎认为已恢复（改这条要先裁定产品语义）。
+   详见 `06-security.md` §9-11 与 `04-api-contract.md` §6.9。
 10. **`state(ref)` 语义收紧把两个模块的口径绑在一起**：`MetricsSampler.verdictOf` 走
     `health.state(ref)?.verdict ?? 'unknown'`，因此"不可见"在采样侧表现为 `unknown` → 该 tick
     不产生样本（方向安全，宁缺测不写 0）；`AlertEngine` 快照用 `health.states()` →
     隐藏服务从快照消失（即第 9 条）。**改任一处都要一起看**。
-11. **`visibleServiceRefs()` 的 fail-closed 分支没有单测**：现有用例都通过"真隐藏 / 真删除"走到
-    `visible = Set(...)`；"注册表抛错 → 服务/容器类 target 全部不可见、宿主与磁盘不受影响"
-    目前只有实现与注释，**没有可区分性证明**。补法简单（注入抛错的 registry 走真实路由），本轮未做。
+11. **`visibleServiceRefs()` 的 fail-closed 覆盖情况（照实记，已更正）**：同类第三处修完后，
+    共享的 `loadVisibleServiceRefs` 有"正常返回集合 / 抛错返回 `null`"的纯函数边界用例，
+    告警读路径有"必抛桩走真实路由 → 服务/容器类事件全不可见、宿主事件照常、还原后恢复原样"
+    的用例；但 **metrics 路由级**仍没有专门断言（"catalog 不含服务类 target、host 仍返回"
+    这条断言本身仍未单独写）。上一轮"完全没有单测"的表述已过时。
 12. **台账未同步**：`docs/sprint2-implementation-spec.md` §3.1 仍写着
     `availableTargets / resolveTarget / catalog` 的**同步**签名（实现已改 async 并多一层可见性校验），
-    冻结规格本轮未改；`README.md` 的测试规模数字也仍是 Sprint 2 提交时的值
-    （本轮 **+2 文件 / +21 用例**）。均已记入 `todo.md`。
+    也**没有** `AlertsService.events(query, visible)` / `summary(visible)` 的必填可见性参数；
+    冻结规格未改。`README.md` 的测试规模数字仍是 Sprint 2 提交时的值
+    （两轮累计 **+3 文件 / +36 用例**：13 + 4 + 4 + 15）。均已记入 `todo.md`。
 
 ---
 
@@ -439,10 +531,11 @@ E2E 新增覆盖：历史页导航 + 空历史**不画 0 线** + 存储/保留�
   本轮把"引擎不做任何出站调用"变成可执行约束，Sprint 3 加渠道时应**新增独立的通知模块**，
   而不是把 `fetch` 塞进引擎（届时 `backgroundBoundary.test.ts` 的白名单要同步扩，
   并在报告里说明扩了什么、为什么）。
-- **验收驳回修复留下的未做项**（本轮范围只到用户驳回的三条 P1，逐条见 §7-8…12）：
-  ① `visibleServiceRefs()` 的 fail-closed 分支补一条单测；
-  ② **告警读接口按可见性收口**（`/api/alerts/events` 与 `summary` 的 `target` / `target_label`
-  仍会带出隐藏前的服务名），且要先决定"隐藏服务的未恢复告警算不算还在故障"这条产品语义；
-  ③ 回填 `docs/sprint2-implementation-spec.md` §3.1 的签名清单（已改 async）与
-  `README.md` 的测试规模数字（本轮 +2 文件 / +21 用例）。
-  以上均已写入 `todo.md` 的「Sprint 2 验收驳回修复的未做项与残留风险」。
+- **验收驳回修复及后续自查留下的未做项**（逐条见 §7-8…12）：
+  ① **告警读接口的两处待裁定**：`GET /api/alerts/rules` 的 `rule.target`、
+  `POST /api/alerts/events/:id/ack` 的响应体（以及 `summary.suppressed` 不做可见性过滤这条
+  残留观察）；读响应本身已收口。要动它们**必须先裁定产品语义**，不是一次过滤能解决的；
+  ② `metrics` 路由级的 fail-closed 专门断言仍未写（共享实现已被证明，见 §7-11）；
+  ③ 回填 `docs/sprint2-implementation-spec.md` §3.1 的签名清单（已改 async、
+  告警服务方法新增必填可见性参数）与 `README.md` 的测试规模数字（两轮累计 +3 文件 / +36 用例）。
+  以上均已写入 `todo.md` 的「Sprint 2 验收驳回修复及后续收口的未做项与残留风险」。

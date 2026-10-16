@@ -159,23 +159,33 @@ Sprint 2 新增了三条后台任务链（历史采样、健康监测、告警�
 | 写接口 | `PATCH /api/alerts/rules/:id`、`POST /api/alerts/events/:id/ack` 要求 **admin + 有效 CSRF** | 改阈值会改变"什么时候会告警"（安全相关配置），确认会写审计并代表"人已经看到" |
 | 匿名 | 三条前缀都在 `PROTECTED_PREFIXES` 里（`requireRole('viewer')` + `createCsrfHook()`），匿名一律 `401`（不是空列表、不是 `404`） | "默认安全"：新增路由即使忘记加守卫，最坏结果是"需要登录"，不会匿名开放 |
 | 兜底守卫 | `api/alerts.ts` 与 `api/healthMonitor.ts` **各自再挂一份** viewer + CSRF 钩子 | 万一 `PROTECTED_PREFIXES` 漏了某条前缀，最坏也是"需要登录 + 缺 CSRF 被拒"，而不是把只读的规则与事件匿名开放出去。重复挂同一钩子是幂等的（只是多校验一次），代价远小于"漏一个前缀就对外裸奔"。有测试独立验证：`/api/alerts-unwired`、`/api/health/monitor-unwired` |
-| 后台采样视角 | 采样 `service.health.up_ratio` 时固定 `role: 'viewer'`；健康监视器取服务列表同样是 viewer 视角 | **hidden 服务不采、不监测**：否则 viewer 可读的历史接口会变成"隐藏服务名"的泄漏通道 —— 用户刻意隐藏的服务的名字不该从曲线或健康列表里冒出来 |
-| **读取侧的可见性强制（S2 验收驳回修复）** | `MetricsSampler.visibleServiceRefs()` 在**每次** catalog / 服务类 history 读时都用同一个 `backgroundHostRequest(config)` 走 `registry.list(..., 'viewer')`；不可见与"从未采集过"返回同一个 `null` → 同一个 400；健康监视器的 `states()` / `state()` / `view()` 也过同一套可见集合 | **只靠采集视角是不够的**：`role: 'viewer'` 只能保证"隐藏之后不再产生新样本"，**隐藏之前**已落库的行与进程内 `liveTargets` 仍在，会被继续列出与查询。读取侧负责把这半条补上（见下方不变量） |
+| 后台采样视角 | 采样 `service.health.up_ratio` 时固定 `role: 'viewer'`；健康监视器取服务列表同样是 viewer 视角 | **hidden 服务的服务健康不采、不监测**：否则 viewer 可读的历史接口会变成"隐藏服务名"的泄漏通道 —— 用户刻意隐藏的服务的名字不该从曲线或健康列表里冒出来。**口径澄清（照实记）**：这只覆盖**服务健康**序列；`container.*` 序列仍按 `containers.list()` 照采（容器列表不看服务可见性），容器类指标的隐藏**完全靠读取侧兜住** |
+| **读取侧的可见性强制（S2 验收驳回修复 + 同类第三处）** | 实现只有一份：`modules/visibility/serviceVisibility.ts` 的 `loadVisibleServiceRefs`（每次读都走同一个 `backgroundHostRequest(config)` + `registry.list(..., 'viewer')`、**不缓存**、读失败返回 `null`）。调用方：`MetricsSampler.visibleServiceRefs()` / `targetVisible()`（catalog 与服务类 history 读）、**告警读路径**（`api/alerts.ts` 的内部 `loadAlertsVisibility()` → `/api/alerts/events` 与 `/summary`，在 **SQL 层**过滤）、健康监视器的 `states()` / `state()` / `view()`（自有 `visibleRefs` / `isVisible()`）。不可见与"从未采集过 / 从未有可见服务"给出同一种结果；**注册表读失败一律 fail-closed** | **只靠采集视角是不够的**：`role: 'viewer'` 只能保证"隐藏之后不再产生新样本"，**隐藏之前**已落库的行（历史桶、内存 `liveTargets`）与**触发时快照**（`alert_events.target` / `target_label` / `message`）仍在，会被继续列出、查询与计数。读取侧负责把这半条补上（见下方不变量）。告警侧的计数同样是证据：`summary` 的 `open` / `unacknowledged` / `bySeverity` / `top` 必须与列表一起过滤 |
 | 探测复用 | 健康探测复用 S1 的 `runHealthProbe`（GET、不跟随跳转、3s 超时、最多读 16KB、失败不重试） | 不做第二份探测逻辑，SSRF 拒绝清单与请求纪律只维护一处（见上表） |
 | 出站能力 | **零**（见下） | Sprint 2 不做任何外发通知，也不做自动修复 |
 
-**不变量：hidden 服务不得经监控/历史接口泄漏，且不得泄漏其存在性。**
+**不变量：hidden 服务不得经监控 / 历史 / 告警读接口泄漏，且不得泄漏其存在性。**
 两个方向都要落实，缺一不可：
 
 | 落实侧 | 位置 | 内容 |
 | --- | --- | --- |
 | **采集侧（既有）** | `MetricsSampler.collect`（`verdictOf` 走 viewer 视角的服务列表）、`HealthMonitor.loadServices`（`registry.list(request, {}, 'viewer')`） | 隐藏之后**不再产生新的样本与判定**，名字不进新行 |
-| **读取侧（本轮新增，P1）** | `MetricsSampler.visibleServiceRefs()` / `isHostOwnedTarget()` / `targetVisible()`；`HealthMonitor.visibleRefs` / `isVisible()` | 已落库历史行与内存状态**按当前可见集合过滤**：catalog 不列、history 查不到、`/api/health/monitor` 不出现；服务名连 `labelsByRef` 一起清 |
+| **读取侧（S2 验收驳回修复，P1-1 / P1-2）** | `HealthMonitor.visibleRefs` / `isVisible()`；`MetricsSampler.visibleServiceRefs()` / `isHostOwnedTarget()` / `targetVisible()`（现已委托共享模块） | 已落库历史行与内存状态**按当前可见集合过滤**：catalog 不列、history 查不到、`/api/health/monitor` 不出现；服务名连 `labelsByRef` 一起清 |
+| **读取侧（同类第三处，本轮）** | `AlertsService.events()` / `summary()` / `counts()` + `alertEventVisibilityWhere()`（SQL 层）；路由侧 `api/alerts.ts` 的 `loadAlertsVisibility()` | 事件行的**触发时快照**（`target` / `target_label` / `message`）按当前可见集合过滤：`items` / `total` / `counts` / `bySeverity` / `top` 一起下降，`limit` 作用在过滤之后；宿主类（`host` / `disk:*`）不受影响。**引擎语义刻意不动**：库里的行仍可能是"未恢复"，读侧只是看不见（恢复可见后原样回来） |
 
-读取侧的四条硬性要求（有测试）：**fail-closed**（注册表读失败时服务/容器类 target 一律不可见）、
-**不缓存**（源码注释：任何 TTL 都是泄漏窗口 —— 代价见 `04-api-contract.md` §6.7）、
+读取侧的硬性要求（有测试）：**fail-closed**（注册表读失败时服务/容器类目标一律不可见 ——
+告警侧由 `alertsVisibility.test.ts` 用必抛桩走真实路由证明，共享函数另有纯函数边界用例）、
+**不缓存**（源码注释：任何 TTL 都是泄漏窗口 —— 代价见 `04-api-contract.md` §6.7 / §6.9）、
 **可见性先于存在性查找**（否则"库里曾经有过"就是存在性证据）、
-**不可见与陌生 target 的响应逐字节一致**（没有 404/403，也没有任何区分字段）。
+**不可见与陌生 / 从未出现目标的响应逐字节一致**（没有 404/403，也没有任何区分字段）、
+**计数与列表同口径**（只过滤列表等于用数字承认"有一条你看不见的告警"）。
+
+> **两处刻意保留、待裁定（照实记，不要当成已收口）**：① `GET /api/alerts/rules` 的 `rule.target`
+> 是**管理员自己写的配置**（不是发现出来的服务名），按可见性抹成 `null` 会让 viewer 看到与规则
+> 不一致的配置；② `POST /api/alerts/events/:id/ack` 的**响应体**是 admin 写路径
+> （入参是随机 UUID 事件 ID），本轮收口范围是**读**响应。另有一条**残留观察**：`summary` 的
+> `suppressed` / `evaluatedAt` 取自引擎、不参与可见性过滤，因此"本轮压掉了 N 次触发"这个数字
+> 仍是全量（不含名字、不指向具体服务，但严格说是一条极弱旁路信号 —— 取舍理由见 `04-api-contract.md` §6.9）。
 
 #### `backgroundBoundary.test.ts`：把"没有这种能力"变成可判定的断言
 
@@ -203,8 +213,10 @@ Sprint 2 新增了三条后台任务链（历史采样、健康监测、告警�
 2. **不自动修复**：后台代码拿不到能写 Docker 的连接对象，所以"自动重启容器"这类需求
    不可能被某次重构顺手引进后台 tick —— 要引进必须先改这条测试，等于强制一次显式评审。
 3. **不泄漏隐藏服务**：采样与监视器固定 viewer 视角（见上表），**并且读取侧也按当前可见集合过滤**
-   —— 隐藏/删除的服务既不出现在历史与监控接口里，也不因"库里曾经有行"而被查到；
-   不可见与从未出现过的目标返回**逐字节相同**的响应，因此连"它存在但被隐藏"这件事也推断不出来。
+   —— 隐藏/删除的服务既不出现在历史、监控与**告警**接口里，也不因"库里曾经有行 / 触发时落过快照"
+   而被查到或计进数字；不可见与从未出现过的目标返回**逐字节相同**的响应，
+   列表与计数**同口径**（只过滤列表等于用数字承认"有一条你看不见的告警"），
+   因此连"它存在但被隐藏"这件事也推断不出来。
 
 ## 4. CSRF
 
@@ -430,22 +442,35 @@ connect-src 'self'; form-action 'self'; frame-ancestors 'none'`。
    下一次打开门户必然看到未确认计数"。接通知渠道时**必须**重新评估这条测试与信源可信度
    （收件人、webhook 目标、凭据存放都属于新增的出站面）。
 10. **历史指标与告警读接口对 viewer 开放且没有单独限流**（S2）：viewer 可以持续拉取宿主 CPU/内存/
-    磁盘曲线、服务健康判定与告警历史（含容器与服务名）。这是**有意**的取舍 ——
+    磁盘曲线、服务健康判定与告警历史。这是**有意**的取舍 ——
     只读视图与容器/系统页同级，且后台采样固定 viewer 视角、
-    **历史与健康接口在读取侧也按当前可见集合过滤**（§3 的不变量），hidden 服务不进样本也不进响应；
+    **历史、健康与告警接口在读取侧都按当前可见集合过滤**（§3 的不变量），
+    hidden 服务不进响应、也不进计数（服务名与容器名因此只在可见服务上出现）；
+    照实记一处口径：采集侧固定 viewer 只让**服务健康**序列不再新增样本，
+    **容器序列仍照采**（`containers.list()` 不看服务可见性），容器指标的隐藏完全靠读取侧兜住；
     但"可读"与"可高频读"是两件事，将来若把门户暴露到不可信网络，
     应在这里加按用户的读限流（现在只有登录接口限流，见 §5）。
-11. **告警读接口是同一类泄漏面上仍未收口的一块**（S2 验收驳回修复的**残留**，本轮**未**修）：
-    `GET /api/alerts/events` / `GET /api/alerts/summary` 返回 `alert_events` 行，
-    而该行的 `target`（`service:<sourceRef>` / `container:<sourceRef>`）与 `target_label`
-    在触发时由 `createAlertSnapshotSource` 填的是**服务展示名与容器名**，落库后**不随可见性变化**。
-    因此：① 隐藏某个服务**之前**已产生的告警事件，viewer 仍能从告警页读到它的名字与 target；
-    ② 隐藏之后 `health.states()` 不再包含该服务，引擎的既有语义是"目标不在快照里 → 不动，不假恢复"，
-    于是该服务的未恢复告警会**停在未恢复状态**（不会自动恢复，也不会再触发）。
-    本轮修的是 `metrics/*` 与 `health/monitor` 两条读路径（用户驳回的三条 P1 之一），
-    告警读路径**未在范围内**；两条后果都已记入 `todo.md`，修法与 metrics 侧同形
-    （读时按当前可见集合过滤 `target` / `target_label`，不可见的行要么隐藏、要么只给聚合计数）。
-    当前缓解：告警默认四条内置规则 `enabled = false`，且告警本身只有站内可见（第 9 条）。
+11. **告警读接口的可见性泄漏（同类第三处）已在同一条线上收口；剩下两处待裁定**：
+    `/api/alerts/events` / `summary` 曾直接返回 `alert_events` 行 —— 其
+    `target`（`service:<sourceRef>` / `container:<sourceRef>`）与 `target_label`
+    是**触发时**由 `createAlertSnapshotSource` 填的**服务展示名与容器名**，落库后不随可见性变化，
+    于是隐藏**之前**产生的告警仍能把名字带给 viewer，而 `summary` 的计数本身就是存在性证据。
+    本轮修法与 metrics 侧同形且**共用同一份实现**（`modules/visibility/serviceVisibility.ts`）：
+    读时按当前可见集合在 **SQL 层**过滤，`items` / `total` / `counts` / `bySeverity` / `top`
+    一起下降，`limit` 作用在过滤之后，注册表读失败 **fail-closed**，**admin 无特例**；
+    宿主类（`host` / `disk:*`）事件不受影响。**有意保留的引擎语义**：隐藏不会让未恢复事件假恢复
+    （行不删、`resolved_at` 不改），因此"库里仍未恢复、viewer 看不见"是有意的组合语义 ——
+    运维含义是**读响应里的未恢复列表不等于库里的未恢复故障全集**。
+    **仍未收口 / 待裁定**：① `GET /api/alerts/rules` 的 `rule.target`（管理员自写的规则配置，
+    不是触发快照；抹成 `null` 会让 viewer 看到自相矛盾的配置）；② `POST /api/alerts/events/:id/ack`
+    的**响应体**（admin 写路径，入参是随机 UUID 的事件 ID）。
+    **残留观察（截至归档提交 `871c3dc`；`todo.md` 已记一条待跟的文档更正）**：`summary` 的
+    `suppressed` / `evaluatedAt` 是引擎的进程级度量、不做可见性过滤 ——
+    "本轮压掉 N 次触发"仍是全量数字（不含名字、不指向具体服务，但严格说是极弱旁路信号）。
+    **本轮未修的后果（保留）**：隐藏后 `health.states()` 不再包含该服务，
+    引擎"目标不在快照里 → 不动，不假恢复"的既有语义让它的未恢复告警**停在未恢复状态**
+    （不会自动恢复，也不会再触发）。当前缓解：告警默认四条内置规则 `enabled = false`，
+    且告警本身只有站内可见（第 9 条）。
 
 ## 10. 安全检查清单（发布前）
 
@@ -465,8 +490,13 @@ connect-src 'self'; form-action 'self'; frame-ancestors 'none'`。
 - [ ] 需要的账号已绑定两步验证，并且**恢复码已离线保存**（恢复码只显示一次）
 - [ ] 确认后台任务仍然**没有**出站能力：`npm test` 里的 `backgroundBoundary.test.ts` 全绿
       （它同时断言三个后台目录存在且非空 —— 别在重命名模块后把它变成空扫描）
-- [ ] 确认 hidden 服务不泄漏：`metricsVisibility.test.ts`（真实路由 + 真实鉴权）与
-      `healthMonitor.test.ts` 的可见性用例全绿；**新增任何返回 target / 服务名的读接口时，
-      必须照 §3 的不变量先过当前可见集合**，并补一条"不可见与陌生目标的响应一致"的断言
+- [ ] 确认 hidden 服务不泄漏：`metricsVisibility.test.ts`、`alertsVisibility.test.ts`
+      （两条都是真实路由 + 真实鉴权）与 `healthMonitor.test.ts` 的可见性用例全绿；
+      **新增任何返回 target / 服务名 / 计数的读接口时，必须照 §3 的不变量先过当前可见集合**，
+      并补一条"不可见与陌生目标的响应一致"的断言；告警类接口额外确认**计数与列表同口径**、
+      注册表读失败时 **fail-closed**（`alertsVisibility.test.ts` 里有必抛桩用例）
+- [ ] 已知两处**未收口、待裁定**（不要当成已修）：`GET /api/alerts/rules` 的 `rule.target`、
+      `POST /api/alerts/events/:id/ack` 的响应体；以及 `summary.suppressed` 不参与可见性过滤
+      （见 §9-11）
 - [ ] 定期检查审计日志中的 `auth.login_failed`、`auth.totp_failed`、`auth.totp_reset`、
       `alert.rule_updated`、`alert.acknowledged`

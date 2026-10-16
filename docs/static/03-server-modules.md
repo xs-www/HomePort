@@ -613,6 +613,62 @@ await settings.initialize();
 **健康探测**：默认 `skipped`（不配置就不探测）；结果只在内存（`HEALTH_RESULT_LIMIT = 512`，
 超限淘汰最早一条），进程重启即清空 —— **落库会把"某一刻的探测结果"变成"永久的谎话"**。
 
+### `src/modules/visibility/`（读路径可见性，S2 验收驳回修复 / 同类泄漏第三处）
+
+**唯一实现**：`server/src/modules/visibility/serviceVisibility.ts`（119 行、一个异步函数）。
+历史指标 `/api/metrics/*` 与告警 `/api/alerts/*` 的读路径**共用它** —— 它们问的是同一个问题
+（"当前这个 viewer 允许看到哪些服务"），所以答案只能有一份。
+
+| 文件 | 性质 | 导出 |
+| --- | --- | --- |
+| `serviceVisibility.ts` | 纯函数 + **一次注册表读**（无缓存、无状态） | `ServiceVisibilityRegistry` `SERVICE_TARGET_PREFIX` `CONTAINER_TARGET_PREFIX` `ServiceTargetKind` `serviceRefOfTarget` `isServiceTargetVisible` `ServiceVisibilityDeps` `loadVisibleServiceRefs` |
+
+**为什么会有这个模块**（Sprint 2 的教训）：同类泄漏修了**三次**，每次形状完全一样 ——
+**写侧按 viewer 视角采集 ≠ 读侧受可见性约束**：
+
+| 第几次 | 泄漏点 | 落点 |
+| --- | --- | --- |
+| 一 | `/api/health/monitor` 的内存状态与 `labelsByRef`（服务名） | `health/monitor.ts`（P1-1） |
+| 二 | `/api/metrics/*` 的历史行与 `liveTargets` | `metrics/sampler.ts`（P1-2） |
+| 三 | `/api/alerts/events`、`/api/alerts/summary` 的**触发时快照** | `alerts/service.ts` + `api/alerts.ts`（本轮） |
+
+各写一遍必然慢慢产生"哪边口径才对"的漂移，因此第三处修完就把实现抽到这里，前两处改为委托。
+
+| 导出 | 签名 | 语义与边界 |
+| --- | --- | --- |
+| `ServiceVisibilityRegistry` | `{ list(request, query?, role?) => Promise<{ items: ReadonlyArray<{ sourceRef: string }> }> }` | **结构类型**，只声明真正用到的 `list()`；传真实 `ServiceRegistryService` 实例自动满足（`MetricsServiceRegistrySource` 与它同形），因此不必 import 具体类 |
+| `SERVICE_TARGET_PREFIX` / `CONTAINER_TARGET_PREFIX` | `'service:'` / `'container:'` | target 里承载服务稳定身份的两个前缀，**唯一来源**（告警的 SQL 条件直接拼它们，不再各写一份字面量） |
+| `ServiceTargetKind` | `'service' \| 'container'` | 服务类目标的两种载体：服务健康（服务维度）与容器（容器是服务的绑定） |
+| `serviceRefOfTarget` | `(target, kind?) => string \| null` | 取 target 引用的服务稳定身份：`service:<ref>` / `container:<ref>` → `<ref>`；`host` / `disk:<label>` / 空串 / 未知前缀 → `null`（**不属于任何服务**，调用方据此原样放过）。传了 `kind` 就**顺便校验前缀与类型对得上**（`service_health` 只能配 `service:`、`container_exit` 只能配 `container:`），对不上返回 `null` = 按不可见处理 |
+| `isServiceTargetVisible` | `(target, visible: ReadonlySet<string> \| null, kind?) => boolean` | `visible === null`（注册表不可用）**一律 `false`**；否则要求 `serviceRefOfTarget(...)` 命中可见集合。**非服务 target 也返回 `false`** —— "宿主目标恒可见"是**调用方的策略**（`MetricsSampler.targetVisible` 先判 `isHostOwnedTarget`），不是这里的默认值 |
+| `ServiceVisibilityDeps` | `{ registry, request, source, logger? }` | `request` 必须是与后台采集**同一个** `backgroundHostRequest(config)`（保证采集侧与读取侧同一套判定）；`source` 只用于日志区分是哪条读路径（`metrics.read` / `alerts.read`） |
+| `loadVisibleServiceRefs` | `(deps) => Promise<ReadonlySet<string> \| null>` | `registry.list(request, {}, 'viewer')` → 可见服务的 `sourceRef` 集合；**注册表读失败返回 `null`**（不是空集合），调用方必须 **fail-closed**。源码注释写明"不要在这里优化"的三条见下 |
+
+**三条刻意保持的行为**（与已提交的指标读路径逐字一致）：
+
+1. **不缓存**：可见性是 `services.visibility` 这一行 DB 事实，读它不产生 Docker 调用
+   （`ServiceRegistryService.list` 内部的发现与容器列表各自走**既有** TTL 缓存）。
+   加一层缓存只会把"隐藏"的生效时刻推迟到 TTL 之后，而那段窗口正是泄漏窗口 ——
+   用一个可观测的泄漏窗口去省一次列表读是拿安全换性能。
+   **代价（照实记）**：`/api/metrics/catalog`、服务类 `/api/metrics/history`，以及本轮新增的
+   告警 `summary` 徽标轮询（每 60s）各多一次 `registry.list`。
+2. **fail-closed**：读失败返回 `null`，语义是"服务/容器类目标一律不可见"，
+   **不是**"过滤不了就当没过滤"。类型上没有"省略 = 不过滤"这个选项（`AlertEventVisibility`
+   也是这个用意）：调用方必须显式表态，免得哪天多一个调用点就悄悄漏了。
+3. **不分角色**：固定 `role: 'viewer'`，admin 与 viewer 走同一条可见集合
+   （`/api/metrics/*` 已如此并有测试钉住）。要"看到一切"请走 `includeHidden` 的管理接口，
+   读路径不开特例。
+
+**谁在用（照实记，别把"共用"说大）**：
+
+| 调用方 | 用到的导出 |
+| --- | --- |
+| `MetricsSampler.visibleServiceRefs()` | `loadVisibleServiceRefs`（`source: 'metrics.read'`）—— 本方法现在只是把采样器自己的依赖喂进去 |
+| `MetricsSampler.targetVisible()` | `isServiceTargetVisible`（`kind` 由 `metricByKey(metricKey)?.targetKind` 推出） |
+| `api/alerts.ts` 的 `loadAlertsVisibility()`（**未导出**） | `loadVisibleServiceRefs`（`source: 'alerts.read'`），每个 `/events`、`/summary` 请求各取一次 |
+| `AlertsService` 的 SQL 条件 | 用 `SERVICE_TARGET_PREFIX` / `CONTAINER_TARGET_PREFIX` 拼 `IN (…)` 参数 —— 过滤落在 **SQL 层**（见 alerts 一节），不走 `isServiceTargetVisible` |
+| `serviceRefOfTarget` | 当前**只在 `isServiceTargetVisible` 内部使用**（导出是为了可单测与复用，暂无外部调用点） |
+
 ### `src/modules/metrics/`（历史指标，S2-01 / S2-02）
 
 Sprint 2 的"轻量历史监控"。六层严格分开，**副作用只出现在 `sampler.ts`（+ 仓储）与 `scheduler.ts`**：
@@ -755,9 +811,9 @@ UPSERT 语句是 `INSERT … ON CONFLICT(resolution, metric, target, bucket_at) 
 
 | 成员 | 签名 | 说明 |
 | --- | --- | --- |
-| `visibleServiceRefs` | `() => Promise<ReadonlySet<string> \| null>` | `registry.list(hostRequest, {}, 'viewer')` → 可见服务的 `sourceRef` 集合。**读失败返回 `null`**（调用方按 fail-closed 处理）。`hostRequest` 与采集用的是同一个 `backgroundHostRequest(config)` |
+| `visibleServiceRefs` | `() => Promise<ReadonlySet<string> \| null>` | **已抽到共享模块**（同类泄漏第三处）：只把采样器自己的 `registry` / `hostRequest` / `log` 喂给 `visibility/serviceVisibility.ts` 的 `loadVisibleServiceRefs`（`source: 'metrics.read'`），语义与代价见 §`src/modules/visibility/`。`hostRequest` 与采集用的是同一个 `backgroundHostRequest(config)`；**读失败返回 `null`**（调用方按 fail-closed 处理） |
 | `isHostOwnedTarget` | `(metricKey) => boolean` | `metricByKey(metricKey)?.targetKind` ∈ `{host, disk}` 即为宿主自身。**metric key 不在目录里（契约变更后的历史行）按"非宿主"处理 = fail-closed** |
-| `targetVisible` | `(metricKey, target, visible) => boolean` | 宿主/磁盘恒 `true`；服务/容器类要求 `service:<sourceRef>` / `container:<sourceRef>` 命中**当前**可见集合；`visible === null` 一律 `false` |
+| `targetVisible` | `(metricKey, target, visible) => boolean` | 宿主/磁盘恒 `true`；服务/容器类交给共享的 `isServiceTargetVisible(target, visible, kind)`（`kind` 由 `metricByKey(metricKey)?.targetKind` 推出）—— "取身份 + 判可见"与告警同一对函数；`visible === null` 一律 `false` |
 
 三条为什么（照实记录，含代价）：
 
@@ -787,6 +843,10 @@ UPSERT 语句是 `INSERT … ON CONFLICT(resolution, metric, target, bucket_at) 
    只要响应里多一个字段，就等于承认"这个 target 存在但你无权看"。
    `server/tests/metricsVisibility.test.ts` 用"抹平调用者自己传入的 target 串后整段响应体
    `toBe` 相等"钉住这一点（逐字节，不是逐字段）。
+6. **实现只有一份**：上面这几条 why 的实现落点从本轮起**不在本文件** ——
+   `visibleServiceRefs` / `targetVisible` 都委托给 `modules/visibility/serviceVisibility.ts`，
+   告警读路径调的是同一个 `loadVisibleServiceRefs`。历史指标侧的行为**逐字未变**
+   （宿主/磁盘的两个短路条件也保留），变的是"哪边口径才对"不再有两份答案。
 
 > **"为什么是内存累积 + 分钟落库"**：曲线的最小分辨率就是一分钟，
 > 同一分钟里的所有样本最终只会变成一行。若每 tick 写库，30s 间隔下就是 120 次写事务/小时，
@@ -1051,7 +1111,7 @@ evaluateHealth(previous, signal, { failThreshold, okThreshold, at }): ServiceHea
 | `types.ts` | 契约类型 + 纯映射 | `AlertKind` `AlertSeverity` `AlertRuleDbRow` `AlertRuleRow` `BuiltinAlertRule` `AlertRulePatch` `AlertRuleView` `AlertEventState` `AlertEventDbRow` `AlertEventView` `AlertEventCounts` `AlertRuleListResponse` `AlertEventListResponse` `AlertSummaryTopItem` `AlertSummaryView` `HealthVerdictLike` `AlertSnapshot` `AlertTickResult` `toAlertRuleRow` `toAlertRuleView` `alertEventState` `toAlertEventView` |
 | `rules.ts` | 纯函数 | `ALERT_KINDS` `THRESHOLD_PERCENT_MIN_EXCLUSIVE` `THRESHOLD_PERCENT_MAX` `DURATION_SEC_MAX` `SILENCE_SEC_MIN` `SILENCE_SEC_MAX` `SERVICE_FAILURE_THRESHOLD_MIN` `SERVICE_FAILURE_THRESHOLD_MAX` `RULE_TARGET_MAX_LENGTH` `BUILTIN_ALERT_RULES` `mergeBuiltinRules` `RulePatchValidation` `validateRulePatch` `compareAlertRules` |
 | `engine.ts` | 编排（评估 + episode 落库） | `AlertAuditSink` `AlertEngineDeps` `AlertCandidate` `RuleOutcome` `evaluateRule` `AlertSnapshotSourceDeps` `createAlertSnapshotSource` `AlertEngine`（并 re-export `AlertTickResult`） |
-| `service.ts` | 业务出口 | `ALERT_EVENTS_DEFAULT_LIMIT` `ALERT_EVENTS_MAX_LIMIT` `ALERT_SUMMARY_TOP_LIMIT` `AlertsServiceDeps` `AlertEventQuery` `AlertsService` `normalizeLimit` |
+| `service.ts` | 业务出口 | `ALERT_EVENTS_DEFAULT_LIMIT` `ALERT_EVENTS_MAX_LIMIT` `ALERT_SUMMARY_TOP_LIMIT` `AlertsServiceDeps` `AlertEventQuery` `AlertEventVisibility` `alertEventVisibilityWhere` `AlertsService` `normalizeLimit` |
 
 两套命名刻意分开，不要混：`AlertRuleDbRow` / `AlertEventDbRow`（**数据库行**，snake_case）
 与 `AlertRuleRow`（**领域行**，camelCase）。映射集中在 `toAlertRuleRow` / `toAlertEventRow`，
@@ -1198,6 +1258,52 @@ episode 把"一次故障"压成一行，恢复写 `resolved_at`，静默期内�
 > 的 `evaluated > 0` 断言守着这条因果链。
 > 未接时只记**一次** warn（这是装配缺口，不是每轮的运行故障，不需要刷屏）。
 
+**读路径的当前可见性（同类泄漏第三处，本轮收口）**
+
+事件行的 `target` / `target_label` / `message` 是**触发那一刻**的落库快照，
+不会因为服务后来被隐藏或删除而变化。只按库里的行读，viewer 就一直在告警页看到被隐藏服务的名字，
+而 `summary` 的计数**本身就是存在性证据**。因此 `/events` 与 `/summary` 每请求先取一份"当前可见服务"
+（`api/alerts.ts` 的 `loadAlertsVisibility()` → 共享的 `loadVisibleServiceRefs`，见
+§`src/modules/visibility/`），再交给服务层；**过滤落在 SQL 层**。
+
+| 导出 / 成员 | 签名 | 语义与边界 |
+| --- | --- | --- |
+| `AlertEventVisibility` | `type = ReadonlySet<string> \| null` | 读路径的可见性输入。`null` = 来源不可用（注册表读失败 / 装配缺依赖）→ **fail-closed**。**类型上没有"省略 = 不过滤"这个选项**：调用方必须显式表态，免得哪天多一个调用点就悄悄漏了 |
+| `HOST_OWNED_EVENT_SQL`（**未导出**） | 常量 | `(target NOT LIKE 'service:%' AND target NOT LIKE 'container:%')` —— 宿主自有事件（`host` / `disk:<label>`）恒可见。判据用 **target 前缀**而不是 `kind`：泄漏面由 target 决定（名字就在 target / target_label 里），`kind` 只是"哪条规则触发的" |
+| `alertEventVisibilityWhere` | `(visible) => { sql: string; params: string[] }` | 返回 `AND` 用的条件片段 + 位置参数（**纯函数**，便于直接对 `null` / 空集合 / 有集合三种输入写断言）。`null` 与空集合都退化为"只有宿主自有事件"；有集合时拼 `(宿主 OR (kind = 'service_health' AND target IN (…service:…)) OR (kind = 'container_exit' AND target IN (…container:…)))`，参数顺序**先 service 分支再 container 分支**（必须与占位符出现顺序一致）。前缀与 `kind` **同时校验**，于是"kind 说是磁盘、target 却指向服务"的手工脏行也落不进可见集合 |
+| `eventWhere`（**私有**） | `(state: 'all'\|'open'\|'resolved', visible) => { sql; params }` | 拼 `WHERE 状态条件 AND 可见性条件`。可见性条件**总是在**（fail-closed 时退化为"只有宿主自有事件"），所以这里只有"有没有状态条件"一种分支，**不存在"忘了加可见性"的写法** |
+| `events` | `(query: AlertEventQuery, visible: AlertEventVisibility) => AlertEventListResponse` | 见下"为什么必须**先过滤再 LIMIT**" |
+| `summary` | `(visible: AlertEventVisibility) => AlertSummaryView` | `open` / `unacknowledged` / `bySeverity` / `top` **全部**按当前可见性过滤（`bySeverity` 与 `top` 分别走 `eventWhere('all'/'open', visible)`） |
+| `counts`（**私有**） | `(visible: AlertEventVisibility) => AlertEventCounts` | `open` / `resolved` / `unacknowledged` 都只在**可见集合内**统计。语义仍是"全量"（不随 `state` / `limit` 变），但"全量"现在是**可见集合的全量** |
+| `acknowledge` | `(id, actor) => AlertEventView` | **刻意不做可见性过滤**（admin 写路径、入参是随机 UUID 的事件 ID），见文末"未收口/待裁定" |
+
+**为什么必须"先过滤再 LIMIT"**：`limit` 必须作用在**可见集合**上，否则首页会被不可见事件占位，
+出现"看得见的事件反而翻不到"。实现上是把可见性条件拼进那条带 `LIMIT` 的 SELECT **之前**，
+不是取出来再筛（测试夹具里最新的一条恰是服务事件：隐藏后 `limit=1` 仍必须返回最新那条**可见**事件，
+`total` 也照旧是可见集合的全量）。
+
+**为什么计数也要过滤**：`total` / `counts` / `bySeverity` / `top` 同步只统计可见集合 ——
+**计数本身就是存在性证据**（"未恢复从 3 掉到 2"会告诉 viewer 少了一条什么）。
+只过滤 `top` 而留着计数，等于用数字告诉 viewer"有一条你看不见的未恢复告警"。
+
+**刻意不动引擎语义（写在源码注释里，不要"顺手修"）**：隐藏一个服务**不会**动它的未恢复事件行
+—— `resolved_at` 仍为 NULL、episode 不变量与静默期判定完全不变；"库里仍未恢复、viewer 看不见"
+是有意的组合语义（告警引擎的事实与读侧的暴露面是两件事）。恢复可见后**同一事件原样回来**
+（行没被删、状态没被改）。反过来，只要引擎还认为目标在故障中，就不会因为"读侧看不见"而假恢复
+—— 那会把真实故障从运维视野里抹掉。
+
+> **本轮未收口 / 待裁定的两处（照实记，不要写成已修）**：
+> ① `GET /api/alerts/rules` 的 `rule.target`：它是**管理员自己写的配置**（`PATCH /rules/:id` 的入参，
+> 按 kind 校验过前缀），不是"发现出来的服务名"；按可见性抹成 `null` 会让 viewer 看到一份与
+> 实际规则不一致的配置（"这条规则到底盯的是什么"会说不清）。这是**刻意的边界**，不是漏改。
+> ② `POST /api/alerts/events/:id/ack` 的**响应体**：admin 写路径，入参是随机 UUID 的事件 ID，
+> 要拿到隐藏服务事件的 ID 得先有别的泄漏渠道。本轮的收口范围是**读**响应。
+
+> **残留观察（照实记；截至归档提交 `871c3dc` 未处理）**：`summary` 的 `suppressed` / `evaluatedAt` 来自引擎、
+> **不参与可见性过滤** —— 它们是"引擎这一轮干了什么"的进程级度量，不是"有多少条事件"。
+> 因此"本轮压掉 N 次触发"仍是全量数字：不含名字、不指向具体服务，但严格说是一条**极弱**的
+> 旁路信号（取舍：让"没有告警"可解释 ＞ 该信号的理论信息量）。
+
 **`service.ts` —— `AlertsService`（业务出口）**
 
 只做"人能看到什么、人能改什么"，**评估全在 `engine.ts`**。
@@ -1207,9 +1313,9 @@ episode 把"一次故障"压成一行，恢复写 `resolved_at`，静默期内�
 | `ensureBuiltinRules` | `(at?) => number` | 幂等补齐四条内置规则，返回**本次插入**条数（第二次必然 0）。装配时调一次。**GET 不播种**：如果 GET 也播种，"迁移后新表为空"与"接口一被调用表就有四条"就会互相打脸，彩排脚本也无法验证迁移本身是干净的 |
 | `rules` | `() => AlertRuleView[]` | 全部规则（内置在前，按 kind 顺序）。未调用 `ensureBuiltinRules()` 时可以是空数组 |
 | `updateRule` | `(id, patch, actor) => AlertRuleView` | 未知 id → `NOT_FOUND`；校验失败 → `VALIDATION_FAILED`（`fieldErrors.patch`），**什么都不写**。SQL 只拼出被提供字段的赋值 + 恒有的 `updated_at` |
-| `events` | `(query) => AlertEventListResponse` | `state` 默认 `all`；`limit` 默认 50（`normalizeLimit` 收敛到 1–200）；`total` 是**过滤后**的总数，而 `counts` 是**全量**计数（徽标要的是"现在有多少未确认"，不是"这一页里有多少未确认"） |
-| `acknowledge` | `(id, actor) => AlertEventView` | 不存在 → `NOT_FOUND`；已恢复的也能确认；**幂等**：已确认的直接原样返回，不改时间、不再写审计（否则"谁在什么时候先看到的"这个信息就丢了） |
-| `summary` | `() => AlertSummaryView` | `open`/`unacknowledged` 来自全量计数；`bySeverity` 只统计**未恢复**的事件；`top` 取未恢复的前 5 条（critical 优先 → `fired_at` 倒序，精简形状）；`suppressed` 是自进程启动的累计值（只报上一轮的话绝大多数时刻都是 0，等于没有信息） |
+| `events` | `(query, visible) => AlertEventListResponse` | `state` 默认 `all`；`limit` 默认 50（`normalizeLimit` 收敛到 1–200）；`limit` 作用在**可见性过滤之后**（`total` 是同一口径的总数）；`total` 与 `counts` 都是**过滤后**（可见集合内）的全量计数 —— 徽标要的是"现在有多少未确认"，不是"这一页里有多少未确认" |
+| `acknowledge` | `(id, actor) => AlertEventView` | 不存在 → `NOT_FOUND`；已恢复的也能确认；**幂等**：已确认的直接原样返回，不改时间、不再写审计（否则"谁在什么时候先看到的"这个信息就丢了）。**不做可见性过滤**（admin 写路径，见上文"未收口"） |
+| `summary` | `(visible) => AlertSummaryView` | `open`/`unacknowledged` 来自（可见集合内的）全量计数；`bySeverity` 只统计**未恢复**且**可见**的事件；`top` 取未恢复且可见的前 5 条（critical 优先 → `fired_at` 倒序，精简形状）；`suppressed` 是自进程启动的累计值（只报上一轮的话绝大多数时刻都是 0，等于没有信息）。**四个计数一起过滤**：只过滤 `top` 等于用数字承认"有一条你看不见的未恢复告警"。`suppressed` / `evaluatedAt` 取自引擎、**不参与过滤**（见上文"残留观察"） |
 | `recordTick` / `recordEvaluatedAt` | `(result) => void` / `(at) => void` | 装配处（`app.ts` 的 `AlertEngineDeps.onTick`）回灌 tick 结果，供 `summary()` 的 `evaluatedAt` / `suppressed` |
 
 写操作（`updateRule` / `acknowledge`）都走审计（`alert.rule_updated` / `alert.acknowledged`），
@@ -1234,7 +1340,7 @@ episode 把"一次故障"压成一行，恢复写 `resolved_at`，静默期内�
 | `search.ts` | `registerSearchRoutes` `buildSearchHits` `SEARCH_DEFAULT_LIMIT` `SEARCH_MAX_LIMIT` | `GET /api/search` |
 | `users.ts` | `registerUserRoutes` `DEFAULT_AUDIT_LIMIT` | `/api/users/*` |
 | `metrics.ts` | `registerMetricsRoutes` `MetricsRouteDeps` `toSchedulerView` | `/api/metrics/*`（三个只读 GET，viewer；读路径按当前可见性过滤 —— 见 §2 `sampler.ts`） |
-| `alerts.ts` | `registerAlertRoutes` `AlertRouteDeps` `AlertRoutesContext` `composeAlertSummary` | `/api/alerts/*`（读 viewer，写 handler 内 `assertAdmin`） |
+| `alerts.ts` | `registerAlertRoutes` `AlertRouteDeps` `AlertRoutesContext` `composeAlertSummary` | `/api/alerts/*`（读 viewer，写 handler 内 `assertAdmin`）。`/events` 与 `/summary` **每请求**先经内部 `loadAlertsVisibility()` 取一次当前可见集合（共享 `loadVisibleServiceRefs`），再交给 `AlertsService` 在 SQL 层过滤 —— 见 §2 `src/modules/visibility/` 与 alerts 一节 |
 | `healthMonitor.ts` | `registerHealthMonitorRoutes` `HealthMonitorLike` `HealthMonitorRouteDeps` | `GET /api/health/monitor`（独立前缀，viewer） |
 | `index.ts` | `registerRoutes` `PROTECTED_PREFIXES` `RouteDependencies` `AlertsRouteDeps` | 总装 + 权限模型 |
 
@@ -1269,11 +1375,11 @@ Sprint 2 新增三个前缀：`/api/metrics`、`/api/alerts`、`/api/health/moni
 | `GET /api/metrics/catalog` | viewer | `metrics.catalog(toSchedulerView(deps.scheduler))`（**已 async**）；未接调度器时 `scheduler: null`。`targets` 由采样器按**当前** viewer 可见服务集合过滤：hidden/已删除的服务**既不出现 `target` 也不出现 `targetLabel`**，且 `metrics[].availableTargets` 同步减少（否则前端会显示一个选不中的数量） |
 | `GET /api/metrics/history` | viewer | `metric`/`target`/`range` 三个查询参数**必填**；未知 metric → 400 且 `details.allowed` 列出全部键；未知 range → 400 且在 `fieldErrors.range` 里列出允许值；未知 target（形态对但**没出现过 _或当前不可见_**）→ 400 且 `details.targetPattern` 给出形态提示。**不可见与"从未采集过"走同一条分支、产出逐字段一致的响应**：`resolveTarget` 对前者也返回 `null`，因此隐藏/已删除的目标得到与陌生 target 完全相同的 400 —— **刻意不用 404/403**（那等于承认该目标存在），也没有任何区分字段。宿主/磁盘 target 不查注册表，响应不变 |
 | `GET /api/metrics/storage` | viewer | 行数 / 文件占用 / 保留配置 / 预算 / `lastTick` |
-| `GET /api/alerts/rules` | viewer | **服务层返回裸数组，路由包成 `{ items }`** —— 层次分工，不要把包装混进服务层 |
+| `GET /api/alerts/rules` | viewer | **服务层返回裸数组，路由包成 `{ items }`** —— 层次分工，不要把包装混进服务层。**不做可见性过滤**（`rule.target` 是管理员写的配置，不是发现出来的服务名；本轮未收口，见 alerts 一节文末） |
 | `PATCH /api/alerts/rules/:id` | **admin** | `ctx.users.assertAdmin()`；请求体 zod `.strict()` + `refine(至少一个字段)`；取值域交给 `validateRulePatch`（那里知道 kind） |
-| `GET /api/alerts/events` | viewer | 查询 schema `.strict()`（拼错参数直接 400，不静默忽略）；`state` 默认 `all`、`limit` 默认 50 |
-| `POST /api/alerts/events/:id/ack` | **admin** | 幂等；已恢复的也能确认 |
-| `GET /api/alerts/summary` | viewer | `composeAlertSummary(service.summary(), deps.engine)`：`suppressed` / `evaluatedAt` **优先取引擎的真实值**，不做 `Math.max` 之类的折中（一个数只能有一个来源） |
+| `GET /api/alerts/events` | viewer | 查询 schema `.strict()`（拼错参数直接 400，不静默忽略）；`state` 默认 `all`、`limit` 默认 50。**先按当前可见集合过滤再 `LIMIT`**，`total` / `counts` 同一口径；可见集合不可得（缺 `config`/`services` 或注册表抛错）→ **fail-closed**（只留宿主类事件），并记一条 warn —— 不把 5xx 甩给告警页 |
+| `POST /api/alerts/events/:id/ack` | **admin** | 幂等；已恢复的也能确认。**响应体本轮未收口**（admin 写路径，未按可见性过滤） |
+| `GET /api/alerts/summary` | viewer | `composeAlertSummary(service.summary(visible), deps.engine)`：`suppressed` / `evaluatedAt` **优先取引擎的真实值**，不做 `Math.max` 之类的折中（一个数只能有一个来源）；`open` / `unacknowledged` / `bySeverity` / `top` 全部按当前可见集合统计 |
 | `GET /api/health/monitor` | viewer | 监视器未装配时返回 **503 `UPSTREAM_UNAVAILABLE`**，而不是空列表（空列表会被误读成"全部健康"）。`services` 来自 `monitor.view()`（内部走 `states()`），因此**读路径同样按当前 viewer 可见集合过滤**：不可见的服务不出现在列表里，`label`（服务名）也不会出现。本路由**本轮未改动**（可见性在监视器内部落实） |
 
 **兜底守卫**：`alerts.ts` 与 `healthMonitor.ts` **各自再挂一份** viewer + CSRF 钩子。
@@ -1340,6 +1446,7 @@ registerRoutes(app, ctx, { metrics, scheduler, health, alerts: { alerts, engine:
 | `audit` 直接传 `auditRepo` | `AlertEngineDeps.audit` 接受两种形态（函数或带 `append` 的 `AuditRepository`），接线只有一行，不需要再写适配闭包 |
 | `ensureBuiltinRules()` 放在装配期 | "迁移只建结构，业务数据由业务层负责"。失败**只告警不阻断启动**（规则表为空时告警页显示空列表，比整个门户起不来好） |
 | `health` 传同一个实例给路由 | 判定只算一次，不出现第二条探测循环 |
+| 告警读路径的可见性来源 | `api/index.ts` 注册 `/api/alerts` 时**直接传整个 `ctx`**（`registerAlertRoutes(app, ctx, deps.alerts)`），因此 `AlertRoutesContext` 的可选 `config` / `services` / `logger` 在生产上必然齐备（`RouteContext` 里本来就有）；**缺任一字段时按 fail-closed 处理**（服务/容器类事件不可见 + 一条 warn），不会静默不过滤，也不会把 5xx 甩给告警页 |
 | `close()` 里 `scheduler.stop()` **必须在 `db.close()` 之前** | 否则关闭库之后还可能有一轮 tick 在写库 |
 
 > **`AppHandle` 新增 `metrics` / `health` / `alerts` / `scheduler`** 的直接原因是测试：
@@ -1384,7 +1491,8 @@ registerRoutes(app, ctx, { metrics, scheduler, health, alerts: { alerts, engine:
 | `tests/metricsApi.test.ts` | viewer 可读三个 GET；匿名 401；非法 `range` / 未知 `metric` / 未知 `target` → 400 且 `code = VALIDATION_FAILED`；`storage` 返回大小与保留配置。**S2 验收驳回修复后（14 条）改用固定 epoch + 三个注入假数据源**：`vi.setSystemTime(EPOCH * 1000)` 把被测进程的读侧时钟（`history()`/`storage()`/`availableTargets()` 都用它）钉住，`ctx.system.snapshot` / `ctx.containers.list` / `ctx.services.list` 全部换成假夹具；落库序列数是确定值（CPU 首次采样无基线 → live-only，`lastSeenAt === null`），并**显式断言本夹具不跨整点**（`hoursRolledUp === 0`、`bounds.hour` 为 `null`）—— 跨整点由 `schedulerIntegration.test.ts` 专门覆盖 |
 | `tests/metricsVisibility.test.ts`（**新增，13 条**） | 历史指标**读路径的当前可见性**（P1 回归），全走 `buildApp()` + `app.inject()` 的**真实路由 + 真实鉴权 + 真实 SQLite**：夹具是**真的采集**（建手工服务 → `health.tick()` → `metrics.tick()` ×2 落库 → 该服务同时进入 DB 行与内存 `liveTargets`）。断言：隐藏后 catalog 里 `target` 与 `targetLabel` 都不出现、**整个响应体里连服务名都不出现**、`availableTargets` 同步为 0；history 与"从未采集过的 target"**抹平 target 串后整段响应体逐字节相同**（`Object.keys(error)` 也相同），且**不是** 404/403；`admin` 会话同样看不到、同样查不到（**不做角色特例**）；`storage` 响应体不含服务名；宿主指标（`host` / `disk:*`）照常返回（过滤没有误伤）；恢复可见后曲线与隐藏前**逐字段相同**（证明行没被删，只是访问受控）；真删服务后同样查不到（历史行仍在库里）；直接插一行"曾经采过、当前无可见服务"的容器序列（`container:docker:ghost/secret-web`）同样受控 |
 | `tests/clockBoundary.test.ts`（**新增，4 条**） | 把"这两条线只许用固定 epoch"变成**可执行约定**（同 `envBoundary` / `backgroundBoundary` 手法）：扫描 `schedulerIntegration.test.ts` 与 `metricsApi.test.ts` 的源码（去注释后），出现 `Date.now(` / `new Date(` / `performance.now(` 即失败；两条线必须声明同一个 `const EPOCH = 1_700_000_000` 并写明取值"为了确定性、不是为了回避边界"（跨整点由专门用例显式覆盖）；必须把 `ctx.system.snapshot` / `ctx.containers.list` / `ctx.services.list` 三个数据源换成注入夹具。**反向保护**：受约束文件不存在或内容为空时用例必须**失败**，否则一次重命名就能让守卫退化成空断言 |
-| `tests/alertsApi.test.ts` | viewer 读规则/事件 200、**PATCH 与 ack 被 403 拒绝**；admin PATCH 成功并写审计；阈值越界 400；未知 rule/event id → 404；**缺 CSRF → 403**；`GET /api/health/monitor` 的鉴权与形状 |
+| `tests/alertsApi.test.ts` | 27 条：viewer 读规则/事件 200、**PATCH 与 ack 被 403 拒绝**；admin PATCH 成功并写审计；阈值越界 400；未知 rule/event id → 404；**缺 CSRF → 403**；`GET /api/health/monitor` 的鉴权与形状。**本轮只调整夹具、未削弱或删除任何既有断言**：①`GET /api/alerts/events` 的用例补一行**可见**的 docker 服务（`svc-fixture-gitea` / `sourceRef = docker:gitea`，SQL 直插、不加健康目标），因为读路径现在按当前可见性过滤，"从未有可见服务"的目标会被合法地过滤掉，那样计数与排序断言测到的就是另一件事；②`/api/alerts-unwired` 的第二次注册改为传**真实 `handle.ctx`**（与生产同一条路径），于是它的可见性过滤也真的生效 |
+| `tests/alertsVisibility.test.ts`（**新增，15 条**） | 告警**读路径的当前可见性**（同类泄漏第三处），全走 `buildApp()` + `app.inject()` 的**真实路由 + 真实鉴权 + 真实 SQLite**（完整迁移 v5），夹具不依赖 Docker、不依赖墙钟（`fired_at` 全是固定值）。断言：隐藏前事件与摘要照常（服务名出现在 `targetLabel` 与 `message` 里，`limit=1` 取到最新的**服务**事件）；隐藏后**整段 JSON** 里服务名 / 容器名 / 幽灵名 / `sourceRef` / `service:` / `container:` 一次都不出现，且 `total` / `counts` / `bySeverity` / `top` **一起下降**；`limit` 与 `state` 都作用在可见集合上（不会返回空页）；宿主类（磁盘/内存）事件字段原样；**admin 会话同样看不到**（与 `/api/metrics/*` 同口径，不分角色）；库里的事件行**没被删、`resolved_at` 仍为 NULL**（有意的组合语义）；恢复可见后同一 id / target / `firedAt` 原样回来；**注册表读失败 → fail-closed**（把 `handle.ctx.services` 换成必抛桩，服务/容器类事件一律不可见、宿主事件照常，还原后恢复原样）；另有两条纯函数边界（`alertEventVisibilityWhere` 的 `null` / 空集合 / 有集合三种输入与参数顺序；`loadVisibleServiceRefs` 正常返回集合、抛错返回 `null`） |
 | `tests/schedulerIntegration.test.ts` | 装配级（`buildApp` 真实装配，**全程不建立任何 SSE/HTTP 客户端**）：`backgroundJobs` 决定定时器是否启动、`close()` 之后一定停掉；tick 照样把样本写进库且"报告的行数 = 实际行数"；**缺测的分钟没有行**（写 0 会被这条抓住）；重启后历史还在（同一库文件）；`tickOnce` 单飞；**告警端到端**（读数 → 判定 → 落库 → 恢复 → 静默期内重开不新增 → 审计留痕，`evaluated > 0` 是"装配漏接 snapshot"的照妖镜）。**S2 验收驳回修复后（7 条）**：起点由固定 `EPOCH` 推出（`BASE = hourStart(EPOCH) + 15min`，**不是** `minuteStart(Date.now()) - 3600`），三个数据源全部换成注入假夹具，序列数因此是确定值（`HOST_SERIES = 5`）—— 断言从 `toBeGreaterThan(0)` 收紧成等号；每个"本该没有 hour 行"的地方都**显式断言 `hoursRolledUp === 0`**；新增**跨整点用例**（22:59:30 → 23:00:30：22:59 落 5 行 minute、22 点滚出 5 行 hour 且 `samples = 1` / `expected = 60` / 加权均值等于唯一读数、总行数 = 5 + 5、缺口 = 5 条 partial + 0 个完全缺测的整分钟、**未结束的 23 点不许提前滚出**、同整点重复 tick 不重复滚） |
 | `tests/backgroundBoundary.test.ts` | 以**源码能力边界**钉住"默认不外发、不自动重启容器"：三个后台模块目录存在且非空（否则守卫退化成空断言）；无 `fetch(` / `node:http(s).request` / `net.connect` / 子进程 / 通知客户端；不得**值导入** `docker/service.js` / `docker/provider.js` / `dockerode`（`import type` 允许）；`healthProbe.ts` 只声明 `GET` 且不带请求体 |
 | `tests/dockerMapper.test.ts`（新增小节） | 「容器退出码（null ≠ 0）」：`exited` + `137` → `137`；`ExitCode = 0` 保留 `0`；`State` 缺失 → `null` 且 `state = 'unknown'`；`ExitCode` 字段缺失 → `null`；运行中的容器是 `0` |
