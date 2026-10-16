@@ -1,6 +1,6 @@
 # TODO
 
-> 最后更新：2026-10-16
+> 最后更新：2026-10-17
 
 ## 已完成 ✅
 
@@ -462,14 +462,14 @@
       无默认值）与 `AlertSummaryEngine.suppressedByTarget()` / `composeAlertSummary(…, visible)`。
       冻结规格本轮**未改**（按"实现为准"归档在 `03-server-modules.md` 与 `04-api-contract.md`），
       是否回填规格由下一轮决定
-- [ ] **`README.md` 的测试规模数字未随近三轮更新**（本次归档范围不含 `README.md`）：
-      README 仍写着 **server 31 文件 / 594 用例** 与"766 个用例"，实际 **server 34 文件 / 643 用例**
-      （web 172 不变；即 **+3 文件 / +49 用例**）。
-      **照实记一处对不上**：既有文档的分解（`metricsVisibility` 13 + `clockBoundary` 4 +
-      `healthMonitor` 4 + `alertsVisibility` 15 + 本轮 `alertsVisibility` +12 = 48）比实测增量 **少 1**
-      （594 → 631 时就已差 1）—— 明细以各文件实测为准，**别再把那个分解当成可加总的账**。
-      另：`03-server-modules.md` §5 里既有条目的用例数（如 `metricsSampler.test.ts`）本轮未逐个重数
-      —— 本轮改过的三条已按实测更新（`alertsVisibility` 27 / `alertsApi` 27 / `alertEngine` 36）
+- [x] **`README.md` 的测试规模数字已随 `330b172` 更正**（上一轮记的"未更新"至此关闭）：
+      README 现在写 **server 34 文件 / 643 用例**、**815 个用例**（server 643 + web 172），
+      与实测逐字一致（归档时复跑：server 34 文件 / 643 例、web 10 文件 / 172 例、exit 0、
+      **0 skipped**）。E2E 的 **12 条**也复核为 `smoke.spec.ts` 10 + `security-headers.spec.ts` 2。
+      **仍照实记**：既有文档里那个用例数分解（`metricsVisibility` 13 + `clockBoundary` 4 +
+      `healthMonitor` 4 + `alertsVisibility` 15 + 第二组 +12）比实测增量 **少 1**（594 → 631 时就已差 1）
+      —— 明细以各文件实测为准，**别再把那个分解当成可加总的账**。
+      另：`03-server-modules.md` §5 里既有条目的用例数（如 `metricsSampler.test.ts`）未逐个重数
 - [x] **归档完成度（第一组那轮）**：告警读接口可见性收口的实现 / 契约 / 安全 / 变更记录已分别落到
       `03-server-modules.md`（新增 `src/modules/visibility/` 章节 + alerts SQL 层过滤小节）、
       `04-api-contract.md`（§6.9 读路径可见性语义）、`06-security.md`
@@ -500,6 +500,34 @@
       `suppressed` 侧的判别力由**非零夹具**承担（用例自检 `suppressed === 2` 且归因为
       `host 1 + 目标服务 1`）—— 这**不等于**一次变异实验，若下一轮要更强的证据，
       应补"临时取消 `sumSuppressedVisible` 的可见性判定 → 对应用例必须红"
+
+### `suppressed` 组测试隔离修复（提交 `330b172`；归档见 `09-changelog.md`）
+
+- [x] **`alertsVisibility.test.ts` 的 suppressed 组不再依赖宿主 Docker / 探测**（本轮）：
+      复审唯一阻断项是该文件 `beforeAll` 在默认配置下稳定超时 —— 它连续跑两次真实
+      `scheduler.tickOnce`，却只换了宿主快照，Docker 列表与健康探测仍走真实外部世界，
+      6 条最关键的 suppressed 用例被跳过、`npm test` 失败（用户实测 server 637 通过 / 6 跳过；
+      加 `--hookTimeout=120000` 后 6/6 通过但耗时约 **102 秒**）。按用户要求**不提高任何超时**，
+      改为在组内换掉四个外部世界（宿主快照 / `containers.list` / 探测注入 + `probeIntervalSec` 钉 1；
+      `ctx.services` **刻意不换**，见 changelog）；**未改任何断言、无 skip、未动超时**；
+      另新增一条 **5 秒耗时上界**断言，把"不许重新混入真 Docker"变成可执行约束。
+      归档时复跑：单文件 **27 例**、`Duration 2.87s`（tests 1.73s）；默认 `npm test` server
+      34 文件 / 643 例、web 10 文件 / 172 例，exit 0、**0 skipped**
+- [ ] **本机无法复现用户那台机器的 102 秒，"修复有效"由机制证据支撑，仍需在有 Docker 的机器上复核一次**（照实记）：
+      本机 Docker 守护进程**是活的**（实测 `docker version` → Server `29.8.0`），`containers.list()`
+      每次调用约 0–1ms，因此**即使把修复前的那个文件原样拿出来单独跑，本机也是 27 例全绿
+      （`Duration 3.46s`）** —— 慢路径在本机根本走不到，"102 秒"无法验证。
+      支撑"修复有效"的是两条机制证据：① 用临时探针统计，`containers.list` **每轮 tick 被调用 6 次、
+      两轮共 12 次**（与提交信息"假 containers 每 tick 被调用 12 次"的措辞不同，**实测是每轮 6 次**；
+      另一次独立探针在"两轮共 13 次（7 + 6）"，差额来自夹具服务与规则配置不同）—— 这 12 处调用点
+      现在全部落在注入的假夹具上，说明夹具确实接住了容器类取数；② 5 秒耗时上界断言
+      （真去连 Docker 单次超时就是 10⁴ms 级）。
+      取证时的**自我干扰**也照实记：那次探针是在修复前的旧文件上给 `containers.list` 加计数包装，
+      结果同一文件出现 3 红 + 5 跳过（`PATCH /api/services/:id` 返回 500），而**未加包装的原文件
+      同机全绿** —— 计数探针本身会干扰该文件，**"12 次"这条数字只在探针运行下成立、未在交付代码里复核**
+- [x] **本轮**（`330b172`）的归档已完成：`09-changelog.md` 新增条目、`03-server-modules.md` §5
+      的 `alertsVisibility.test.ts` 行补夹具/驱动方式、`08-operations.md` **§12.0** 新增"单测与外部环境无关"
+      一节、本文件三点同步；`README.md` 的数字由代码提交更新，**本轮未动**
 
 ## 环境备忘
 

@@ -3531,5 +3531,93 @@ npx vitest run --root server        # 本次归档独立复跑（2026-10-16）�
    应新开一个**管理侧**（`includeHidden` 口径）的读接口，**不要**把 `/summary` 改成区分角色
    —— 那会与"事件 / 快照类不分角色"的口径打架。
 
+---
+
+## [2026-10-17] 测试隔离：`alertsVisibility` 的 suppressed 组不再依赖宿主 Docker 与真实探测
+
+> 代码改动在提交 **`330b172`**（正文只改了 `server/tests/alertsVisibility.test.ts` 与 `README.md`
+> 的测试规模数字）。**本条目归档范围不含 `server/**`**，因此这里记录的是"改了什么、为什么、怎么验证"，
+> 而不是一次新的实现。
+
+### 背景（复审驳回）
+
+用户复审给出的**唯一阻断项**：`server/tests/alertsVisibility.test.ts` 第 721–736 行的 `beforeAll`
+在**默认配置**下稳定超时 —— 它连续跑两次真实 `scheduler.tickOnce`，却只把宿主快照换成了假夹具，
+**Docker 容器列表与健康探测仍走真实外部世界**。在无 Docker（或 Docker Desktop 抖动）的机器上
+每轮 tick 都要等到超时，两轮把 `beforeAll` 顶过 **30s `hookTimeout`**（`server/vitest.config.ts`
+的 `hookTimeout: 30_000`），于是该组 **6 条最关键的 suppressed 用例全部被跳过**，
+`npm test` 失败（server **637 通过 / 6 跳过**）；加 `--hookTimeout=120000` 后 6/6 通过，
+但**耗时约 102 秒**。用户明确要求：**不要仅提高超时**，要么注入假数据源，要么用真实
+`AlertEngine` + 固定 snapshot 产生 suppressed 再经真实 HTTP 路由验证。
+
+### 修法（路线 A 加固版：保留真实 `tickOnce` 与真实 HTTP 路由，只换外部世界）
+
+**未改任何断言、无 skip、未动任何超时。** 六个外部世界替换点全部装在
+`isolateTickDataSources()` 里，`afterAll` 全部还原：
+
+| # | 替换点 | 换成什么 | 为什么 |
+| --- | --- | --- | --- |
+| 1 | `ctx.system.snapshot` | 假宿主快照（内存 95%） | suppressed 的**宿主来源**（`memory_percent` 规则） |
+| 2 | `ctx.containers.list` | `makeContainerList([], { dockerAvailable: false })` | **102 秒的真正来源**；照抄 `schedulerIntegration.test.ts` / `metricsApi.test.ts` 的既有三件套写法 |
+| 3 | `ctx.services` | **刻意不换**（保持生产实例：`repository.listAll()` + `role='viewer'` 过滤） | 它本身**无外部调用**，隐藏/删除**立刻**反映到可见集合；换成静态 `EMPTY_SERVICES` 会把"按可见性求和"这件事**架空** |
+| 4 | `HealthMonitor.deps.probe` | 注入固定 `fail`（**零出站请求**），不再依赖"回环端口恰好连不上" | 监视器实例、状态机与连续失败计数仍是生产实现 |
+| 5 | `handle.config.health.probeIntervalSec` | **钉成 1** | 为 `0` 时监视器**根本不排探测** → 服务永远拿不到"连续失败" → 本组会**静默退化成 0、失去判别力** |
+| 6 | `afterAll` | 全部还原 | 别的组（含"把注册表换成抛错桩"的 fail-closed 用例）读路径行为一个字不变 |
+
+**装配期捕获的坑（本次实测踩到，照实记录）**：`serviceRegistry` / `HealthMonitor` /
+告警快照来源都在**装配期**就捕获了 `ctx.containers` 这**同一个对象**，因此**只替换 `handle` 上的引用
+是空操作** —— 实测 `handle.health = new HealthMonitor(...)` 无效（换完仍走真实探测）。
+必须替换**装配期捕获的那一处**（本组即 `ctx.containers.list` 与 `HealthMonitor.deps.probe`）。
+
+**用例语义**：6 条 suppressed 用例**逐条不变**（只改夹具 / 驱动方式），并**新增一条 5 秒耗时上界断言**
+（`TICK_BUDGET_MS = 5_000`，对两轮 tick 的墙钟耗时断言 `< 5000ms`），把"不许重新混入真 Docker"
+变成**可执行约束**而不是 reviewer 看时间戳。
+
+**判别力（修复方实测，本次归档未复跑）**：把注入探测从 `fail` 改成 `ok` → 用例红在
+`expected 1 to be 2`（该服务对 `suppressed` 的贡献正确消失），证明夹具没有被架空。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 修改 | `server/tests/alertsVisibility.test.ts` | 新增 `isolateTickDataSources()` / `overrideHealthProbe()` / `failingProbe()`（**全是夹具，不是被测逻辑**）；`beforeAll` 改为装配四个替换点 + 两轮 tick 计时；`afterAll` 全量还原；新增 `TICK_BUDGET_MS` 耗时上界与 `lastTickMs` 自检。**6 条用例的断言与名称逐条未改** |
+| 修改 | `README.md` | 测试规模 **594 / 766 → 643 / 815**（server 34 文件 / 643 例；web 10 文件 / 172 例），E2E 12 条复核为 `smoke` 10 + `security-headers` 2 |
+| 修改 | `docs/static/{03,08,09}.md`、`todo.md` | 本次归档（**未改 `server/src/**`、`web/**`、`e2e/**`**） |
+
+### 验证方式（本次归档**独立复跑**）
+
+```
+npm test                                   # 根目录，无任何 flag
+# → server：Test Files 34 passed (34)；Tests 643 passed (643)；Duration 20.55s
+#   web   ：Test Files 10 passed (10)；Tests 172 passed (172)
+#   exit 0，**0 skipped**（这正是复审驳回时的症状指标：当时是 637 通过 / 6 跳过）
+
+npx vitest run tests/alertsVisibility.test.ts --root server
+# → Tests 27 passed (27)；Duration 2.87s（tests 1.73s）—— 修复前约为 102 秒（用户机器实测）
+```
+
+**归档时用临时探针做的两次交叉核对（探针已删除，非交付物）**：
+
+| 核对项 | 结果 |
+| --- | --- |
+| `containers.list` 在两轮 tick 里被调用几次 | 在**修复前的那个文件**上给真实 `containers.list` 加计数包装，实测 **两轮共 12 次（每轮 6 次）**，每次 0–1ms。**与提交信息"假 containers 每 tick 被调用 12 次"的措辞不同：实测是每轮 6 次、两轮共 12 次**。机制上这 12 次调用点现在全部落在注入的假夹具上（`ctx.containers.list` 是同一个对象），所以"夹具确实接住了全部容器类取数"成立，但**这个 12 是旧文件的调用点计数，不是在交付代码上直接测出来的** |
+| 修复前的文件在本机单独跑 | **27 例全绿，`Duration 3.46s`**（另一次 2.35s / 3.85s）—— 本机 Docker 守护进程是活的（`docker version` → Server `29.8.0`），**慢路径根本走不到**，所以"102 秒"在本机无法验证，也**不是**"旧文件必然超时"的反证 |
+| 探针的自我干扰（照实记） | 同一份旧文件，**加**计数包装后变成 **3 红 + 5 跳过**（`PATCH /api/services/:id` 返回 500，另一处断言红），**去掉**包装后同机全绿 ⇒ 计数探针本身会干扰该文件。"12 次/两轮"这条数字**只在探针运行下成立**，未在交付代码里复核 |
+
+### 已知限制 / 后续
+
+1. **本机无法复现用户那台机器的 102 秒**（本机 Docker 可用且秒回，旧文件同机 27 例全绿 3.46s），
+   因此"修复有效"由**机制证据**支撑（旧文件里的 12 处 `containers.list` 调用点现在全部落在
+   注入的假夹具上 + 5 秒耗时上界断言），**仍需在有 Docker 的机器上复核一次**。已记入 `todo.md`。
+2. **修复前的失败归因（"真实 Docker 调用每轮等到超时"）取自提交信息与用户实测，本次归档未独立证实**
+   —— 本机能拿到的只是"未加包装的旧文件在本机 3.46s 全绿"，那只说明**本机走不到慢路径**，
+   既不能证实也不能证伪用户机器上的 637 / 6 跳过。
+3. `HealthMonitor.deps.probe` 是通过**一次结构化断言**够到的私有依赖（`src` 不动）。
+   若将来 `HealthMonitor` 变成 `#private` 字段或改变内部结构，这段夹具会失效 ——
+   失效方式是**编译期/运行期立刻报错**（不是静默放过），但它确实是"测试够到实现细节"的耦合点。
+4. 本组仍然**走真实 HTTP 路由 + 真实 SQLite + 真实调度器**：隔离的只是外部世界（Docker / 宿主采样 / 探测），
+   被测的可见性逻辑一行未换。
+
+
 
 

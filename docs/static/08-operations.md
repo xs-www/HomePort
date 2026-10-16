@@ -896,6 +896,29 @@ SQLite、首启令牌与主密钥都写在那里），并在验证过版本后�
 
 ## 12. CI 质量门与本地 E2E
 
+### 12.0 单测不依赖外部环境（`npm test` 无 Docker 也应全绿）
+
+`npm test`（Vitest，server + web）**不需要**任何外部依赖：不需要 Docker、不需要 Tailscale、
+不需要网络。测试里凡是要碰"外部世界"的地方，一律换成**注入夹具**；只有 E2E（§12.3）才需要
+起真实进程（但它也是刻意把数据源指向不存在的 socket）。
+
+| 外部世界 | 单测里怎么处理 |
+| --- | --- |
+| Docker 容器列表 / 发现 | `tests/support/serviceFixtures.ts` 的 `makeContainerList(..., { dockerAvailable: false })`，或直接换成假对象 |
+| 宿主采样（CPU / 内存 / 磁盘 / GPU） | 注入假 `SystemSnapshot`（`ctx.system.snapshot`） |
+| 服务健康探测 | 注入固定结果的 `HealthMonitor.deps.probe`（**零出站请求**） |
+| 墙钟 | 注入固定 epoch（`1_700_000_000`）；`schedulerIntegration` / `metricsApi` 两条线由 `clockBoundary.test.ts` 扫源码钉住 |
+
+**为什么值得写进运维文档**：这条边界在 `330b172` 之前**被破坏过一次** ——
+`alertsVisibility.test.ts` 的 suppressed 组只换了宿主快照，Docker 列表与健康探测仍走真实外部世界，
+于是在没有 Docker（或 Docker Desktop 抖动）的机器上两轮 `tickOnce` 撞破 30s `hookTimeout`，
+**6 条最关键用例被整组跳过**、`npm test` 失败（症状是"通过数少了 6 条 + 有 skipped"，
+而不是某条断言红）。修复方式见 `09-changelog.md`；组内现在有一条 **5 秒耗时上界**断言，
+任何重新混入的真 Docker 调用都会被打红。
+
+**判读失败输出**：`Tests 637 passed | 6 skipped` 这类"跳过"几乎总是**夹具 hook 超时/抛错**，
+不是用例被有意 `skip` —— 本项目交付的测试代码里没有 `skip`。
+
 ### 12.1 两个工作流的分工
 
 | 工作流 | 触发 | 做什么 | 权限 |
