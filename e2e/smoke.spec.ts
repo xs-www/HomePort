@@ -432,8 +432,9 @@ test('告警页：viewer 只读（没有写入口，带有效 CSRF 的写请求�
 
   // viewer 能看规则（只读），但界面上没有任何写入口。
   await expect(page.getByText('磁盘使用率过高')).toBeVisible();
-  // 只断言**按钮的可访问名**、并尽量用 exact：规则列表里的状态文案（如"未启用"）
-  // 会误命中宽泛的正则，那种失败是测试自己的问题，不是权限问题。
+  // 只断言**按钮的可访问名**、并尽量用 exact：规则列表里的状态文案（「启用中」「已关闭」）
+  // 会误命中宽泛的正则 —— `确认|保存|启用` 就会命中「启用中」，
+  // 那种失败是测试自己的问题，不是权限问题。
   await expect(page.getByRole('button', { name: '确认', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '保存', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '取消', exact: true })).toHaveCount(0);
