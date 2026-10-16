@@ -21,6 +21,7 @@ import { registerHealthMonitorRoutes } from '../src/api/healthMonitor.js';
 import { loadConfig, type PortalConfig } from '../src/config.js';
 import { createSilentLogger } from '../src/logger.js';
 import { AuditRepository } from '../src/db/users.js';
+import { ServicesRepository } from '../src/db/services.js';
 import type { AlertEventListResponse, AlertRuleListResponse, AlertRuleView, AlertSummaryView } from '../src/modules/alerts/types.js';
 import type { HealthMonitorView } from '../src/modules/health/types.js';
 
@@ -193,9 +194,10 @@ beforeAll(async () => {
 
   // 告警域：故意**再注册一次**同一套路由（独立前缀），用来证明路由自带兜底守卫 ——
   // 即使 api/index.ts 漏了 PROTECTED_PREFIXES 条目，也不会匿名开放。
+  // 第二个参数传真实 ctx（与生产同一条路径），于是它的可见性过滤也真的生效。
   app.register(
     async (scope) => {
-      registerAlertRoutes(scope, { users: handle.ctx.users }, { alerts: handle.alerts });
+      registerAlertRoutes(scope, handle.ctx, { alerts: handle.alerts });
     },
     { prefix: '/api/alerts-unwired' },
   );
@@ -395,6 +397,20 @@ describe('告警 API · PATCH /api/alerts/rules/:id（§5.3 / §7）', () => {
 
 describe('告警 API · GET /api/alerts/events（§7）', () => {
   beforeAll(() => {
+    // 夹具前提：`ev-3` 的目标服务必须**真的存在且可见**。
+    // 读路径现在按当前可见性过滤（服务被隐藏/删除后事件不再出现），而
+    // `service:docker:gitea` 在无 Docker 的测试环境里若没有对应的服务行，
+    // 就是"从未有可见服务"的目标 —— 那样下面的计数/排序断言就会测到另一件事。
+    // 因此这里补一行可见的 docker 服务（SQL 直插：不加健康目标，不影响
+    // /api/health/monitor 的空视图断言）。
+    new ServicesRepository(handle.db).insert({
+      id: 'svc-fixture-gitea',
+      slug: 'gitea-fixture',
+      displayName: 'Gitea',
+      sourceType: 'docker',
+      sourceRef: 'docker:gitea',
+    });
+
     seedEvent({ id: 'ev-1', target: 'disk:C:', firedAt: '2026-10-15T09:00:00.000Z', severity: 'warning' });
     seedEvent({ id: 'ev-2', target: 'disk:D:', targetLabel: 'D:', firedAt: '2026-10-15T09:05:00.000Z', severity: 'critical' });
     seedEvent({

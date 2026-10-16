@@ -36,7 +36,8 @@
  *
  * 采集用 viewer 视角只保证"隐藏之后不再新增样本"；**隐藏之前**已落库的行与进程内
  * `liveTargets` 仍在。因此 `availableTargets()` 与 `resolveTarget()` 会按**当前**
- * viewer 可见服务集合再过一次（见 `visibleServiceRefs`）：不可见与"从未采集过"
+ * viewer 可见服务集合再过一次（见 `visibleServiceRefs`，实现已抽到共享模块
+ * `modules/visibility/serviceVisibility.ts`，与告警读路径同一份）：不可见与"从未采集过"
  * 返回同一个 null，API 层据此返回同一种 400 —— 不泄露存在性。
  */
 import type { PortalConfig } from '../../config.js';
@@ -44,6 +45,11 @@ import type { Db } from '../../db/database.js';
 import type { Logger } from '../../logger.js';
 import { backgroundHostRequest } from '../docker/backgroundContext.js';
 import type { HostContextRequest } from '../docker/service.js';
+import {
+  isServiceTargetVisible,
+  loadVisibleServiceRefs,
+  type ServiceTargetKind,
+} from '../visibility/serviceVisibility.js';
 import {
   HOUR_SECONDS,
   MINUTE_SECONDS,
@@ -641,32 +647,23 @@ export class MetricsSampler {
    * 只靠采集视角，被隐藏的服务会被 catalog 继续列出、被 history 继续查到，
    * 直到历史数据过期。这正是"读接口绕过当前可见性"的泄漏面。
    *
-   * ## 为什么不缓存（也不复用任何 TTL 缓存）
+   * ## 实现已经抽到共享模块
    *
-   * 可见性是 `services.visibility` 这一行 DB 事实，读它不产生任何 Docker 调用
-   * （`ServiceRegistryService.list` 内部的发现与容器列表各自走**既有**的 TTL 缓存）。
-   * 加一层缓存只会把"隐藏"的生效时刻推迟到 TTL 之后，而这段时间恰恰就是泄漏窗口；
-   * 用一个可观测的泄漏窗口去省一次列表读，是拿安全换性能 —— 这里不做。
-   *
-   * ## 来源与采集时一致
-   *
-   * viewer 视角 + 与采集同一个 `backgroundHostRequest(config)`，因此"隐藏服务在
-   * 采集侧不可见"与"在读取侧不可见"用的是同一套判定，不会出现两套口径。
+   * 具体的"怎么读、读失败怎么办、要不要缓存"全在 `modules/visibility/serviceVisibility.ts`
+   * —— 那里是同一份口径的唯一实现，告警读路径（`/api/alerts/*`）调用的是**同一个函数**。
+   * 本方法只负责把采样器自己的依赖（注册表 + 后台宿主上下文 + 日志）喂进去。
    *
    * @returns 可见服务的 `sourceRef` 集合；注册表读失败时返回 `null`
    *   （调用方按 **fail-closed** 处理：服务/容器类 target 一律视为不可见）。
    *   宿主与磁盘指标不经过这个判定，因此注册表抖动不会影响它们。
    */
   private async visibleServiceRefs(): Promise<ReadonlySet<string> | null> {
-    try {
-      const listed = await this.deps.registry.list(this.hostRequest, {}, 'viewer');
-      return new Set(listed.items.map((item) => item.sourceRef));
-    } catch (error) {
-      this.log.warn('读取服务可见性失败：服务/容器类 target 按不可见处理（宿主与磁盘指标不受影响）', {
-        error: errorMessage(error),
-      });
-      return null;
-    }
+    return loadVisibleServiceRefs({
+      registry: this.deps.registry,
+      request: this.hostRequest,
+      source: 'metrics.read',
+      logger: this.log,
+    });
   }
 
   /**
@@ -686,17 +683,15 @@ export class MetricsSampler {
    *
    * 服务/容器 target 里带的就是服务的稳定身份：`service:<sourceRef>` 与
    * `container:<sourceRef>`（`containerServiceRef` 与服务的 `sourceRef` 同源），
-   * 因此必须命中**当前**可见集合；`visible === null`（注册表不可用）时一律拒绝，
-   * 宁可少列一个也不泄露一个。
+   * 因此必须命中**当前**可见集合；集合为 `null`（注册表不可用）时一律拒绝。
+   * "取身份 + 判可见"这段与告警共用 `serviceVisibility` 里的同一对函数。
    */
   private targetVisible(metricKey: string, target: string, visible: ReadonlySet<string> | null): boolean {
     if (this.isHostOwnedTarget(metricKey)) return true;
-    if (visible === null) return false;
     const metric = metricByKey(metricKey);
     if (!metric) return false;
-    const prefix = metric.targetKind === 'container' ? 'container:' : 'service:';
-    if (!target.startsWith(prefix)) return false;
-    return visible.has(target.slice(prefix.length));
+    const kind: ServiceTargetKind = metric.targetKind === 'container' ? 'container' : 'service';
+    return isServiceTargetVisible(target, visible, kind);
   }
 
   /** 当前采样间隔（秒）；非法值回退到 60，避免 expected 变成 NaN。 */
