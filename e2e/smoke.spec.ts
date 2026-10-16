@@ -311,3 +311,48 @@ test('服务墙：Ctrl+K 搜索并进入服务详情；viewer 看不到任何管
 
   await expectNoCrash(page, errors);
 });
+
+/**
+ * 移动端排版验收（计划 §4 明确要求"移动端"）。
+ *
+ * 为什么必须用真实视口而不是单测：卡片是 Tailwind 断点驱动的（`grid sm:grid-cols-2 xl:grid-cols-3`），
+ * jsdom 不做布局，单测里 `getComputedStyle` 拿不到真实轨道数；横向溢出这类破版更是只有真浏览器能发现。
+ * 用 iPhone 13 的视口（390×844）。
+ */
+test('服务墙：移动视口下单列排版、无横向溢出，命令面板可用且不溢出', async ({ page }) => {
+  const errors = trackPageErrors(page);
+
+  await loginAs(page, ADMIN_USERNAME, ADMIN_PASSWORD);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1, name: '服务' })).toBeVisible();
+
+  const grid = page.getByTestId('service-grid');
+  await expect(grid).toBeVisible();
+
+  // 1) 单列：<640px 不该出现两列（这是移动端最常见的破版）
+  const tracks = await grid.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(' ').length);
+  expect(tracks).toBe(1);
+
+  // 2) 卡片落在视口内，且页面不横向滚动
+  const card = grid.locator('article').first();
+  await expect(card).toBeVisible();
+  const box = await card.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.x).toBeGreaterThanOrEqual(0);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(391);
+  const overflowX = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  expect(overflowX).toBeLessThanOrEqual(1);
+
+  // 3) 小屏下命令面板照样能用，且不溢出视口
+  await page.keyboard.press('Control+K');
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('combobox')).toBeVisible();
+  const dialogBox = await dialog.boundingBox();
+  expect(dialogBox).not.toBeNull();
+  expect(dialogBox!.x).toBeGreaterThanOrEqual(0);
+  expect(dialogBox!.x + dialogBox!.width).toBeLessThanOrEqual(391);
+
+  await expectNoCrash(page, errors);
+});
