@@ -490,6 +490,9 @@ export class ServiceRegistryService {
       bindingRefs: service.bindingRefs,
       container,
       serveRoutes: live.serve.routes,
+      // 判定"这个容器是不是这条路由的 owner"需要看全部容器：端口被多个容器占用时，
+      // route.containerId/containerName 是 mapper 猜的第一个匹配，不能直接信。
+      containers: live.items,
     });
     const entries = buildServiceEntries({
       preferredUrl: service.preferredUrl,

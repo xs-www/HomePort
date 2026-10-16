@@ -269,10 +269,60 @@ export interface DiscoveryPlan {
 }
 
 /**
+ * 有多少个容器"声称"占用了某个宿主端口（`0` = 没有容器在用它）。
+ *
+ * 为什么要自己数：`mapServeRoutes` 是按 `port.hostPort === route.targetPort` 用
+ * `containers.find(...)` 归属的，**冲突时取第一个匹配**（既有行为，本文件不改它）。
+ * 而"两个容器报同一宿主端口"在真实数据里会出现 —— 典型是**已停止的容器仍报告
+ * 自己配置过的端口绑定**，而门户默认连停止的容器一起列（`all: true`）。
+ */
+export function countHostPortClaimants(targetPort: number | null, containers: readonly ContainerSummary[]): number {
+  if (targetPort === null) return 0;
+  let claimants = 0;
+  for (const container of containers) {
+    if (container.ports.some((port) => port.hostPort === targetPort)) claimants += 1;
+  }
+  return claimants;
+}
+
+/**
+ * 这条 serve 路由的容器归属**可不可信**（唯一占用该宿主端口时才可信）。
+ *
+ * 关键：**发现阶段与视图阶段必须用同一个判定**。少了任何一处，就会出现
+ * "同一路由既是独立服务、又被挂回第一个容器"这种自相矛盾的视图 ——
+ * 用户看到的是一个点了打到别人家的入口，而这正是计划 §4 要求"多容器端口冲突不猜"的原因。
+ */
+export function isServeRouteAttributable(
+  route: { targetPort: number | null },
+  containers: readonly ContainerSummary[],
+): boolean {
+  return countHostPortClaimants(route.targetPort, containers) === 1;
+}
+
+/**
+ * 副本代表选择：优先"在跑"的容器。
+ *
+ * 为什么不是"无脑取第一个"：`docker compose up --scale web=2` 之后停掉其中一个副本很常见，
+ * 代表恰好是停掉的那个时，服务墙的"容器运行"维度会显示 stopped，
+ * 让人去重启一个本来没事的服务。`restarting` 排在 `exited` 前面：
+ * 正在重启说明编排层在把它拉起来，比一个已退出且不会自愈的副本更接近"可用"。
+ */
+function containerAvailabilityRank(state: string): number {
+  if (state === 'running') return 0;
+  if (state === 'restarting' || state === 'created' || state === 'paused') return 1;
+  return 2;
+}
+
+function isBetterRepresentative(candidate: ContainerSummary, current: ContainerSummary): boolean {
+  return containerAvailabilityRank(candidate.state) < containerAvailabilityRank(current.state);
+}
+
+/**
  * 规划一次发现：返回"服务应该长什么样"的纯数据，落库与否由调用方决定。
  *
  * serve 路由的容器归属**复用 `mapServeRoutes` 已算好的 `containerName/containerId`**
- * （它按 `targetPort` 匹配容器端口），因此这里不再重复实现匹配逻辑。
+ * （它按 `targetPort` 匹配容器端口），因此这里不再重复实现匹配逻辑；
+ * 但"mapper 给了 owner"要通过 `isServeRouteAttributable` 复核一次才敢用。
  */
 export function planDiscovery(input: DiscoveryInput): DiscoveryPlan {
   const services = new Map<string, DiscoveredService>();
@@ -287,24 +337,12 @@ export function planDiscovery(input: DiscoveryInput): DiscoveryPlan {
   }
 
   /**
-   * 有多少个容器"声称"占用了某个宿主端口。
+   * 每个 docker 服务已选定的"代表容器"（多副本合并时用）。
    *
-   * 为什么要自己数一遍：`mapServeRoutes` 是按 `port.hostPort === route.targetPort` 用
-   * `containers.find(...)` 归属的，**冲突时取第一个匹配**（既有行为，本函数不改它）。
-   * 而"两个容器都报告同一宿主端口"在真实数据里会出现 —— 典型是**已停止的容器仍报告
-   * 自己配置过的端口绑定**，而门户默认连停止的容器一起列（`all: true`）。
-   * 这种情况下 mapper 给的 owner 就是猜的，而计划 §4 明确要求"多容器端口冲突不猜"，
-   * 所以这里用实时容器列表自己判一次唯一性，宁可作为独立 serve 服务列出 + 说明原因，
-   * 也不把入口挂到错的容器卡片上（挂错比不挂更难排查）。
+   * 数据库对 `(service_id, kind, ref)` 有唯一约束，所以同一 `sourceRef` **只能留一份绑定**，
+   * 副本信息不可能一行一个地存下去；代表容器决定卡片的"容器运行"维度看谁。
    */
-  const countHostPortClaimants = (targetPort: number | null): number => {
-    if (targetPort === null) return 0;
-    let claimants = 0;
-    for (const container of input.containers) {
-      if (container.ports.some((port) => port.hostPort === targetPort)) claimants += 1;
-    }
-    return claimants;
-  };
+  const representative = new Map<string, ContainerSummary>();
 
   for (const container of input.containers) {
     const sourceRef = containerServiceRef(container);
@@ -333,9 +371,19 @@ export function planDiscovery(input: DiscoveryInput): DiscoveryPlan {
     };
 
     if (existing) {
-      // 同 sourceRef 的副本容器：合并到同一个服务（只保留一份绑定记录，避免重复卡片）
-      if (!existing.bindings.some((item) => item.ref === binding.ref && item.containerId === binding.containerId)) {
-        existing.bindings.push(binding);
+      // 同一 `sourceRef` = 同一 Compose 服务的**副本**（`docker compose up --scale web=2`）。
+      // 副本必须合并成"一个服务 + 一份绑定"，两个理由：
+      //   1. **绑定去重的键只能是 `ref`（稳定身份），不能带上 containerId** ——
+      //      副本之间容器 ID 必然不同，带上就等于没去重，两行同 ref 会直接撞
+      //      `UNIQUE(service_id, kind, ref)` 让整个发现事务回滚（表现为 /api/services 报错）；
+      //   2. 代表容器优先取**正在运行**的那个（见 isBetterRepresentative）：
+      //      拿一个恰好停掉的副本当代表，会让人去重启一个本来没事的服务。
+      const current = representative.get(sourceRef);
+      if (current && isBetterRepresentative(container, current)) {
+        const index = existing.bindings.findIndex((item) => item.ref === binding.ref);
+        if (index === -1) existing.bindings.push(binding);
+        else existing.bindings[index] = binding;
+        representative.set(sourceRef, container);
       }
       continue;
     }
@@ -351,12 +399,13 @@ export function planDiscovery(input: DiscoveryInput): DiscoveryPlan {
       bindingRefs: [sourceRef],
       bindings: [binding],
     });
+    representative.set(sourceRef, container);
   }
 
   for (const route of input.serveRoutes) {
     const serveRef = serveServiceRef(route);
-    /** 端口被多个容器占用 → mapper 的 owner 是"第一个匹配"，不可信（见上）。 */
-    const claimants = countHostPortClaimants(route.targetPort);
+    /** 端口被多个容器占用 → mapper 的 owner 是"第一个匹配"，不可信（见 isServeRouteAttributable）。 */
+    const claimants = countHostPortClaimants(route.targetPort, input.containers);
     const ambiguous = claimants > 1;
 
     const ownerRef = ambiguous
@@ -388,6 +437,8 @@ export function planDiscovery(input: DiscoveryInput): DiscoveryPlan {
     };
 
     if (owner) {
+      // 重复的 serve 路由（同一 host/port/path 出现两次）会在这里多推一份绑定，
+      // 由本函数收尾的"(kind, ref) 唯一"归一化兜住（见下方注释）。
       if (!owner.bindingRefs.includes(serveRef)) owner.bindingRefs.push(serveRef);
       owner.bindings.push(binding);
       continue;
@@ -436,6 +487,23 @@ export function planDiscovery(input: DiscoveryInput): DiscoveryPlan {
         : '未读到 Tailscale Serve 配置（Serve 入口可能缺失，CLI 模式才可读取）。',
     );
   }
+  // 收尾：保证"每个服务里每个 (kind, ref) 只有一份绑定"。
+  //
+  // 为什么收敛到这一个出口、而不是在每个 push 处小心翼翼地判断：数据库对
+  // `(service_id, kind, ref)` 有唯一约束（迁移 v4），任何一处漏去重都会让**整个发现事务回滚**
+  // ——用户看到的是"服务墙报错"，而不是"少了一个条目"。多副本容器与重复的 serve 路由
+  // （同一 host/port/path 出现两次）都会走到这里，把不变量收在一处，以后新增绑定来源也不会再踩。
+  for (const service of services.values()) {
+    const seenBindings = new Set<string>();
+    service.bindings = service.bindings.filter((binding) => {
+      const key = `${binding.kind}\u0000${binding.ref}`;
+      if (seenBindings.has(key)) return false;
+      seenBindings.add(key);
+      return true;
+    });
+    service.bindingRefs = [...new Set(service.bindingRefs)];
+  }
+
   for (const service of services.values()) {
     const kinds = new Set(service.bindings.map((binding) => binding.kind));
     if (kinds.size === 0) notes.push(`服务 ${service.sourceRef} 没有任何绑定。`);
@@ -767,11 +835,22 @@ export function findContainerForService(input: {
   return null;
 }
 
-/** 过滤出属于某个服务的 serve 路由（按稳定 ref 或容器归属匹配）。 */
+/**
+ * 过滤出属于某个服务的 serve 路由（按稳定 ref 或容器归属匹配）。
+ *
+ * **容器归属匹配必须过 `isServeRouteAttributable`**：`route.containerId/containerName` 来自
+ * `mapServeRoutes` 的 `containers.find(...)`（端口冲突时取第一个匹配）。少了这道复核，
+ * 发现阶段判定为"不可归属"的路由会在**视图阶段**又被挂回第一个容器 ——
+ * 于是同一条路由既是独立服务、又出现在 app-a 的候选入口里，用户点到的是别人家的服务。
+ * 显式写在 `bindingRefs` 里的归属（稳定 ref）不受影响：那是发现阶段确认过的结果，
+ * 也是独立 serve 服务能显示自己入口的唯一依据。
+ */
 export function serveRoutesForService(input: {
   bindingRefs: readonly string[];
   container: ContainerSummary | null;
   serveRoutes: readonly ServeRouteView[];
+  /** 判定归属唯一性所必需（见 isServeRouteAttributable）。 */
+  containers: readonly ContainerSummary[];
 }): ServeRouteView[] {
   const refs = new Set(input.bindingRefs);
   const out: ServeRouteView[] = [];
@@ -780,6 +859,7 @@ export function serveRoutesForService(input: {
     const ref = serveServiceRef(route);
     const ownedByContainer =
       input.container !== null &&
+      isServeRouteAttributable(route, input.containers) &&
       (route.containerId === input.container.id || route.containerName === input.container.name);
     if (!refs.has(ref) && !ownedByContainer) continue;
     if (seen.has(ref)) continue;
