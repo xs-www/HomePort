@@ -7,6 +7,10 @@
  * 3. 把后端的 `{ error: { code, message, details } }` 转成 `ApiError` 抛出，
  *    页面只需 `catch (e) { e.message }` 就能展示中文提示。
  * 4. 401 时触发全局"会话失效"回调（AuthProvider 借此跳转登录页）。
+ * 5. 401 的语义细分：`TOTP_INVALID` / `TOTP_CHALLENGE_EXPIRED` / `INVALID_CREDENTIALS`
+ *    表示"凭据或验证码不对"而非"会话失效"，这类 401 **不触发**全局登出回调
+ *    （否则用户输错一次验证码就会被踢回登录页）；真正的会话失效仍是 `UNAUTHORIZED`。
+ *    登录/登录第二步这类"建立会话之前"的请求另用 `skipUnauthorizedHandler` 显式跳过。
  */
 
 import type {
@@ -16,8 +20,11 @@ import type {
   ContainerLogsResponse,
   HealthResponse,
   LoginResponse,
+  LoginTotpRequest,
+  LoginTotpResponse,
   MeResponse,
   OverviewResponse,
+  RecoveryCodesResponse,
   ResetSettingsResponse,
   SessionActivity,
   SessionUser,
@@ -29,6 +36,13 @@ import type {
   TailscaleTestResponse,
   ToolListResponse,
   ToolView,
+  TotpDisableRequest,
+  TotpDisableResponse,
+  TotpEnableRequest,
+  TotpEnableResponse,
+  TotpRecoveryCodesRequest,
+  TotpResetResponse,
+  TotpSetupResponse,
   UpdateSettingsResponse,
   UserListResponse,
   UserPreferences,
@@ -83,6 +97,19 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 /** 指标采集等较慢接口使用更长的超时。 */
 const SLOW_TIMEOUT_MS = 45_000;
 
+/**
+ * 表示"这次提交的凭据/验证码不对"的 401 错误码 —— 它们**不是**会话失效。
+ *
+ * 若不排除，用户只是输错一次 TOTP 验证码（或当前密码）就会被全局登出，
+ * 与"就地重试"的产品预期完全相反。排除后，真正的会话失效仍然返回
+ * `UNAUTHORIZED`，照旧触发 `onUnauthorized` 跳登录页。
+ */
+const CREDENTIAL_FAILURE_CODES = new Set(['TOTP_INVALID', 'TOTP_CHALLENGE_EXPIRED', 'INVALID_CREDENTIALS']);
+
+function isCredentialFailure(code: string): boolean {
+  return CREDENTIAL_FAILURE_CODES.has(code);
+}
+
 export class ApiClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
@@ -132,7 +159,9 @@ export class ApiClient {
 
       if (!response.ok) {
         const error = toApiError(payload, response.status);
-        if (response.status === 401 && !options.skipUnauthorizedHandler) this.onUnauthorized();
+        if (response.status === 401 && !options.skipUnauthorizedHandler && !isCredentialFailure(error.code)) {
+          this.onUnauthorized();
+        }
         throw error;
       }
 
@@ -181,6 +210,20 @@ export class ApiClient {
     return this.request<LoginResponse>('/auth/login', {
       method: 'POST',
       body: input,
+      skipUnauthorizedHandler: true,
+    });
+  }
+
+  /**
+   * 登录第二步：提交 6 位动态码或恢复码，成功后才真正建立会话。
+   *
+   * 与 `login` 一样在**会话建立之前**调用，因此不假设已有 CSRF 令牌
+   * （客户端会在令牌存在时才附加请求头），且 401 不当作"会话失效"。
+   */
+  loginTotp(body: LoginTotpRequest): Promise<LoginTotpResponse> {
+    return this.request<LoginTotpResponse>('/auth/login/totp', {
+      method: 'POST',
+      body,
       skipUnauthorizedHandler: true,
     });
   }
@@ -313,6 +356,60 @@ export class ApiClient {
 
   revokeUserSessions(id: number): Promise<{ revoked: number }> {
     return this.request<{ revoked: number }>(`/users/${id}/sessions/revoke`, { method: 'POST' });
+  }
+
+  // ------------------------------------------------------------ 两步验证（TOTP）
+
+  /**
+   * 生成一个**未确认**的 TOTP 种子。
+   *
+   * 重复调用会重新生成，并使上一次未确认的种子失效（界面必须就此提示用户）。
+   */
+  totpSetup(): Promise<TotpSetupResponse> {
+    return this.request<TotpSetupResponse>('/users/me/totp/setup', { method: 'POST' });
+  }
+
+  /**
+   * 用 6 位动态码确认绑定；成功时**一次性**返回恢复码。
+   *
+   * 失败时 401 是 `TOTP_INVALID`（验证码错误），由 `CREDENTIAL_FAILURE_CODES`
+   * 保证它不会被误当作会话失效。
+   */
+  totpEnable(body: TotpEnableRequest): Promise<TotpEnableResponse> {
+    return this.request<TotpEnableResponse>('/users/me/totp/enable', {
+      method: 'POST',
+      body,
+    });
+  }
+
+  /**
+   * 关闭两步验证。
+   *
+   * 后端要求的门槛不低于开启：需要密码，**且当前已启用时还需一次当前验证码或恢复码**
+   * （缺验证码时后端按 `VALIDATION_FAILED` 返回 `fieldErrors.code`）。
+   */
+  totpDisable(body: TotpDisableRequest): Promise<TotpDisableResponse> {
+    return this.request<TotpDisableResponse>('/users/me/totp/disable', {
+      method: 'POST',
+      body,
+    });
+  }
+
+  /** 用当前动态码重新生成恢复码；旧恢复码立即失效。401 = `TOTP_INVALID`。 */
+  totpRegenerateRecoveryCodes(body: TotpRecoveryCodesRequest): Promise<RecoveryCodesResponse> {
+    return this.request<RecoveryCodesResponse>('/users/me/totp/recovery-codes', {
+      method: 'POST',
+      body,
+    });
+  }
+
+  /**
+   * 管理员强制重置某用户的两步验证（清除绑定 + 吊销其全部会话）。
+   *
+   * 这里的 401 只可能是会话真的失效，因此保留全局 401 回调。
+   */
+  resetUserTotp(id: number): Promise<TotpResetResponse> {
+    return this.request<TotpResetResponse>(`/users/${id}/totp/reset`, { method: 'POST' });
   }
 
   auditLog(limit = 100): Promise<AuditListResponse> {

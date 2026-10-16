@@ -4,6 +4,11 @@
  * 关键设计：`AuthProvider` 是唯一持有会话状态的地方，并在挂载时把
  * 「CSRF 取值函数」与「401 回调」注入 API 客户端单例 —— 这样其它页面
  * 直接用 `api.xxx()` 即可，无需关心令牌与失效跳转。
+ *
+ * 两步验证（TOTP）：`login()` 返回判别联合 —— `ok` 表示已建立会话，
+ * `totp` 表示还需要第二步。`challengeToken` 是**一次性**凭据，只回传给登录页
+ * 并保存在组件状态里（不写 localStorage/sessionStorage，刷新即失效），
+ * 由登录页调用 `completeTotpLogin()` 完成会话建立。
  */
 import {
   createContext,
@@ -16,7 +21,19 @@ import {
   type ReactNode,
 } from 'react';
 import { ApiClient, ApiError } from '../api/client.js';
-import type { SessionUser, SessionView, UserPreferences } from '../api/types.js';
+import { isTotpChallenge } from '../api/types.js';
+import type { LoginSuccessResponse, SessionUser, SessionView, UserPreferences } from '../api/types.js';
+
+/**
+ * 登录第一步的结果。
+ *
+ * - `ok`：已直接建立会话（账号未启用 TOTP）。
+ * - `totp`：需要第二步；`challengeToken` 是**一次性**凭据，只允许放在组件状态里
+ *   （**不得**写入 localStorage/sessionStorage），刷新即失效 —— 后端 TTL 默认 5 分钟。
+ */
+export type LoginOutcome =
+  | { status: 'ok' }
+  | { status: 'totp'; challengeToken: string; expiresAt: string };
 
 export interface AuthContextValue {
   /** 类型化 API 客户端（已注入 CSRF 与 401 处理） */
@@ -29,7 +46,9 @@ export interface AuthContextValue {
   setupRequired: boolean;
   /** 后端健康信息中的版本号等（非必需，失败为 null） */
   apiVersion: string | null;
-  login: (input: { username: string; password: string; remember: boolean }) => Promise<void>;
+  login: (input: { username: string; password: string; remember: boolean }) => Promise<LoginOutcome>;
+  /** 登录第二步：用 challengeToken + 动态码/恢复码换取会话 */
+  completeTotpLogin: (input: { challengeToken: string; code: string; remember: boolean }) => Promise<void>;
   bootstrap: (input: { token: string; username: string; password: string; displayName: string }) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
@@ -129,9 +148,9 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
     };
   }, [client]);
 
-  const login = useCallback(
-    async (input: { username: string; password: string; remember: boolean }): Promise<void> => {
-      const result = await client.login(input);
+  /** 登录成功（含第二步）后的统一收尾：写入 CSRF、用户与偏好。 */
+  const establishSession = useCallback(
+    async (result: LoginSuccessResponse): Promise<void> => {
       csrfRef.current = result.csrfToken;
       setUser(result.user);
       setSetupRequired(false);
@@ -145,11 +164,40 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
     [client, applyPreferences],
   );
 
+  const login = useCallback(
+    async (input: { username: string; password: string; remember: boolean }): Promise<LoginOutcome> => {
+      const result = await client.login(input);
+      // 账号启用了 TOTP：此时**没有**会话 Cookie，challengeToken 只回传给登录页
+      if (isTotpChallenge(result)) {
+        return { status: 'totp', challengeToken: result.challengeToken, expiresAt: result.expiresAt };
+      }
+      await establishSession(result);
+      return { status: 'ok' };
+    },
+    [client, establishSession],
+  );
+
+  const completeTotpLogin = useCallback(
+    async (input: { challengeToken: string; code: string; remember: boolean }): Promise<void> => {
+      const result = await client.loginTotp({
+        challengeToken: input.challengeToken,
+        code: input.code,
+        remember: input.remember,
+      });
+      await establishSession(result);
+    },
+    [client, establishSession],
+  );
+
   const bootstrap = useCallback(
     async (input: { token: string; username: string; password: string; displayName: string }): Promise<void> => {
       await client.bootstrap(input);
       // 初始化完成后直接登录，省去用户再输一次密码
-      await login({ username: input.username, password: input.password, remember: false });
+      const outcome = await login({ username: input.username, password: input.password, remember: false });
+      // 刚创建的账号不可能已绑定两步验证；真出现说明服务端状态异常，明确报错而不是假装登录成功
+      if (outcome.status === 'totp') {
+        throw new ApiError('初始管理员账号不应启用两步验证，请刷新页面后重试', 'UNEXPECTED_TOTP_CHALLENGE', 500);
+      }
     },
     [client, login],
   );
@@ -185,13 +233,14 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
       setupRequired,
       apiVersion,
       login,
+      completeTotpLogin,
       bootstrap,
       logout,
       refresh,
       updatePreferences,
       isAdmin: user?.role === 'admin',
     }),
-    [client, ready, user, preferences, setupRequired, apiVersion, login, bootstrap, logout, refresh, updatePreferences],
+    [client, ready, user, preferences, setupRequired, apiVersion, login, completeTotpLogin, bootstrap, logout, refresh, updatePreferences],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

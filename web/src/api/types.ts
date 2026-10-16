@@ -38,6 +38,16 @@ export interface SessionUser {
   createdAt: string;
   updatedAt: string;
   lastLoginAt: string | null;
+  /** 是否已启用两步验证（TOTP）；界面据此显示徽标与"关闭"入口 */
+  totpEnabled: boolean;
+  /**
+   * 两步验证绑定确认时间。
+   *
+   * 注意：冻结契约只承诺 `totpEnabled`，后端 `server/src/db/types.ts` 的 `User`
+   * 已经带了这个字段，因此这里按**可选**声明：返回时界面显示真实绑定时间，
+   * 未返回（`undefined`）时界面显示 `—`，不影响任何逻辑。
+   */
+  totpConfirmedAt?: string | null;
 }
 
 export interface SessionView {
@@ -48,10 +58,95 @@ export interface SessionView {
   expiresAt: string | null;
 }
 
-export interface LoginResponse {
+/** 登录成功（第一步即成功，或第二步验证通过）：会话 Cookie 已下发。 */
+export interface LoginSuccessResponse {
   user: SessionUser;
   csrfToken: string;
   expiresAt: string;
+}
+
+/**
+ * 登录第一步的"需要第二步"分支（账号已启用 TOTP）。
+ *
+ * **不设置会话 Cookie**：此时尚未登录成功，`challengeToken` 只是后续
+ * `POST /api/auth/login/totp` 的一次性凭据（后端 TTL 默认 5 分钟）。
+ */
+export interface LoginTotpChallengeResponse {
+  totpRequired: true;
+  challengeToken: string;
+  expiresAt: string;
+}
+
+/** `POST /api/auth/login` 的响应：判别联合，用 `totpRequired` 区分两步。 */
+export type LoginResponse = LoginSuccessResponse | LoginTotpChallengeResponse;
+
+/** `POST /api/auth/login/totp` 的请求体。 */
+export interface LoginTotpRequest {
+  challengeToken: string;
+  /**
+   * 6 位 TOTP 动态码，或恢复码（形如 `XXXX-XXXX`）。
+   * 前端不做格式强校验，交给后端判定并返回 `TOTP_INVALID`。
+   */
+  code: string;
+  remember?: boolean;
+}
+
+/** `POST /api/auth/login/totp` 成功后的响应（与普通登录一致）。 */
+export type LoginTotpResponse = LoginSuccessResponse;
+
+/** 判断登录第一步的响应是否要求第二步验证。 */
+export function isTotpChallenge(response: LoginResponse): response is LoginTotpChallengeResponse {
+  return 'totpRequired' in response && response.totpRequired === true;
+}
+
+// ---------------------------------------------------------------- 两步验证（TOTP）
+
+/** `POST /api/users/me/totp/setup` —— 生成（或重新生成）**未确认**的种子。 */
+export interface TotpSetupResponse {
+  secret: string;
+  otpauthUri: string;
+  digits: 6;
+  period: 30;
+}
+
+/** `POST /api/users/me/totp/enable` 的请求体。 */
+export interface TotpEnableRequest {
+  code: string;
+}
+
+/** `POST /api/users/me/totp/enable` —— 绑定成功，**一次性**返回恢复码。 */
+export interface TotpEnableResponse {
+  recoveryCodes: string[];
+  user: SessionUser;
+}
+
+/** `POST /api/users/me/totp/disable` 的请求体；`code` 可选（后端可能要求二次确认）。 */
+export interface TotpDisableRequest {
+  password: string;
+  code?: string;
+}
+
+/** `POST /api/users/me/totp/disable`。 */
+export interface TotpDisableResponse {
+  ok: true;
+  user: SessionUser;
+}
+
+/** `POST /api/users/me/totp/recovery-codes` 的请求体。 */
+export interface TotpRecoveryCodesRequest {
+  code: string;
+}
+
+/** 恢复码列表（重新生成时旧的立即失效）。 */
+export interface RecoveryCodesResponse {
+  recoveryCodes: string[];
+}
+
+/** `POST /api/users/:id/totp/reset`（管理员强制重置）。 */
+export interface TotpResetResponse {
+  ok: true;
+  /** 被连带吊销的会话数 —— 用户会直接掉线 */
+  revokedSessions: number;
 }
 
 export interface UserPreferences {
