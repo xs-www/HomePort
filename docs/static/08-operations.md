@@ -146,6 +146,21 @@ PORTAL_DISK_MOUNTS=C:=/host/disk/C
 盘符写成 `C:` 会被 Compose 当成相对路径，解析成 `<项目目录>/C:` 而挂载失败。
 **挂载与登记两边都写了，门户才会展示该磁盘**（只写一边等于没配）。
 
+> **推荐做法：写进 `docker-compose.override.yml`，而不是改动仓库里的 compose。**
+> Compose 会自动把 `docker-compose.yml` 与 `docker-compose.override.yml` 合并，
+> 而这个文件依赖具体机器的路径，因此已在 `.gitignore` 中忽略 —— 本机改挂载不会
+> 污染仓库，`git pull` 也不会有冲突。上面那段 YAML 原样写进覆盖文件即可：
+>
+> ```yaml
+> services:
+>   homeport:
+>     volumes:
+>       - "C:/:/host/disk/C:ro"        # NAS 上换成 - "/volume1:/host/volume1:ro"
+> ```
+>
+> 覆盖文件只写"本机特有"的增量项，别把 `cap_drop`、`security_opt`、`docker.sock:ro`
+> 这些硬化项抄进去 —— 那些在主 compose 里，抄一份反而会在日后主文件更新时留下不一致。
+
 不要加 `/proc:/host/proc:ro`（WSL2 视图，与任务管理器对不上，挂了也没用，见 §2）。
 
 #### 常见坑（都是实测踩到的）
