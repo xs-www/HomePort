@@ -4,6 +4,7 @@
  * 这些是「外部数据 → 门户契约」的转换层，用固定的输入快照验证输出，
  * 保证改动映射逻辑时不会悄悄破坏前端依赖的字段。
  */
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   computeCpuPercent,
@@ -58,9 +59,13 @@ describe('config · 环境变量解析', () => {
     expect(testConfig.port).toBe(8899);
     expect(testConfig.session.cookieName).toBe('hp_session');
     expect(loadConfig().bootstrap.tokenFile.endsWith('setup-token.txt')).toBe(true);
-    // 默认 webDistDir 应指向仓库根的 web/dist（而不是 server 包内）
-    // 注意：产品名为 HomePort，但仓库目录名仍是 HomePage，故此处匹配 HomePage
-    expect(loadConfig().webDistDir).toMatch(/HomePage[\\/]web[\\/]dist$/);
+    // 默认 webDistDir 应指向**仓库根**的 web/dist（而不是 server 包内）。
+    // 这里刻意只断言相对结构，不断言仓库目录名 —— 目录名历史上叫 HomePage、
+    // 现已改名 HomePort，断言目录名会让"改名"这种无关改动把测试打红。
+    const webDist = loadConfig().webDistDir;
+    expect(path.isAbsolute(webDist)).toBe(true);
+    expect(path.basename(webDist)).toBe('dist');
+    expect(path.basename(path.dirname(webDist))).toBe('web');
   });
 });
 

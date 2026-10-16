@@ -1,42 +1,79 @@
 /**
- * F1 容器业务服务：把 Docker 原始数据映射为门户契约（含 tailnet 可达性与入口 URL）。
+ * F1 容器业务服务：缓存、数据源编排与 HTTP 契约装配。
+ *
+ * 映射/判定类**纯函数**已抽到 `./mapper.js`（S0-05 技术债拆分）：
+ * 端口可达性判定、入口 URL、多候选入口、serve 路由覆盖标记都在那里，
+ * 可以脱离真实 Docker 直接单测。本文件只保留有状态的编排逻辑。
  *
  * 缓存：完整容器墙数据按 `all` 维度缓存 `config.cache.containersTtlMs`（默认 2s），
  * stats 不进缓存（开销独立且需要新鲜度）。
  */
-import type { ContainerInspectInfo } from 'dockerode';
 import type { PortalConfig } from '../../config.js';
 import type { Logger } from '../../logger.js';
 import { TtlCache } from '../../util/cache.js';
-import { normalizeLines, parseDockerTime, round, toIso } from '../../util/format.js';
-import {
-  REACHABILITY_RANK,
-  bestReachability,
-  buildUrl,
-  classifyBind,
-  isTailscaleIp,
-  parsePortKey,
-  type Reachability,
-} from '../../util/net.js';
+import { normalizeLines, round } from '../../util/format.js';
 import { redactEnvList, redactLines } from '../../util/redact.js';
 import { buildHostContext, type PortalHostContext } from './hostContext.js';
-import { DockerProvider, mapWithConcurrency, type DockerStatsRaw } from './provider.js';
 import {
-  TAILSCALE_IMAGE_RE,
-  type ContainerDetail,
-  type ContainerListQuery,
-  type ContainerListResult,
-  type ContainerLogsResult,
-  type ContainerMountView,
-  type ContainerNetworkView,
-  type ContainerPortView,
-  type ContainerStatsView,
-  type ContainerSummary,
-  type ServeRouteView,
-  type ServeStatusView,
-  type SourceStatus,
-  type UrlCandidate,
+  attachHostContext,
+  attachServePaths,
+  buildCandidates,
+  cleanName,
+  collectReachableHostPorts,
+  dedupeIdenticalBindings,
+  detectTailscaleSidecar,
+  joinCommand,
+  mapContainer,
+  mapMounts,
+  mapNetworks,
+  mapPorts,
+  mapServeRoutes,
+  normalizeCommandList,
+  pickPrimaryUrl,
+  rebuildPortUrls,
+  summarize,
+  urlForBinding,
+  type ServeRouteInput,
+} from './mapper.js';
+import { DockerProvider, mapWithConcurrency, type DockerStatsRaw } from './provider.js';
+import type {
+  ContainerDetail,
+  ContainerListQuery,
+  ContainerListResult,
+  ContainerLogsResult,
+  ContainerStatsView,
+  ContainerSummary,
+  ServeStatusView,
+  SourceStatus,
 } from './types.js';
+
+/**
+ * 兼容旧调用方：映射纯函数已迁至 `mapper.ts`。
+ *
+ * 这里保留同名 re-export，`import { mapPorts } from './docker/service.js'`
+ * 之类的既有写法无需改动（`server/tests/modules.test.ts` 即依赖此约定）。
+ */
+export {
+  attachHostContext,
+  attachServePaths,
+  buildCandidates,
+  cleanName,
+  collectReachableHostPorts,
+  dedupeIdenticalBindings,
+  detectTailscaleSidecar,
+  joinCommand,
+  mapContainer,
+  mapMounts,
+  mapNetworks,
+  mapPorts,
+  mapServeRoutes,
+  normalizeCommandList,
+  pickPrimaryUrl,
+  rebuildPortUrls,
+  summarize,
+  urlForBinding,
+};
+export type { ServeRouteInput };
 
 /** 提供门户主机上下文所需的 tailnet 信息（由 tailscale 模块满足）。 */
 export interface HostInfoProvider {
@@ -64,17 +101,7 @@ export interface ServeRoutesProvider {
     available: boolean;
     mode: string;
     detail: string | null;
-    routes: Array<{
-      host: string;
-      port: number;
-      scheme: 'https';
-      path: string;
-      url: string;
-      proxy: string;
-      targetHost: string | null;
-      targetPort: number | null;
-      funnel: boolean;
-    }>;
+    routes: ServeRouteInput[];
   }>;
 }
 
@@ -86,9 +113,6 @@ export interface ContainerServiceDeps {
   config: PortalConfig;
   logger: Logger;
 }
-
-const LOCALHOST_NOTE = '该端口仅绑定回环地址（127.0.0.1），tailnet 内其它设备无法直接访问';
-const UNPUBLISHED_NOTE = '该端口未发布到宿主，容器网络内可见';
 
 export class ContainerService {
   private readonly deps: ContainerServiceDeps;
@@ -141,9 +165,9 @@ export class ContainerService {
     const cached = await this.loadAll(query.all);
     const hostContext = this.buildHost(request);
 
-    let items = this.attachHostContext(cached.items, hostContext);
+    let items = attachHostContext(cached.items, hostContext);
     const serve = await this.buildServeView(cached.items, hostContext);
-    items = this.attachServePaths(items, serve.routes);
+    items = attachServePaths(items, serve.routes);
 
     if (query.reachability) {
       items = items.filter((item) => item.reachability === query.reachability);
@@ -182,10 +206,8 @@ export class ContainerService {
    * 关键处理：
    * 1. 把路由的监听主机限定为"本机 tailnet 名"（serve 配置里的 key 就是它），
    *    避免把别的节点或历史残留的路由混进来。
-   * 2. 把目标端口匹配回容器，便于 UI 显示"这条 serve 指向哪个容器"。
-   * 3. 标记 `coveredByContainerPort`：若该目标端口已经作为可达端口展示过
-   *    （例如 worldforge 的 4173 已发布到宿主），就不再单独列一条，
-   *    改为在容器卡上打 serve 标记，避免同一入口出现两次。
+   * 2. 目标端口匹配回容器、`coveredByContainerPort` 去重标记由
+   *    `mapper.mapServeRoutes` 完成（纯函数，可单测）。
    */
   private async buildServeView(
     containers: readonly ContainerSummary[],
@@ -213,58 +235,12 @@ export class ContainerService {
       };
     }
 
-    // 已作为可达端口展示过的宿主端口（用于去重）
-    const reachableHostPorts = new Set<number>();
-    for (const container of containers) {
-      for (const port of container.ports) {
-        if (port.reachability === 'tailnet' || port.reachability === 'lan') {
-          if (port.hostPort !== null) reachableHostPorts.add(port.hostPort);
-        }
-      }
-    }
-
-    const routes: ServeRouteView[] = result.routes.map((route) => {
-      const owner =
-        route.targetPort === null
-          ? null
-          : (containers.find((container) =>
-              container.ports.some((port) => port.hostPort === route.targetPort),
-            ) ?? null);
-      return {
-        host: route.host,
-        port: route.port,
-        scheme: route.scheme,
-        path: route.path,
-        url: route.url,
-        proxy: route.proxy,
-        targetHost: route.targetHost,
-        targetPort: route.targetPort,
-        containerName: owner?.name ?? null,
-        containerId: owner?.id ?? null,
-        coveredByContainerPort: route.targetPort !== null && reachableHostPorts.has(route.targetPort),
-      };
-    });
-
-    return { available: result.available, mode: result.mode, detail: result.detail, routes };
-  }
-
-  /** 把 serve 路径写到对应容器上（卡片标记用）。 */
-  private attachServePaths(
-    items: readonly ContainerSummary[],
-    routes: readonly ServeRouteView[],
-  ): ContainerSummary[] {
-    return items.map((item) => {
-      const matched = routes.filter((route) => route.containerId === item.id);
-      if (matched.length === 0) {
-        return { ...item, servePaths: [], servedUrl: null };
-      }
-      return {
-        ...item,
-        servePaths: matched.map((route) => route.path),
-        // 优先给容器自身的 serve 入口；没有则给第一条
-        servedUrl: matched.find((route) => route.targetPort !== null)?.url ?? matched[0]?.url ?? null,
-      };
-    });
+    return {
+      available: result.available,
+      mode: result.mode,
+      detail: result.detail,
+      routes: mapServeRoutes(result.routes, containers),
+    };
   }
 
   /** 单个容器详情（`:id` 支持完整 ID / 短 ID / 名称）。 */
@@ -405,292 +381,6 @@ export class ContainerService {
       tailscaleDnsName: this.deps.hostInfo.getTailscaleDnsName(),
     });
   }
-
-  /** 把缓存的容器条目与当前请求的 host 上下文结合，重新生成 URL。 */
-  private attachHostContext(items: ContainerSummary[], hostContext: PortalHostContext): ContainerSummary[] {
-    return items.map((item) => {
-      const ports: ContainerPortView[] = item.ports.map((port) => rebuildPortUrls(port, hostContext, item.name));
-      return {
-        ...item,
-        ports,
-        reachability: ports.reduce<Reachability>((acc, port) => bestReachability(acc, port.reachability), 'none'),
-        primaryUrl: pickPrimaryUrl(ports),
-        urlCandidates: buildCandidates(ports, hostContext),
-      };
-    });
-  }
-}
-
-/** 汇总统计。 */
-export function summarize(items: readonly ContainerSummary[]): ContainerListResult['summary'] {
-  let running = 0;
-  let stopped = 0;
-  let tailnetReachable = 0;
-  let lanReachable = 0;
-  let localhostOnly = 0;
-  let attention = 0;
-
-  for (const item of items) {
-    const isRunning = item.state === 'running';
-    if (isRunning) running += 1;
-    else stopped += 1;
-
-    if (item.reachability === 'tailnet') tailnetReachable += 1;
-    else if (item.reachability === 'lan') lanReachable += 1;
-    else if (item.reachability === 'localhost-only') localhostOnly += 1;
-
-    const unhealthy = item.health !== null && item.health !== 'healthy' && item.health !== 'none';
-    if (!isRunning || unhealthy || (isRunning && item.reachability === 'none')) attention += 1;
-  }
-
-  return { total: items.length, running, stopped, tailnetReachable, lanReachable, localhostOnly, attention };
-}
-
-/** 容器名去掉前导斜杠。 */
-export function cleanName(name: string | undefined): string {
-  return (name ?? '').replace(/^\//, '');
-}
-
-/**
- * 把 Docker inspect 结果映射为容器摘要。
- *
- * @param skipUrls 为 true 时（缓存阶段）不生成 URL，URL 由 attachHostContext 在响应阶段生成
- */
-export function mapContainer(
-  inspect: ContainerInspectInfo,
-  hostContext: PortalHostContext,
-  tailscaleIps: readonly string[],
-  options: { skipUrls?: boolean } = {},
-): ContainerSummary {
-  const name = cleanName(inspect.Name) || inspect.Id.slice(0, 12);
-  const labels = (inspect.Config?.Labels ?? {}) as Record<string, string>;
-  const networks = mapNetworks(inspect);
-  const ports = mapPorts(inspect, hostContext, tailscaleIps, name);
-  const tailscaleSidecar = detectTailscaleSidecar(inspect);
-
-  const health = inspect.State?.Health?.Status ?? (inspect.Config?.Healthcheck ? 'starting' : null);
-
-  const summary: ContainerSummary = {
-    id: inspect.Id,
-    shortId: inspect.Id.slice(0, 12),
-    name,
-    image: inspect.Config?.Image ?? '',
-    imageId: inspect.Image ?? null,
-    state: inspect.State?.Status ?? 'unknown',
-    status: inspect.State?.Status ?? 'unknown',
-    health,
-    createdAt: toIso(parseDockerTime(inspect.Created)),
-    startedAt: toIso(parseDockerTime(inspect.State?.StartedAt)),
-    finishedAt: toIso(parseDockerTime(inspect.State?.FinishedAt)),
-    composeProject: labels['com.docker.compose.project'] ?? null,
-    composeService: labels['com.docker.compose.service'] ?? null,
-    composeWorkingDir: labels['com.docker.compose.project.working_dir'] ?? null,
-    labels,
-    networks,
-    mounts: mapMounts(inspect),
-    reachability: ports.reduce<Reachability>((acc, port) => bestReachability(acc, port.reachability), 'none'),
-    primaryUrl: pickPrimaryUrl(ports),
-    ports,
-    urlCandidates: buildCandidates(ports, hostContext),
-    tailscaleSidecar,
-    servePaths: [],
-    servedUrl: null,
-    stats: null,
-  };
-
-  if (options.skipUrls) {
-    // 缓存阶段：保留可达性判定（与 host 无关），但清空 URL 相关字段
-    return {
-      ...summary,
-      ports: summary.ports.map((port) => ({ ...port, url: null })),
-      primaryUrl: null,
-      urlCandidates: [],
-    };
-  }
-  return summary;
-}
-
-/** 映射网络信息。 */
-export function mapNetworks(inspect: ContainerInspectInfo): ContainerNetworkView[] {
-  const entries = Object.entries(inspect.NetworkSettings?.Networks ?? {});
-  return entries.map(([networkName, network]) => {
-    // dockerode 的 EndpointSettings.Aliases 在部分版本中类型缺失（隐式 any），
-    // 这里显式收窄为 unknown 再判断，避免依赖其声明。
-    const aliasSource: unknown = network?.Aliases;
-    const aliases = Array.isArray(aliasSource) ? aliasSource.filter((a): a is string => typeof a === 'string') : [];
-    const ipv4 = network?.IPAddress;
-    return {
-      name: networkName,
-      ipv4: ipv4 && ipv4 !== '' ? ipv4 : null,
-      aliases,
-    };
-  });
-}
-
-/** 映射挂载点（过滤 docker.sock 等自动注入项？不 —— 展示真实情况更有诊断价值）。 */
-export function mapMounts(inspect: ContainerInspectInfo): ContainerMountView[] {
-  return (inspect.Mounts ?? []).map((mount) => ({
-    type: mount.Type ?? 'unknown',
-    source: mount.Source ?? '',
-    destination: mount.Destination ?? '',
-    readOnly: mount.RW === false,
-  }));
-}
-
-/**
- * 映射端口并判定可达性。
- *
- * Docker 数据模型：`NetworkSettings.Ports["80/tcp"]` 给出**实际生效**的宿主绑定列表
- * （未发布则为 null），`HostConfig.PortBindings` 给出**声明**的绑定（可能被运行时覆盖）。
- * 以 `NetworkSettings.Ports` 为准，缺失时回退到 `PortBindings`。
- */
-export function mapPorts(
-  inspect: ContainerInspectInfo,
-  hostContext: PortalHostContext,
-  tailscaleIps: readonly string[],
-  containerName: string,
-): ContainerPortView[] {
-  const effective = inspect.NetworkSettings?.Ports ?? {};
-  const declared = (inspect.HostConfig?.PortBindings ?? {}) as Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
-  const out: ContainerPortView[] = [];
-
-  const keys = new Set<string>([...Object.keys(effective), ...Object.keys(declared)]);
-
-  for (const key of keys) {
-    const parsed = parsePortKey(key);
-    if (!parsed) continue;
-    const bindings = effective[key] ?? declared[key] ?? null;
-
-    if (!bindings || bindings.length === 0) {
-      out.push({
-        containerPort: parsed.port,
-        protocol: parsed.protocol,
-        hostIp: '',
-        hostPort: null,
-        reachability: 'none',
-        url: null,
-        note: UNPUBLISHED_NOTE,
-      });
-      continue;
-    }
-
-    for (const binding of bindings) {
-      const hostIp = binding.HostIp ?? '';
-      const hostPort = binding.HostPort ? Number(binding.HostPort) : null;
-      const reachability = classifyBind(hostIp, tailscaleIps);
-      if (hostPort === null || !Number.isInteger(hostPort)) {
-        out.push({
-          containerPort: parsed.port,
-          protocol: parsed.protocol,
-          hostIp,
-          hostPort: null,
-          reachability: 'none',
-          url: null,
-          note: '宿主端口未分配',
-        });
-        continue;
-      }
-
-      const url = urlForBinding(parsed.protocol, hostIp, hostPort, hostContext, reachability);
-      out.push({
-        containerPort: parsed.port,
-        protocol: parsed.protocol,
-        hostIp,
-        hostPort,
-        reachability,
-        url,
-        note: reachability === 'localhost-only' ? LOCALHOST_NOTE : null,
-      });
-    }
-  }
-
-  void containerName;
-
-  // 排序：可达性优先，其次宿主端口升序
-  out.sort((a, b) => {
-    const byReach = REACHABILITY_RANK[a.reachability] - REACHABILITY_RANK[b.reachability];
-    if (byReach !== 0) return byReach;
-    return (a.hostPort ?? 0) - (b.hostPort ?? 0);
-  });
-  return out;
-}
-
-/** 为单个端口绑定生成 URL。仅 http 协议有可直接点击的 URL。 */
-function urlForBinding(
-  protocol: string,
-  hostIp: string,
-  hostPort: number,
-  hostContext: PortalHostContext,
-  reachability: Reachability,
-): string | null {
-  if (reachability === 'none' || reachability === 'localhost-only') return null;
-  if (protocol !== 'tcp') return null; // udp 无 HTTP 入口
-  const host = isTailscaleIp(hostIp) ? hostIp : hostContext.primaryHost;
-  const scheme = isTailscaleIp(hostIp) && hostContext.primaryScheme === 'https' ? 'https' : 'http';
-  return buildUrl({ scheme, host, port: hostPort, path: '/' });
-}
-
-/** 从缓存的端口条目重建 URL（同一份数据服务不同访问者）。 */
-function rebuildPortUrls(port: ContainerPortView, hostContext: PortalHostContext, containerName: string): ContainerPortView {
-  void containerName;
-  if (port.reachability === 'none' || port.reachability === 'localhost-only' || port.hostPort === null) {
-    return { ...port, url: null };
-  }
-  const host = isTailscaleIp(port.hostIp) ? port.hostIp : hostContext.primaryHost;
-  const url = buildUrl({ scheme: hostContext.primaryScheme, host, port: port.hostPort, path: '/' });
-  return { ...port, url };
-}
-
-/** 选择首选入口：可达性最优且有 URL 的端口。 */
-export function pickPrimaryUrl(ports: readonly ContainerPortView[]): string | null {
-  const reachable = ports
-    .filter((p) => p.url !== null)
-    .sort((a, b) => REACHABILITY_RANK[a.reachability] - REACHABILITY_RANK[b.reachability]);
-  return reachable[0]?.url ?? null;
-}
-
-/** 为容器生成全部候选入口（去重）。 */
-export function buildCandidates(ports: readonly ContainerPortView[], hostContext: PortalHostContext): UrlCandidate[] {
-  const chosen = ports.filter((p) => p.url !== null).sort((a, b) => REACHABILITY_RANK[a.reachability] - REACHABILITY_RANK[b.reachability])[0];
-  if (!chosen || chosen.hostPort === null) return [];
-
-  const out: UrlCandidate[] = [];
-  const seen = new Set<string>();
-  const push = (label: UrlCandidate['label'], host: string, display?: string): void => {
-    const url = buildUrl({ scheme: hostContext.primaryScheme, host, port: chosen.hostPort, path: '/' });
-    if (!url || seen.has(url)) return;
-    seen.add(url);
-    out.push({ label, url, ...(display ? { display } : {}) });
-  };
-
-  for (const candidate of hostContext.candidates) {
-    push(candidate.label, candidate.host, candidate.display);
-  }
-  return out;
-}
-
-/** 判断容器是否像 tailscale sidecar。 */
-export function detectTailscaleSidecar(inspect: ContainerInspectInfo): boolean {
-  const image = inspect.Config?.Image ?? '';
-  if (TAILSCALE_IMAGE_RE.test(image)) return true;
-  const env = inspect.Config?.Env ?? [];
-  const tailscaleEnvKeys = ['TS_AUTHKEY', 'TS_STATE_DIR', 'TS_HOSTNAME', 'TS_CERT_DOMAIN', 'TS_USERSPACE', 'TS_ROUTES'];
-  return env.some((entry) => tailscaleEnvKeys.some((key) => entry.startsWith(`${key}=`)));
-}
-
-/** 把 Cmd/Entrypoint 数组拼为字符串。 */
-export function joinCommand(parts: string[] | undefined | null): string | null {
-  if (!parts || parts.length === 0) return null;
-  return parts.join(' ');
-}
-
-/**
- * 规范化 Entrypoint：Docker 的 `Config.Entrypoint` 可能是字符串
- * （镜像元数据里写成单个字符串时），统一为数组。
- */
-export function normalizeCommandList(value: string | string[] | undefined | null): string[] | null {
-  if (value === undefined || value === null) return null;
-  return Array.isArray(value) ? value : [value];
 }
 
 /** 列表失败时的可展示原因。 */
