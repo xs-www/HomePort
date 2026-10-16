@@ -149,6 +149,49 @@ export class UsersRepository {
     );
   }
 
+  /**
+   * 写入一个**尚未确认**的 TOTP 种子（绑定流程的中间态）。
+   *
+   * 刻意把 `totp_enabled` 置 0：用户"扫了码但还没回填验证码"时不能算启用，
+   * 否则一次失败的绑定操作就能把自己锁在门外。
+   */
+  setPendingTotpSecret(id: number, encryptedSecret: string): void {
+    this.db
+      .prepare(
+        `UPDATE users
+            SET totp_secret = ?, totp_enabled = 0, totp_confirmed_at = NULL, totp_last_counter = NULL, updated_at = ?
+          WHERE id = ?`,
+      )
+      .run(encryptedSecret, new Date().toISOString(), id);
+  }
+
+  /** 确认启用两步验证：写入（或沿用）种子并置 `totp_enabled = 1`。 */
+  enableTotp(id: number, encryptedSecret: string, at: Date = new Date()): void {
+    this.db
+      .prepare(
+        `UPDATE users
+            SET totp_secret = ?, totp_enabled = 1, totp_confirmed_at = ?, updated_at = ?
+          WHERE id = ?`,
+      )
+      .run(encryptedSecret, at.toISOString(), at.toISOString(), id);
+  }
+
+  /** 关闭两步验证：清空种子、确认时间与时间步计数。 */
+  disableTotp(id: number): void {
+    this.db
+      .prepare(
+        `UPDATE users
+            SET totp_secret = NULL, totp_enabled = 0, totp_confirmed_at = NULL, totp_last_counter = NULL, updated_at = ?
+          WHERE id = ?`,
+      )
+      .run(new Date().toISOString(), id);
+  }
+
+  /** 记录最后成功使用的时间步（TOTP 防重放）。 */
+  setTotpLastCounter(id: number, counter: number): void {
+    this.db.prepare('UPDATE users SET totp_last_counter = ? WHERE id = ?').run(counter, id);
+  }
+
   /** 删除用户（连带会话与偏好，靠外键级联）。返回是否删除成功。 */
   delete(id: number): boolean {
     const info = this.db.prepare('DELETE FROM users WHERE id = ?').run(id);

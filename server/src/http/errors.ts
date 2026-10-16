@@ -12,6 +12,9 @@ export type ApiErrorCode =
   | 'INVALID_CREDENTIALS'
   | 'FORBIDDEN'
   | 'CSRF_MISMATCH'
+  | 'TOTP_INVALID'
+  | 'TOTP_CHALLENGE_EXPIRED'
+  | 'TOTP_UNAVAILABLE'
   | 'SETUP_REQUIRED'
   | 'ALREADY_INITIALIZED'
   | 'NOT_FOUND'
@@ -26,6 +29,12 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   INVALID_CREDENTIALS: 401,
   FORBIDDEN: 403,
   CSRF_MISMATCH: 403,
+  // 两步验证：验证码错误 / 挑战过期都按"未通过认证"处理（401），
+  // 但用**不同的 code** 区分——前端必须能判断"就地重试"还是"退回第一步重新登录"。
+  TOTP_INVALID: 401,
+  TOTP_CHALLENGE_EXPIRED: 401,
+  // 服务端未启用两步验证能力（例如未配置主密钥或管理员关闭了该功能）
+  TOTP_UNAVAILABLE: 400,
   SETUP_REQUIRED: 409,
   ALREADY_INITIALIZED: 409,
   NOT_FOUND: 404,

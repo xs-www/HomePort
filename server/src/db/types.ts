@@ -21,6 +21,14 @@ export interface UserRow {
   created_at: string;
   updated_at: string;
   last_login_at: string | null;
+  /** TOTP 种子**密文**（`enc:v1:…`）；未开始绑定为 null */
+  totp_secret: string | null;
+  /** 是否已完成两步验证绑定（0/1） */
+  totp_enabled: number;
+  /** 绑定确认时间 */
+  totp_confirmed_at: string | null;
+  /** 最后成功使用的时间步，用于防重放 */
+  totp_last_counter: number | null;
 }
 
 export interface User {
@@ -32,11 +40,37 @@ export interface User {
   createdAt: string;
   updatedAt: string;
   lastLoginAt: string | null;
+  /** 是否已启用两步验证（前端据此显示徽标与"关闭"入口） */
+  totpEnabled: boolean;
+  /** 两步验证绑定确认时间 */
+  totpConfirmedAt: string | null;
 }
 
 /** 带密码哈希的内部用户模型，**禁止**直接返回给 API。 */
 export interface UserWithSecret extends User {
   passwordHash: string;
+  /** TOTP 种子密文，仅服务端内部使用（解密只在 auth service 里发生） */
+  totpSecretEncrypted: string | null;
+  /** 最后成功使用的时间步 */
+  totpLastCounter: number | null;
+}
+
+export interface TotpRecoveryCodeRow {
+  id: number;
+  user_id: number;
+  code_hash: string;
+  created_at: string;
+  used_at: string | null;
+}
+
+export interface TotpChallengeRow {
+  id: string;
+  token_hash: string;
+  user_id: number;
+  created_at: string;
+  expires_at: string;
+  consumed_at: string | null;
+  attempts: number;
 }
 
 export interface SessionRow {
@@ -122,11 +156,18 @@ export function mapUserRow(row: UserRow): User {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     lastLoginAt: row.last_login_at,
+    totpEnabled: row.totp_enabled === 1,
+    totpConfirmedAt: row.totp_confirmed_at,
   };
 }
 
 export function mapUserWithSecret(row: UserRow): UserWithSecret {
-  return { ...mapUserRow(row), passwordHash: row.password_hash };
+  return {
+    ...mapUserRow(row),
+    passwordHash: row.password_hash,
+    totpSecretEncrypted: row.totp_secret,
+    totpLastCounter: row.totp_last_counter,
+  };
 }
 
 export function mapSessionRow(row: SessionRow): Session {

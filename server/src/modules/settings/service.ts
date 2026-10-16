@@ -6,6 +6,8 @@
  * 2. **每次变更后重新应用**，并在需要时热重建 Tailscale / Docker 数据源。
  * 3. 向管理接口提供「当前值 + 来源 + 生效级别」的视图，以及校验与重置能力。
  * 4. 提供 Tailscale 连通性测试（保存前先验证 Token，避免存进一个错值）。
+ * 5. 注入 `secretBox` 时，注册表标了 `sensitive` 的键**落库前加密、读出后解密**，
+ *    并提供存量明文的一次性升级入口 `reencryptAll()`（见 `secretStore.ts`）。
  *
  * ## 为什么用"版本号 + 惰性应用"
  *
@@ -16,7 +18,7 @@
  */
 import type { PortalConfig } from '../../config.js';
 import type { Logger } from '../../logger.js';
-import type { SettingsRepository } from '../../db/settings.js';
+import type { SettingsRepository, SettingsStore } from '../../db/settings.js';
 import type { AuditRepository } from '../../db/users.js';
 import {
   MASK_TOKEN,
@@ -33,6 +35,8 @@ import {
   type SettingView,
   type ValidationResult,
 } from './registry.js';
+import { SecretSettingsStore, collectSensitiveKeys } from './secretStore.js';
+import type { SecretBox } from './secretBox.js';
 import { probeTailscale } from './tailscaleProbe.js';
 import type { TailscaleTestResult } from './types.js';
 
@@ -41,6 +45,14 @@ export interface SettingsServiceDeps {
   repository: SettingsRepository;
   audit: AuditRepository;
   logger: Logger;
+  /**
+   * 敏感值加密盒（AES-256-GCM）。
+   *
+   * **可选**：不传时完全保持"明文存储"的旧行为 —— 无密钥场景与既有测试不受影响。
+   * 传入后，注册表里标记为 `sensitive` 的键会在**写库前加密、读库后解密**，
+   * 服务内部（如 Tailscale 探测）拿到的始终是明文。
+   */
+  secretBox?: SecretBox;
   /** 应用设置后触发的数据源重建钩子（由 app.ts 注入，避免模块环） */
   onReload?: (hint: { tailscale: boolean; docker: boolean }) => Promise<void> | void;
 }
@@ -70,16 +82,59 @@ export interface UpdateSettingsResult {
 
 export class SettingsService {
   private readonly deps: SettingsServiceDeps;
+  /**
+   * 实际使用的设置仓储：传了 `secretBox` 时是"读写自动加解密"的装饰器，
+   * 否则就是原始仓储（明文）。
+   */
+  private readonly repository: SettingsStore;
+  /** 加密层（未启用为 null，`reencryptAll()` 因此是安全的空操作） */
+  private readonly secretStore: SecretSettingsStore | null;
   private appliedVersion: string | null = null;
   private applying: Promise<void> | null = null;
 
   constructor(deps: SettingsServiceDeps) {
     this.deps = deps;
+    this.secretStore = deps.secretBox
+      ? new SecretSettingsStore({
+          base: deps.repository,
+          secretBox: deps.secretBox,
+          sensitiveKeys: collectSensitiveKeys(deps.config),
+          logger: deps.logger,
+        })
+      : null;
+    this.repository = this.secretStore ?? deps.repository;
   }
 
   /** 启动时调用：把数据库覆盖值应用到 config。 */
   async initialize(): Promise<void> {
     await this.ensureApplied(true);
+  }
+
+  /**
+   * 一次性把库里仍是明文的敏感值全部升级为密文（**首次启动装配时调用**）。
+   *
+   * 惰性迁移已经覆盖了"用户下次写入该键"的场景，这个方法是给存量老库兜底：
+   * 启动即可把历史明文敏感值收进密文，顺带把 `previousKeys` 加密的老密文
+   * 升级到当前密钥。幂等：没有可升级的行时返回 0 且不写库。
+   *
+   * 解密失败的键会被跳过（记警告、按"未设置"处理），**不会中止启动**。
+   *
+   * @returns 升级条数；未启用加密时恒为 0
+   */
+  async reencryptAll(): Promise<number> {
+    if (!this.secretStore) return 0;
+    const { upgraded, failed } = this.secretStore.reencryptAll();
+    if (upgraded > 0) {
+      // 只记条数与密钥指纹（非密钥本身），不记任何值
+      this.deps.logger.info('敏感设置已加密存储（存量明文 → 密文）', {
+        upgraded,
+        keyFingerprint: this.secretStore.keyFingerprint(),
+      });
+    }
+    if (failed.length > 0) {
+      this.deps.logger.warn('部分敏感设置无法解密，已按“未设置”处理，请重新填写', { keys: failed });
+    }
+    return upgraded;
   }
 
   /**
@@ -96,8 +151,8 @@ export class SettingsService {
     if (!force && this.appliedVersion === version) return;
 
     this.applying = (async () => {
-      const resolved = resolveSettings({ config: this.deps.config, repository: this.deps.repository });
-      const overridden = new Set(this.deps.repository.list().map((item) => item.key));
+      const resolved = resolveSettings({ config: this.deps.config, repository: this.repository });
+      const overridden = new Set(this.repository.list().map((item) => item.key));
       const result = applyTo(this.deps.config, settingsToMap(resolved), overridden);
 
       // 设置项变化会影响已建立的连接/客户端，这里显式重建
@@ -124,7 +179,7 @@ export class SettingsService {
   /** 当前设置视图（含每项的来源与生效级别）。 */
   async view(): Promise<SettingsView> {
     await this.ensureApplied();
-    const resolved = resolveSettings({ config: this.deps.config, repository: this.deps.repository });
+    const resolved = resolveSettings({ config: this.deps.config, repository: this.repository });
     const groups = groupList();
     return {
       groups,
@@ -173,7 +228,9 @@ export class SettingsService {
     }
 
     if (toWrite.length > 0) {
-      this.deps.repository.upsertMany(
+      // 敏感项在这里被加密后才落库（由 secretStore 装饰层处理）；
+      // 审计与日志下面只记键名，明文/密文都不外泄。
+      this.repository.upsertMany(
         toWrite.map((item) => ({ key: item.key, value: item.serialized, updatedBy: input.actor.username })),
       );
       // 写后立即应用，让本次请求的响应就能反映新值
@@ -218,7 +275,7 @@ export class SettingsService {
   async reset(keys: readonly string[] | null, actor: { id: number; username: string }, ip: string | null): Promise<number> {
     const definitions = this.definitions();
     const allowed = keys === null ? null : keys.filter((key) => definitions.some((d) => d.key === key));
-    const removed = allowed === null ? this.deps.repository.deleteAll() : this.deps.repository.deleteMany(allowed);
+    const removed = allowed === null ? this.repository.deleteAll() : this.repository.deleteMany(allowed);
 
     await this.ensureApplied(true);
 
@@ -255,7 +312,7 @@ export class SettingsService {
 
   /** 当前版本标识（settings 表最后修改时间）。 */
   private currentVersion(): string {
-    const list = this.deps.repository.list();
+    const list = this.repository.list();
     if (list.length === 0) return 'empty';
     // updatedAt 为 ISO 字符串，字典序即时间序
     let latest = '';

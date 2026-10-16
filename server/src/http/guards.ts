@@ -31,7 +31,7 @@ declare module 'fastify' {
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 /** 豁免 CSRF 的路径（登录与首启初始化在建立会话之前，无法携带会话 CSRF）。 */
-const CSRF_EXEMPT_PATHS = new Set(['/api/auth/login', '/api/auth/bootstrap']);
+const CSRF_EXEMPT_PATHS = new Set(['/api/auth/login', '/api/auth/login/totp', '/api/auth/bootstrap']);
 
 export interface ResolveSessionInput {
   token: string | null;

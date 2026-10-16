@@ -39,7 +39,27 @@ export interface UpsertSettingInput {
   updatedBy: string | null;
 }
 
-export class SettingsRepository {
+/**
+ * 设置仓储的**读写契约**。
+ *
+ * 之所以把它抽成接口而不是到处直接用 `SettingsRepository` 类：
+ * 敏感值的加解密需要在仓储边界上叠加一层装饰器
+ * （见 `modules/settings/secretStore.ts`），而 TypeScript 的类带 `private` 成员时
+ * 是名义类型 —— 装饰器无法被当成 `SettingsRepository` 传递。
+ * `resolveSettings()` 只依赖本接口，因此可以直接吃到"已解密"的数据。
+ */
+export interface SettingsStore {
+  list(): SettingRecord[];
+  toMap(): Map<string, string>;
+  get(key: string): string | null;
+  upsert(input: UpsertSettingInput): SettingRecord;
+  upsertMany(inputs: readonly UpsertSettingInput[]): string[];
+  delete(key: string): boolean;
+  deleteMany(keys: readonly string[]): number;
+  deleteAll(): number;
+}
+
+export class SettingsRepository implements SettingsStore {
   constructor(private readonly db: Db) {}
 
   /** 全部被覆盖的键（值均为字符串）。 */

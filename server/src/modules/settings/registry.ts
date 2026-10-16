@@ -23,7 +23,7 @@
  */
 import path from 'node:path';
 import type { PortalConfig } from '../../config.js';
-import type { SettingsRepository } from '../../db/settings.js';
+import type { SettingsStore } from '../../db/settings.js';
 
 /** 生效级别。 */
 export type SettingEffect = 'live' | 'reload' | 'restart';
@@ -646,7 +646,14 @@ export interface ResolvedSetting {
 
 export interface ResolveOptions {
   config: PortalConfig;
-  repository: SettingsRepository;
+  /**
+   * 设置来源仓储。
+   *
+   * 用接口而非具体类，是为了能传入"读出即解密"的装饰器
+   * （`modules/settings/secretStore.ts`）—— 敏感项在这里拿到的必须是明文，
+   * 否则解出来的密文会被当成 Token 传给外部 API。
+   */
+  repository: SettingsStore;
 }
 
 /**

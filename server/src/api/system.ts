@@ -7,6 +7,7 @@
  */
 import type { FastifyInstance } from 'fastify';
 import { requireAuth } from '../http/guards.js';
+import { securityHeadersFor } from '../http/securityHeaders.js';
 import type { RouteContext } from './context.js';
 
 /** 心跳间隔（ms）。 */
@@ -26,6 +27,9 @@ export function registerSystemRoutes(app: FastifyInstance, ctx: RouteContext): v
     requireAuth(request);
 
     reply.raw.writeHead(200, {
+      // SSE 直接写 raw head，不走 Fastify 的发送流程，
+      // 因此 app.ts 里 onRequest 钩子设置的安全头不会自动带上，这里显式补一份。
+      ...securityHeadersFor(ctx.config.securityHeaders, request.protocol),
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',

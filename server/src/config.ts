@@ -10,6 +10,51 @@ import { fileURLToPath } from 'node:url';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
+/**
+ * `trustProxy` 的取值。
+ *
+ * Fastify 会把它原样交给 `proxy-addr`，因此可以是布尔、CIDR 字符串、
+ * 预置名称（`loopback` / `linklocal` / `uniquelocal`）或它们的数组。
+ */
+export type TrustProxySetting = boolean | string | string[];
+
+/**
+ * 默认信任的代理范围：**仅回环**。
+ *
+ * 为什么不是 `true`：`true` 表示无条件相信任何来源的 `X-Forwarded-For` /
+ * `X-Forwarded-Proto`，于是任意客户端都能伪造客户端 IP 绕过登录限流、
+ * 并让门户以为自己在 HTTPS 后面（误发 `Secure` Cookie）。
+ *
+ * 为什么是 `loopback` 而不是 `false`：本项目的标准部署是
+ * `tailscale serve → 127.0.0.1:8899`，代理连接必然来自回环地址；
+ * 信任回环既拿到真实客户端 IP（限流键正确），又不会相信 tailnet 直连客户端
+ * 自带的伪造头。
+ */
+export const DEFAULT_TRUST_PROXY: TrustProxySetting = 'loopback';
+
+/**
+ * 默认 CSP。
+ *
+ * - `script-src 'self'`：前端产物全部是本地静态文件，没有内联脚本，
+ *   因此不需要 `'unsafe-inline'`（React 19 + Vite 产物满足该约束）。
+ * - `style-src 'self' 'unsafe-inline'`：React 组件通过 `style` **属性**
+ *   写少量内联样式（进度条宽度等），属性级内联无法用 nonce 覆盖。
+ * - `connect-src 'self'`：允许同源 `fetch` 与 **SSE** 长连接。
+ * - `frame-ancestors 'none'` + `object-src 'none'`：门户不允许被内嵌。
+ */
+export const DEFAULT_CSP = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "font-src 'self'",
+  "connect-src 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join('; ');
+
 export interface MountConfig {
   /** 展示用路径（宿主视角） */
   path: string;
@@ -28,7 +73,13 @@ export interface PortalConfig {
   port: number;
   version: string;
   logLevel: LogLevel;
-  trustProxy: boolean;
+  /**
+   * 可信代理范围。见 `DEFAULT_TRUST_PROXY`：默认只信回环。
+   *
+   * 设为 `true` 等于"相信任何人伪造的 `X-Forwarded-*`"，仅在门户前面确实有
+   * 一个**不可绕过**的反代时才应这么配（此时反代也必须重写而不是追加头）。
+   */
+  trustProxy: TrustProxySetting;
   /** 部署在 HTTPS 反代之后时置 true，会话 Cookie 将带 Secure */
   secureCookies: boolean;
   /** 门户对外的公开主机名（MagicDNS 名或 tailnet IP）；空则运行时从请求头推导 */
@@ -97,6 +148,37 @@ export interface PortalConfig {
   };
   /** 是否信任 X-Forwarded-* 判断请求协议 */
   forwardedProtoTrusted: boolean;
+  /** 浏览器侧安全响应头（CSP / HSTS / X-Frame-Options …） */
+  securityHeaders: {
+    /** 总开关；关闭后一个头都不发（仅在排障时用） */
+    enabled: boolean;
+    /** CSP 内容；空字符串表示不下发 CSP */
+    csp: string;
+    /** 是否允许下发 HSTS（只在请求确为 HTTPS 时才真正下发） */
+    hsts: boolean;
+    /** HSTS max-age（秒） */
+    hstsMaxAge: number;
+  };
+  /** 敏感数据加密（AES-256-GCM）主密钥来源 */
+  secrets: {
+    /** 显式提供的主密钥（hex 64 位或 base64 32 字节）；为空则用 keyFile */
+    key: string | null;
+    /** 未提供 key 时自动生成并读取的密钥文件（权限 0600） */
+    keyFile: string;
+    /** 轮换期间保留的旧密钥（只用于解密），来自 `PORTAL_SECRET_KEY_PREVIOUS` */
+    previousKeys: string[];
+  };
+  /** 两步验证（TOTP） */
+  totp: {
+    /** 是否允许用户启用 TOTP；关闭后所有 TOTP 接口返回不可用 */
+    enabled: boolean;
+    /** otpauth:// URI 里的签发者名 */
+    issuer: string;
+    /** 校验时允许的时间窗口（±N 个 30s 周期） */
+    window: number;
+    /** 登录第二步挑战令牌的有效期（秒） */
+    challengeTtlSeconds: number;
+  };
 }
 
 const DEFAULT_MOUNTS = 'C:=/host/disk/C,D:=/host/disk/D';
@@ -147,6 +229,44 @@ function oneOf<T extends string>(name: string, fallback: T, allowed: readonly T[
     throw new Error(`环境变量 ${name} 必须是 ${allowed.join('|')} 之一，当前为 "${raw}"`);
   }
   return raw as T;
+}
+
+/**
+ * 解析 `PORTAL_TRUST_PROXY`。
+ *
+ * | 取值 | 含义 |
+ * | --- | --- |
+ * | 未设置 | `loopback`（只信回环代理，安全默认） |
+ * | `1`/`true`/`on`/`yes` | `true` —— 无条件相信 `X-Forwarded-*`（有反代且不可绕过时才用） |
+ * | `0`/`false`/`off`/`no` | `false` —— 完全不信任 |
+ * | `127.0.0.1/8,::1` | 逗号分隔的 IP / CIDR 白名单 |
+ * | `loopback`/`linklocal`/`uniquelocal` | proxy-addr 的预置名称 |
+ *
+ * 非法值直接抛错（启动即失败），避免静默退化成"信任所有人"。
+ */
+export function parseTrustProxy(raw: string | undefined | null): TrustProxySetting {
+  if (raw === undefined || raw === null || raw.trim() === '') return DEFAULT_TRUST_PROXY;
+  const trimmed = raw.trim();
+  const lowered = trimmed.toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(lowered)) return true;
+  if (['0', 'false', 'no', 'off'].includes(lowered)) return false;
+
+  const parts = trimmed
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return DEFAULT_TRUST_PROXY;
+
+  const named = new Set(['loopback', 'linklocal', 'uniquelocal']);
+  for (const part of parts) {
+    if (named.has(part.toLowerCase())) continue;
+    if (!/^[0-9a-fA-F.:]+\/\d{1,3}$/.test(part) && !/^[0-9a-fA-F.:]+$/.test(part)) {
+      throw new Error(
+        `环境变量 PORTAL_TRUST_PROXY 非法："${part}"。应为布尔值、预置名（loopback/linklocal/uniquelocal）或 IP/CIDR 列表`,
+      );
+    }
+  }
+  return parts.length === 1 ? parts[0]! : parts;
 }
 
 /**
@@ -225,7 +345,7 @@ export function loadConfig(overrides: Partial<PortalConfig> = {}): PortalConfig 
     port: num('PORTAL_PORT', 8899, 1, 65535),
     version: str('PORTAL_VERSION', '0.1.0'),
     logLevel: oneOf<LogLevel>('PORTAL_LOG_LEVEL', 'info', ['debug', 'info', 'warn', 'error']),
-    trustProxy: bool('PORTAL_TRUST_PROXY', true),
+    trustProxy: parseTrustProxy(process.env['PORTAL_TRUST_PROXY']),
     secureCookies: bool('PORTAL_SECURE_COOKIES', false),
     publicHost: str('PORTAL_PUBLIC_HOST', ''),
     publicPort: num('PORTAL_PUBLIC_PORT', 0, 0, 65535),
@@ -281,6 +401,26 @@ export function loadConfig(overrides: Partial<PortalConfig> = {}): PortalConfig 
       tailscaleTtlMs: num('PORTAL_CACHE_TAILSCALE_TTL_MS', 5000, 0, 120000),
     },
     forwardedProtoTrusted: bool('PORTAL_FORWARDED_PROTO_TRUSTED', true),
+    securityHeaders: {
+      enabled: bool('PORTAL_SECURITY_HEADERS', true),
+      csp: str('PORTAL_CSP', DEFAULT_CSP),
+      hsts: bool('PORTAL_HSTS', true),
+      hstsMaxAge: num('PORTAL_HSTS_MAX_AGE', 180 * 24 * 3600, 0, 63072000),
+    },
+    secrets: {
+      key: optionalStr('PORTAL_SECRET_KEY'),
+      keyFile: path.resolve(str('PORTAL_SECRET_KEY_FILE', path.join(dataDir, 'secret.key'))),
+      previousKeys: str('PORTAL_SECRET_KEY_PREVIOUS', '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    },
+    totp: {
+      enabled: bool('PORTAL_TOTP_ENABLED', true),
+      issuer: str('PORTAL_TOTP_ISSUER', 'HomePort'),
+      window: num('PORTAL_TOTP_WINDOW', 1, 0, 5),
+      challengeTtlSeconds: num('PORTAL_TOTP_CHALLENGE_TTL_SECONDS', 300, 60, 1800),
+    },
   };
 
   return { ...config, ...overrides };

@@ -17,14 +17,17 @@ import { createLogger, type Logger } from './logger.js';
 import { initDatabase, type Db } from './db/database.js';
 import { AuditRepository, PreferencesRepository, UsersRepository } from './db/users.js';
 import { SettingsRepository } from './db/settings.js';
+import { RecoveryCodesRepository, TotpChallengesRepository } from './db/totp.js';
 import { handleError } from './http/errors.js';
 import { createAuthHook } from './http/guards.js';
+import { registerSecurityHeaders } from './http/securityHeaders.js';
 import { AuthService } from './modules/auth/service.js';
 import { SessionsRepository } from './modules/auth/sessions.js';
 import { DockerProvider } from './modules/docker/provider.js';
 import { ContainerService } from './modules/docker/service.js';
 import { OverviewService } from './modules/overview/service.js';
 import { SettingsService } from './modules/settings/service.js';
+import { createSecretBox, loadOrCreateKey, parsePreviousKeys } from './modules/settings/secretBox.js';
 import { SystemProvider } from './modules/system/provider.js';
 import { SystemService } from './modules/system/service.js';
 import { selectTailscaleProvider } from './modules/tailscale/provider.js';
@@ -89,6 +92,26 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
   const preferencesRepo = new PreferencesRepository(db);
   const auditRepo = new AuditRepository(db);
   const settingsRepo = new SettingsRepository(db);
+  const recoveryCodesRepo = new RecoveryCodesRepository(db);
+  const totpChallengesRepo = new TotpChallengesRepository(db);
+
+  // ---- 敏感数据加密主密钥 ----
+  // 优先 `PORTAL_SECRET_KEY`，否则读取/生成 `<dataDir>/secret.key`（0600）。
+  // 同一个 secretBox 同时服务两件事：settings 表的敏感项、用户的 TOTP 种子。
+  const loadedKey = loadOrCreateKey({
+    explicit: config.secrets.key,
+    keyFile: config.secrets.keyFile,
+    logger,
+  });
+  const secretBox = createSecretBox({
+    key: loadedKey.key,
+    previousKeys: parsePreviousKeys(config.secrets.previousKeys.join(',')),
+  });
+  logger.info('敏感数据加密已启用', {
+    keySource: loadedKey.source,
+    keyFingerprint: secretBox.keyFingerprint(),
+    previousKeys: config.secrets.previousKeys.length,
+  });
 
   const tailscaleProvider = await selectTailscaleProvider(config, logger, defaultCommandRunner);
   const tailscale = new TailscaleService({ provider: tailscaleProvider, config, logger });
@@ -122,6 +145,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
     repository: settingsRepo,
     audit: auditRepo,
     logger,
+    secretBox,
     onReload: async ({ tailscale: reloadTs, docker: reloadDocker }) => {
       if (reloadDocker) dockerProvider.reload();
       // 缓存 TTL 与 /proc 路径属构造期读取的值，这里同步一次
@@ -130,6 +154,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
       if (reloadTs) await tailscale.reload();
     },
   });
+  // 存量明文敏感值一次性升级为密文（幂等；失败只告警不中断启动）。
+  // 必须早于 initialize()：让数据库里的覆盖值在解密后立刻生效。
+  const reencrypted = await settings.reencryptAll();
+  if (reencrypted > 0) logger.info('敏感设置已从明文升级为加密存储', { count: reencrypted });
   // **必须在任何数据源被使用之前**：让数据库里的覆盖值先生效
   await settings.initialize();
   // 预热一次，让容器模块立刻能拿到本机 tailnet 地址（否则首次渲染全部容器都判为不可达）
@@ -142,6 +170,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
     audit: auditRepo,
     config,
     logger,
+    secretBox,
+    totp: { recoveryCodes: recoveryCodesRepo, challenges: totpChallengesRepo },
   });
 
   const users = new UsersService({
@@ -170,6 +200,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
     timeWindow: '1 minute',
     keyGenerator: (request) => request.ip,
   });
+
+  // 安全响应头（CSP / nosniff / HSTS…）。放在鉴权钩子之前注册：
+  // 这样连 401/403 之类的错误响应也会带上头，不会出现"报错页没防护"的缝。
+  registerSecurityHeaders(app, config.securityHeaders, logger);
 
   // 请求日志：只记录出错的 API 请求，避免噪声
   app.addHook('onResponse', async (request, reply) => {
@@ -275,6 +309,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
       try {
         const purged = auth.purgeExpiredSessions();
         if (purged > 0) logger.debug('已清理过期会话', { purged });
+        // 过期的两步验证挑战（含尝试次数用尽的）
+        auth.purgeExpiredTotpState();
         // 审计日志保留 90 天
         auditRepo.pruneOlderThan(new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString());
       } catch (error) {

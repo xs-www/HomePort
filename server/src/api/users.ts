@@ -13,6 +13,9 @@ import {
   parseOrThrow,
   preferencesBodySchema,
   resetPasswordBodySchema,
+  totpDisableBodySchema,
+  totpEnableBodySchema,
+  totpRecoveryCodesBodySchema,
   updateUserBodySchema,
 } from '../http/schemas.js';
 import type { RouteContext } from './context.js';
@@ -42,6 +45,62 @@ export function registerUserRoutes(app: FastifyInstance, ctx: RouteContext): voi
     const session = requireAuth(request);
     ctx.users.assertAdmin(session.user);
     return ctx.users.list();
+  });
+
+  // ---- 两步验证（TOTP）----
+  //
+  // 这几个路由刻意挂在 `/api/users/me/*` 而不是 `/api/auth/*`：
+  // `/api/auth/*` 是**匿名**作用域（登录前就要能用），没有角色守卫也没有 CSRF 钩子；
+  // 而绑定/关闭两步验证是登录后的变更操作，必须同时满足
+  // 「已登录」+「CSRF 校验」。挂在 `/api/users` 下就自动继承这两层。
+
+  /** 两步验证 · 开始绑定：生成种子并以未确认状态保存（明文种子只返回这一次）。 */
+  app.post('/me/totp/setup', async (request) => {
+    const session = requireAuth(request);
+    return ctx.auth.beginTotpSetup(session);
+  });
+
+  /** 两步验证 · 确认启用：回填验证器上的码，成功后**一次性**返回恢复码。 */
+  app.post('/me/totp/enable', async (request) => {
+    const session = requireAuth(request);
+    const body = parseOrThrow(totpEnableBodySchema, request.body, '两步验证参数');
+    const result = await ctx.auth.enableTotp(session, body.code, request.ip);
+    ctx.logger.info('用户启用了两步验证', { username: session.user.username });
+    return result;
+  });
+
+  /** 两步验证 · 关闭（需密码；已启用时还需一次当前验证码或恢复码）。 */
+  app.post('/me/totp/disable', async (request) => {
+    const session = requireAuth(request);
+    const body = parseOrThrow(totpDisableBodySchema, request.body, '关闭两步验证参数');
+    const user = await ctx.auth.disableTotp(session, {
+      password: body.password,
+      code: body.code,
+      ip: request.ip,
+    });
+    ctx.logger.info('用户关闭了两步验证', { username: session.user.username });
+    return { ok: true, user };
+  });
+
+  /** 两步验证 · 重新生成恢复码（旧码全部作废）。 */
+  app.post('/me/totp/recovery-codes', async (request) => {
+    const session = requireAuth(request);
+    const body = parseOrThrow(totpRecoveryCodesBodySchema, request.body, '恢复码参数');
+    const recoveryCodes = await ctx.auth.regenerateRecoveryCodes(session, body.code, request.ip);
+    return { recoveryCodes };
+  });
+
+  /**
+   * 管理员：强制重置某用户的两步验证（用户丢失验证器时的兜底流程）。
+   *
+   * 副作用是"清空种子 + 吊销该用户全部会话"，因此审计会记录到管理员头上。
+   */
+  app.post('/:id/totp/reset', async (request) => {
+    const session = requireAuth(request);
+    ctx.users.assertAdmin(session.user);
+    const { id } = parseOrThrow(numericIdParamSchema, request.params, '用户 ID');
+    const revokedSessions = ctx.auth.resetTotpForUser(session, id, request.ip);
+    return { ok: true, revokedSessions };
   });
 
   /** 管理员：创建用户。 */

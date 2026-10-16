@@ -132,6 +132,42 @@ export const testTailscaleBodySchema = z.object({
   token: z.string().max(512).optional(),
 });
 
+// ---- 两步验证（TOTP）----
+
+/**
+ * 登录第二步：挑战令牌 + 验证码。
+ *
+ * `code` 同时接受 6 位 TOTP 码与 `XXXX-XXXX` 形式的恢复码，
+ * 因此这里只做长度与字符集约束（具体判定在 service 层），
+ * 且**不**把错误提示写成"验证码格式错误"以免暴露内部判定顺序。
+ */
+export const loginTotpBodySchema = z.object({
+  challengeToken: z.string().trim().min(16, '缺少登录挑战令牌').max(256),
+  code: z.string().trim().min(6, '请输入 6 位验证码').max(16),
+  remember: z.boolean().optional(),
+});
+
+/** 确认启用两步验证：回填一次验证器生成的 6 位码。 */
+export const totpEnableBodySchema = z.object({
+  code: z.string().trim().min(6, '请输入 6 位验证码').max(16),
+});
+
+/** 重新生成恢复码：需要当前 TOTP 码作为"再次确认"。 */
+export const totpRecoveryCodesBodySchema = z.object({
+  code: z.string().trim().min(6, '请输入 6 位验证码').max(16),
+});
+
+/**
+ * 关闭两步验证。
+ *
+ * 要求密码（证明是本人）并可再要求当前验证码；
+ * 两步验证是"提高门槛"的功能，关掉它的门槛必须不低于打开它。
+ */
+export const totpDisableBodySchema = z.object({
+  password: z.string().min(1, '请输入当前密码').max(PASSWORD_MAX_LENGTH),
+  code: z.string().trim().min(6).max(16).optional(),
+});
+
 /**
  * 解析 + 校验；失败抛 `VALIDATION_FAILED`（含 `fieldErrors`）。
  *

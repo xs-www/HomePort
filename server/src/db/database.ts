@@ -101,6 +101,52 @@ export const MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    name: 'totp_two_factor',
+    up: (db) => {
+      // 两步验证（TOTP）。设计要点：
+      //
+      // 1. `totp_secret` 存的是**密文**（`enc:v1:…`，AES-256-GCM，见 settings/secretBox.ts）。
+      //    种子等价于"第二个密码"，明文落库等于把两步验证降级成一步 ——
+      //    因此哪怕数据库文件被拷走，没有主密钥也拿不到种子。
+      // 2. `totp_enabled` 与 `totp_secret` 分离：setup 阶段会先写入一个**未确认**的种子，
+      //    只有用户用验证器 App 成功回填一次验证码后才置 1。
+      //    这样"扫了码但没输码"不会把人锁在门外。
+      // 3. `totp_last_counter` 记录最后成功使用的时间步，用于**防重放**：
+      //    同一个 30 秒窗口内的验证码被二次使用会被拒绝。
+      // 4. 恢复码只存 sha256 摘要；用掉一次就记 `used_at`，不可复用。
+      // 5. 登录第二步的挑战令牌同样只存摘要，并带 `attempts` 计数，
+      //    避免"拿到密码的人"对 6 位验证码做无限次暴力尝试。
+      db.exec(`
+        ALTER TABLE users ADD COLUMN totp_secret TEXT;
+        ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE users ADD COLUMN totp_confirmed_at TEXT;
+        ALTER TABLE users ADD COLUMN totp_last_counter INTEGER;
+
+        CREATE TABLE totp_recovery_codes (
+          id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          code_hash  TEXT    NOT NULL,
+          created_at TEXT    NOT NULL,
+          used_at    TEXT
+        );
+        CREATE INDEX idx_totp_recovery_user ON totp_recovery_codes(user_id);
+
+        CREATE TABLE totp_challenges (
+          id          TEXT    PRIMARY KEY,
+          token_hash  TEXT    NOT NULL,
+          user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at  TEXT    NOT NULL,
+          expires_at  TEXT    NOT NULL,
+          consumed_at TEXT,
+          attempts    INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE UNIQUE INDEX idx_totp_challenges_token ON totp_challenges(token_hash);
+        CREATE INDEX idx_totp_challenges_expires ON totp_challenges(expires_at);
+      `);
+    },
+  },
 ];
 
 export interface OpenDbOptions {
