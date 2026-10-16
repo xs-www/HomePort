@@ -133,6 +133,19 @@ async function main() {
     PORTAL_TRUST_PROXY: '0',
     PORTAL_LOG_LEVEL: 'warn',
     DOCKER_ENDPOINT,
+    // ---- Sprint 2：让"还没有历史数据"成为确定性断言
+    //
+    // 后台采集**仍然开着**（走的是生产入口 index.js，`backgroundJobs: true`），
+    // 但分钟桶只在下一次 tick 观察到"当前分钟已经结束"时才落库；
+    // 把间隔拉到 1 小时，整个用例集（~26 秒）内就不会有任何历史行，
+    // 于是 `/history` 的空态断言不会因为跑到一半刚好跨过分钟边界而变红。
+    //
+    // 曲线的真实语义（缺口断开、部分缺测、单位换算）不靠 E2E 验：
+    // 后端用可注入时钟的一昼夜仿真验，前端用图表纯函数单测验。
+    PORTAL_METRICS_SAMPLE_INTERVAL_SEC: '3600',
+    // 关闭自动健康探测：E2E 里的服务没有 healthTarget，且不该在冒烟测试里发真实网络请求。
+    // 手动 `POST /api/services/:id/health` 不受影响。
+    PORTAL_HEALTH_PROBE_INTERVAL_SEC: '0',
   };
 
   // 直接用当前 node 可执行文件启动，不经 shell —— 少一层中间进程，退出时更干净

@@ -9,12 +9,13 @@
  *
  * 约定：
  * - 断言落在**可见文案或 URL** 上，不只断言 HTTP 200 —— "接口通但页面白屏"必须能被发现；
- * - 每个用例都用默认的独立浏览器上下文（Cookie 不跨用例），需要登录时走真实登录表单。
+ * - 每个用例仍用默认的独立浏览器上下文（Cookie 不跨用例），但**每个角色只真正登录一次**，
+ *   其余用例复用缓存的会话 —— 原因见 `loginAs` 上方关于登录限速的说明；
  *
  * 顺序敏感：用例按声明顺序串行执行（`workers: 1`），第 2 条会真正创建管理员，
  * 倒数第 2 条创建 viewer，末尾两条 Sprint 1 用例依赖这两类账号。
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Cookie, type Page } from '@playwright/test';
 
 /** 与 e2e/start-server.mjs 保持一致的固定测试凭据（不是真实密钥）。 */
 const SETUP_TOKEN = process.env.PORTAL_E2E_SETUP_TOKEN ?? 'E2E-TEST-TOKEN-0000-0000';
@@ -40,7 +41,22 @@ function trackPageErrors(page: Page): string[] {
 }
 
 /**
- * 走真实登录表单登录，并**确定性地**落到总览页。
+ * 已建立会话的角色 → cookies（**每个角色只真正登录一次**）。
+ *
+ * 为什么必须复用：登录接口的限速是**硬编码的安全常量**
+ * `LOGIN_RATE_LIMIT = { max: 10, timeWindow: '1 minute' }`（`server/src/api/auth.ts`，防暴力破解）。
+ * 而本套件每条用例都要以某个身份进入，用例数一多就会把 10 次/分钟的额度用光 ——
+ * Sprint 2 新增两条用例后**真的发生了**：末尾那条（移动端排版）被 429 挡在登录页上，
+ * 服务端日志里留下 `RATE_LIMITED` + `"ip":"127.0.0.1"`，症状却表现为"登录页标题一直不消失"。
+ *
+ * 处理原则：**绝不为测试放宽安全控制**（那是对真实攻击面的削弱），而是让每个角色
+ * 只走一次真实登录表单（登录流程本身仍有覆盖），其余用例复用同一份 cookies。
+ * `workers: 1` 且同源，因此进程内缓存就足够；这也是以后再加用例不会再撞上限速的原因。
+ */
+const sessions = new Map<string, Cookie[]>();
+
+/**
+ * 走真实登录表单登录，并**确定性地**落到服务墙。
  *
  * 为什么要显式回到 `/`：登录页会用 React Router 的 `state.from` 把用户送回"当初想去的页面"，
  * 而 `state.from` 存在 history entry 里，**同 URL 的 goto 会保留它**（等价于刷新）。
@@ -48,7 +64,34 @@ function trackPageErrors(page: Page): string[] {
  * 这是产品预期行为（用例 3 专门验证它），但会让"以某身份登录"的辅助函数变得不确定，
  * 所以这里统一在登录完成后显式导航到首页。
  */
+/**
+ * 试着重放缓存里的会话；若已被撤销（见下）就返回 `false`，交由调用方走真实登录。
+ *
+ * 为什么要"试用 + 兜底"而不是直接用：缓存的是**会话令牌本身**，而"登录登出"是
+ * Sprint 0 的验收项 —— 用例会真的点「退出」，退出会在服务端**撤销该会话**。
+ * 于是缓存里那枚令牌从那一刻起就作废了，硬用它只会落到登录页，
+ * 症状是"登录后服务墙标题找不到"（且日志里不会有 401 警告，因为那是正常的未认证响应）。
+ * 这里用短超时探测，失效就重新登录并刷新缓存 —— 自愈，且不会因此多花多少次登录额度。
+ */
+async function restoreSession(page: Page, cookies: Cookie[]): Promise<boolean> {
+  await page.context().addCookies(cookies);
+  await page.goto('/');
+  try {
+    await expect(page.getByRole('heading', { level: 1, name: '服务' })).toBeVisible({ timeout: 3000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function loginAs(page: Page, username: string, password: string): Promise<void> {
+  // 先清空：同一用例里可能要换身份（例如"viewer 看不到、管理员可见"要在两条会话间切换），
+  // 若不清，上下文里会同时存在两个同名 `hp_session`，服务端解析不出有效会话。
+  await page.context().clearCookies();
+
+  const cached = sessions.get(username);
+  if (cached && (await restoreSession(page, cached))) return;
+
   await page.goto('/login');
   await expect(page.getByRole('heading', { name: 'HomePort 门户' })).toBeVisible();
   await page.locator('#username').fill(username);
@@ -57,6 +100,9 @@ async function loginAs(page: Page, username: string, password: string): Promise<
 
   // 等登录真正完成（离开登录页）再导航，否则整页跳转会打断还在飞的登录请求
   await expect(page.getByRole('heading', { name: 'HomePort 门户' })).toHaveCount(0);
+  // 登录成功即缓存会话：由于上面已清空，这里捕获到的**只有本次登录**产生的 cookie，
+  // 不会把上一个身份的会话一起缓存进去（限速额度对每个角色只花一次）
+  sessions.set(username, await page.context().cookies());
   await page.goto('/');
   // Sprint 1 起 `/` 是服务墙（总览迁到 `/overview`），登录成功的落点断言也随之改变
   await expect(page.getByRole('heading', { level: 1, name: '服务' })).toBeVisible();
@@ -308,6 +354,105 @@ test('服务墙：Ctrl+K 搜索并进入服务详情；viewer 看不到任何管
   // 直接敲管理页 → 权限不足（后端也会独立拒绝写接口）
   await page.goto('/admin/services');
   await expect(page.getByRole('heading', { level: 1, name: '权限不足' })).toBeVisible();
+
+  await expectNoCrash(page, errors);
+});
+
+/**
+ * Sprint 2：历史与告警（S2-01…S2-04 的生产产物验收）。
+ *
+ * 这一条**故意不验曲线形状**：缺口断开、部分缺测、百分比/字节不混淆这些语义，
+ * 在后端"可注入时钟的一昼夜仿真"与前端"图表纯函数单测"里验得更准更稳。
+ * E2E 的价值是另外三件事：生产产物真能打开这两页、空库时不白屏也不画假线、
+ * 权限边界在**真实 HTTP** 上确实拦住。
+ *
+ * 空态为什么确定：`e2e/start-server.mjs` 把 `PORTAL_METRICS_SAMPLE_INTERVAL_SEC` 设为 3600
+ * （后台采集仍开着），所以整个用例集内库里不会出现任何历史行。
+ */
+test('历史与告警：导航可达、空历史不画 0 线、四条内置规则默认关闭', async ({ page }) => {
+  const errors = trackPageErrors(page);
+
+  await loginAs(page, ADMIN_USERNAME, ADMIN_PASSWORD);
+  await expect(navLink(page, '历史')).toBeVisible();
+  await expect(navLink(page, '告警')).toBeVisible();
+
+  // ---- 历史页：空态可读（"没有数据"必须说出来，而不是给一条 0 的平线）
+  await navLink(page, '历史').click();
+  await expect(page).toHaveURL(/\/history$/);
+  await expect(page.getByText('还没有历史数据')).toBeVisible();
+
+  // 接口层同样要诚实：没有样本时 points 为空、summary 的统计量是 null 而不是 0
+  const historyResponse = await page.request.get(
+    '/api/metrics/history?metric=host.cpu.percent&target=host&range=1h',
+  );
+  expect(historyResponse.status()).toBe(200);
+  const history = await historyResponse.json();
+  expect(history.points).toEqual([]);
+  expect(history.summary.count).toBe(0);
+  expect(history.summary.avg).toBeNull();
+  expect(history.unit).toBe('percent');
+  expect(history.sampling.intervalSec).toBe(3600);
+
+  // 存储与保留配置真的通到了接口（"历史数据量与库大小被记录"这条验收要靠它）
+  const storageResponse = await page.request.get('/api/metrics/storage');
+  expect(storageResponse.status()).toBe(200);
+  const storage = await storageResponse.json();
+  expect(storage.retention).toMatchObject({ minuteHours: 24, hourDays: 30 });
+  // 库大小按 §1.1 的口径报出（`page_count × page_size`），而不是"文件多大"这种含 WAL 的模糊量
+  expect(storage.size.bytes).toBeGreaterThan(0);
+  expect(storage.size.pageCount).toBeGreaterThan(0);
+  // 预算判据必须可读，且稳态上限就是 §1.1 冻结的 32 MB（"数据量符合预算"这条验收靠它）
+  expect(storage.budget.steadyLimitBytes).toBe(32 * 1024 * 1024);
+  expect(storage.budget.withinBudget).toBe(true);
+
+  // ---- 规则状态用同源 API 断言真实值：UI 上的"关闭"可能是渲染假象
+  const rulesResponse = await page.request.get('/api/alerts/rules');
+  expect(rulesResponse.status()).toBe(200);
+  const rules = await rulesResponse.json();
+  expect(rules.items.map((rule: { name: string }) => rule.name).sort()).toEqual(
+    ['内存使用率过高', '容器异常退出', '磁盘使用率过高', '服务连续探测失败'].sort(),
+  );
+  expect(rules.items.every((rule: { enabled: boolean }) => rule.enabled === false)).toBe(true);
+  expect(rules.items.every((rule: { builtin: boolean }) => rule.builtin === true)).toBe(true);
+
+  await navLink(page, '告警').click();
+  await expect(page).toHaveURL(/\/alerts$/);
+  await expect(page.getByText('磁盘使用率过高')).toBeVisible();
+
+  await expectNoCrash(page, errors);
+});
+
+test('告警页：viewer 只读（没有写入口，带有效 CSRF 的写请求也被后端拒绝）', async ({ page }) => {
+  const errors = trackPageErrors(page);
+
+  await loginAs(page, VIEWER_USERNAME, VIEWER_PASSWORD);
+  await expect(navLink(page, '告警')).toBeVisible();
+  await navLink(page, '告警').click();
+  await expect(page).toHaveURL(/\/alerts$/);
+
+  // viewer 能看规则（只读），但界面上没有任何写入口。
+  await expect(page.getByText('磁盘使用率过高')).toBeVisible();
+  // 只断言**按钮的可访问名**、并尽量用 exact：规则列表里的状态文案（如"未启用"）
+  // 会误命中宽泛的正则，那种失败是测试自己的问题，不是权限问题。
+  await expect(page.getByRole('button', { name: '确认', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '保存', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '取消', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /^编辑规则/ })).toHaveCount(0);
+
+  // 后端独立拒绝。**必须带上有效的 CSRF 令牌**，否则这个 403 只是因为缺 CSRF 才出现，
+  // 就证明不了角色鉴权（两个不同的拒绝理由不能混为一谈）。
+  const sessionResponse = await page.request.get('/api/auth/session');
+  expect(sessionResponse.status()).toBe(200);
+  const { csrfToken } = await sessionResponse.json();
+  expect(typeof csrfToken).toBe('string');
+
+  const rulesResponse = await page.request.get('/api/alerts/rules');
+  const rules = await rulesResponse.json();
+  const patchResponse = await page.request.patch(`/api/alerts/rules/${rules.items[0].id}`, {
+    data: { enabled: true },
+    headers: { 'x-csrf-token': csrfToken },
+  });
+  expect(patchResponse.status()).toBe(403);
 
   await expectNoCrash(page, errors);
 });
