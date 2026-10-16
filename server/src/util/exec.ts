@@ -60,7 +60,10 @@ export async function runCommand(
     try {
       child = spawn(command, argList, {
         cwd,
-        env: env ?? process.env,
+        // 不传 env 就是"继承父进程环境"（Node 的默认行为），因此这里不需要
+        // 读 process.env —— 环境变量的读取点只有 config.ts（见其文件头约定）。
+        // 需要改环境（例如注入 LD_LIBRARY_PATH）时由调用方显式传 env。
+        ...(env ? { env } : {}),
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'pipe'],
       });

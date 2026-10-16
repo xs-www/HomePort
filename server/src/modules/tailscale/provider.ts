@@ -14,6 +14,7 @@
  *
  * 两种模式的输出统一为 `TailnetStatus`，上层无感。
  */
+import os from 'node:os';
 import type { PortalConfig } from '../../config.js';
 import type { Logger } from '../../logger.js';
 import { isSuccess, runCommandJson, type RunCommandResult } from '../../util/exec.js';
@@ -323,7 +324,10 @@ export class ApiTailscaleProvider implements TailscaleProvider {
         return unavailableStatus('api', `Tailscale API 返回 ${response.status}${text ? `：${text.slice(0, 200)}` : ''}`);
       }
       const payload = (await response.json()) as { devices?: TailscaleApiDevice[] };
-      return mapApiDevices(payload.devices ?? [], this.config.publicHost || process.env.HOSTNAME || '');
+      // 本机主机名用于在设备列表里认出"这台"。用 os.hostname() 而不是
+      // process.env.HOSTNAME：语义相同，但不额外制造一个环境变量依赖
+      // （环境变量的读取点只有 config.ts，见其文件头约定）。
+      return mapApiDevices(payload.devices ?? [], this.config.publicHost || os.hostname() || '');
     } catch (error) {
       const detail = error instanceof Error && error.name === 'AbortError' ? 'Tailscale API 请求超时' : `Tailscale API 请求失败：${String(error)}`;
       this.logger.warn('Tailscale API 调用失败', { error });

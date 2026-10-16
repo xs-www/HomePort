@@ -61,10 +61,15 @@ export function effectiveMode(mode: TailscaleProbeInput['mode'], hasToken: boole
 
 /**
  * 执行连通性测试。**永不抛异常**，所有结果通过返回值表达。
+ *
+ * 注意：这里**不读 `process.env`**。传进来的 `apiToken` 已经是三层优先级
+ * （数据库 > 环境变量 > 默认值）解析后的生效值 —— 环境变量那一层由
+ * `config.ts` 负责，探针再去看一眼 `process.env` 只会让结论与生效配置不一致，
+ * 并且让测试结果取决于宿主机恰好设了什么变量。
  */
 export async function probeTailscale(input: TailscaleProbeInput): Promise<TailscaleTestResult> {
   const token = input.apiToken.trim();
-  const mode = effectiveMode(input.mode, token !== '' || process.env.PORTAL_TAILSCALE_API_TOKEN !== undefined);
+  const mode = effectiveMode(input.mode, token !== '');
 
   if (mode === 'off') {
     return {

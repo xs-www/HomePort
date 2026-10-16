@@ -22,7 +22,7 @@
  * 不给出可编辑控件，避免误导用户以为改了就生效。
  */
 import path from 'node:path';
-import type { PortalConfig } from '../../config.js';
+import { readEnvVar, type PortalConfig } from '../../config.js';
 import type { SettingsStore } from '../../db/settings.js';
 
 /** 生效级别。 */
@@ -701,11 +701,9 @@ export function resolveSettings(options: ResolveOptions): ResolvedSetting[] {
   });
 }
 
+/** 环境变量层的原值。读取动作统一走 `config.ts`（唯一接触 `process.env` 的模块）。 */
 function readEnv(name: string): string | null {
-  const raw = process.env[name];
-  if (raw === undefined) return null;
-  const trimmed = raw.trim();
-  return trimmed === '' ? null : trimmed;
+  return readEnvVar(name);
 }
 
 /** 解析结果为「键 → 值」的映射，供 applyTo 使用。 */

@@ -400,7 +400,9 @@ export class SystemProvider {
    */
   private async queryGpu(): Promise<{ gpu: GpuView | null; status: SourceStatus }> {
     const bin = this.config.system.nvidiaSmi;
-    const env = { ...process.env };
+    // 基础环境来自 config 的环境快照，而不是自己去读 process.env
+    // （环境变量的读取点只有 config.ts，见其文件头约定）
+    const env: Record<string, string | undefined> = { ...this.config.envVars };
     if (this.config.system.ldLibraryPath) {
       env.LD_LIBRARY_PATH = `${this.config.system.ldLibraryPath}:${env.LD_LIBRARY_PATH ?? ''}`.replace(/:$/, '');
     }

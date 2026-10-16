@@ -69,6 +69,17 @@ export interface MountConfig {
 
 export interface PortalConfig {
   env: string;
+  /**
+   * `process.env` 的快照。
+   *
+   * 存在的意义：**本文件是唯一读取 `process.env` 的模块**（见文件头约定）。
+   * 需要"继承父进程环境"或"展示某个环境变量的原值"的模块从这里取，
+   * 而不是各自去碰 `process.env` —— 否则环境依赖会散落各处，
+   * 测试也会因为宿主机恰好设了某个变量而走进不同分支。
+   *
+   * 键名由使用方（如设置注册表的 `envVar`）声明，这里只负责提供值。
+   */
+  envVars: Readonly<Record<string, string | undefined>>;
   host: string;
   port: number;
   version: string;
@@ -338,9 +349,12 @@ export function loadConfig(overrides: Partial<PortalConfig> = {}): PortalConfig 
   const diskMounts = parseMounts(
     str('PORTAL_DISK_MOUNTS', process.platform === 'win32' ? DEFAULT_MOUNTS.replace('D:=/host/disk/D', '') : '/=/host/root'),
   );
+  // 环境变量快照：测试可通过 overrides.envVars 追加，不必去改 process.env
+  const envVars: Readonly<Record<string, string | undefined>> = { ...process.env, ...(overrides.envVars ?? {}) };
 
   const config: PortalConfig = {
     env: str('NODE_ENV', 'production'),
+    envVars,
     host: str('PORTAL_HOST', '0.0.0.0'),
     port: num('PORTAL_PORT', 8899, 1, 65535),
     version: str('PORTAL_VERSION', '0.1.0'),
@@ -423,7 +437,21 @@ export function loadConfig(overrides: Partial<PortalConfig> = {}): PortalConfig 
     },
   };
 
-  return { ...config, ...overrides };
+  return { ...config, ...overrides, envVars };
+}
+
+/**
+ * 读取原始环境变量（去空白；空串按"未设置"处理）。
+ *
+ * 供设置注册表等需要展示"环境变量层原值"的模块使用 —— 它是本文件之外
+ * 唯一被允许触达 `process.env` 的入口，因此调用方不需要（也不应该）
+ * 自己去读 `process.env`。
+ */
+export function readEnvVar(name: string): string | null {
+  const raw = process.env[name];
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 /** 确保 dataDir 存在（含父目录）。 */
