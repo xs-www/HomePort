@@ -20,3 +20,16 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 *.tsbuildinfo
+# 敏感数据加密主密钥（绝不入库）
+secret.key
+*.key
+# E2E（Playwright）
+playwright-report/
+test-results/
+blob-report/
+.e2e-data/
+.e2e-data*/
+playwright/.cache/
+# 本机专用 compose 覆盖（例如 Windows 上把 C: 挂进容器、NAS 上挂 /volume1）：
+# compose 会自动合并这个文件，但它依赖具体机器的路径，因此不入库。
+docker-compose.override.yml
