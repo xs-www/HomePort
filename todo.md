@@ -223,6 +223,13 @@
       `e2e/start-server.mjs` + `playwright.config.ts`；覆盖首启初始化 → 登录/登出 →
       关键页面降级提示 → 权限边界 → 安全响应头。默认端口 8988（`PORTAL_E2E_PORT` 可覆盖），
       启动前跑完整生产构建、每次清空 `.e2e-data`。见 `08-operations.md` §12
+- [x] 测试的宿主依赖性已收口：`tailnet 连通性`用例改为自钉模式与 Token
+      （原先会读前一个用例写下的 Token / 依赖本机是否装了 Tailscale CLI，CI 与本机分支不同）；
+      `auth.test.ts` 增加环境变量清理，与 `settings.test.ts` 既有约定一致
+- [x] 环境变量边界变成可执行约定：`config.envVars` 快照 + `config.readEnvVar()`，
+      其余模块不再直接读 `process.env`（`registry.ts` / `tailscale/provider.ts` /
+      `system/provider.ts` / `util/exec.ts` / `tailscaleProbe.ts` 均已改）；
+      `server/tests/envBoundary.test.ts` 扫描源码钉住这一点
 - [x] CI 已覆盖测试（S0-02）：新增 `.github/workflows/ci.yml`（PR 与 master push：
       typecheck + 单测 + 构建 + E2E，**无 paths-ignore**）；
       `docker-publish.yml` 新增 `quality` job 且 `build-and-push` 依赖它。

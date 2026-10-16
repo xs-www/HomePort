@@ -1871,5 +1871,111 @@ npm run test:e2e    → 7 passed（2 个 spec）
 7. **HTTPS 下的 HSTS 与反代绑定**：只有 `X-Forwarded-Proto: https` 被 `trustProxy` 采信时才会下发，
    反代配置不对就会出现"以为开了 HSTS 其实没开"。
 
+---
+
+## [2026-10-16] 修复：tailnet 连通性用例的宿主依赖 + 环境变量边界收紧
+
+### 背景
+
+`npm test` 出现 **332/333**：失败用例 `接口契约 > 测试 tailnet 连通性：无 Token 时给出可操作的提示而非报错`。
+排查后发现不是"某台机器的问题"，而是这条用例**从来没有控制住自己的输入**，
+于是结论取决于跑测试的机器 —— 属于典型的"能过，但过得毫无意义"。
+
+### 变更概览
+
+| 变更 | 文件 |
+| --- | --- |
+| 用例不再复用它前面用例写下的 Token（新增 `afterEach` 清理 + 用例内显式钉住模式与 Token） | `server/tests/auth.test.ts` |
+| 用例期间清空会影响设置解析的环境变量（结束后恢复），与 `settings.test.ts` 既有约定一致 | `server/tests/auth.test.ts` |
+| 连通性探针不再读 `process.env` | `server/src/modules/settings/tailscaleProbe.ts` |
+| 环境变量读取点收敛：新增 `config.envVars` 快照与 `config.readEnvVar()`，其余模块不再直接读 | `server/src/config.ts`、`modules/settings/registry.ts`、`modules/tailscale/provider.ts`、`modules/system/provider.ts`、`util/exec.ts` |
+| 新增"环境变量边界"用例：扫描源码钉住唯一读取点 + 直接验证探针不看环境变量 | `server/tests/envBoundary.test.ts` |
+
+### 逐项明细
+
+**1. 失败的真实原因（三层叠加）**
+
+这条用例原本的假设是"没配 Token 就应当返回报错提示"，但它既没有清理前一个用例写入的设置，
+也没有固定模式，更没有隔离环境变量：
+
+- 前一个用例（`保存设置：敏感项提交占位符不覆盖原值`）把 `PORTAL_TAILSCALE_API_TOKEN`
+  写进运行时设置且**不清理** → 后续用例读到它；
+- `PORTAL_TAILSCALE_MODE` 未固定，默认 `auto` → 有 Token 走 api、没有则走 cli；
+- 于是 `auto + 有 Token` 会**真的访问 `api.tailscale.com`**（网络不可达或 401 时给的是
+  完全不同的消息），`auto + 无 Token` 又会**真的执行宿主上的 `tailscale` 命令**——
+  本机装了 Tailscale 且已登录时，探针会正常读到十几台设备返回 `ok: true`，用例直接失败。
+
+即：同一条用例在 CI 上走 A 分支、在开发机上走 B 分支，而两条分支的断言完全不同。
+
+**2. 用例改为自证前提**
+
+`api` 模式 + 清空 Token 后再断言，不再依赖宿主机是否装了 Tailscale CLI：
+
+```ts
+// 先把环境钉成确定状态：api 模式 + 哪里都没有 Token
+PATCH /api/settings   { PORTAL_TAILSCALE_MODE: 'api' }
+POST  /api/settings/reset { keys: ['PORTAL_TAILSCALE_API_TOKEN'] }
+POST  /api/settings/test/tailscale {}
+expect(body.ok).toBe(false)
+expect(body.mode).toBe('api')
+expect(body.source.detail).toContain('Token')   // 缺 Token，而不是"网络不可达"
+expect(body.message).toMatch(/Token|令牌|Keys/i)
+```
+
+同时给该文件加上 `beforeEach/afterEach` 的环境变量清理（`MANAGED_ENV`，结束后恢复原值），
+并在 `接口契约` 这个 describe 上加了 `afterEach`：把 `PORTAL_TAILSCALE_API_TOKEN`
+与 `PORTAL_TAILSCALE_MODE` 复位，避免"写设置的用例"污染后续用例。
+
+**3. 探针不再读 `process.env`**
+
+```ts
+// 旧：mode = effectiveMode(input.mode, token !== '' || process.env.PORTAL_TAILSCALE_API_TOKEN !== undefined)
+const mode = effectiveMode(input.mode, token !== '');
+```
+
+传进来的 `apiToken` 已经是三层优先级（数据库 > 环境变量 > 默认值）解析后的生效值，
+环境变量那一层由 `config.ts` 负责；探针再看一眼 `process.env` 只会让结论与生效配置不一致。
+
+**4. 环境变量边界变成可执行约定**
+
+`config.ts` 一直是"唯一读取 `process.env` 的模块"，但此前 `modules/settings/registry.ts`、
+`modules/tailscale/provider.ts`、`modules/system/provider.ts`、`util/exec.ts` 都在直接读，
+约定实际上已经失效。现在：
+
+- `config.envVars`：进程环境快照（测试可用 `loadConfig({ envVars })` 注入，不必改 `process.env`）；
+- `config.readEnvVar(name)`：单个取值（去空白、空串视为未设置），设置注册表展示"环境变量层原值"用它；
+- `util/exec.ts` 改为**不传 `env` 即继承父进程环境**（Node 默认行为），连"继承"都不再需要读 `process.env`；
+- 本机主机名改用 `os.hostname()`，不再依赖 `process.env.HOSTNAME`。
+
+`envBoundary.test.ts` 扫描 `src/**/*.ts`（去注释）断言除 `config.ts` 外不出现 `process.env`，
+并直接验证"宿主环境里有 Token 时 `auto` 模式仍按无 Token 处理、且不发网络请求"。
+
+### 配置 / 接口 / 数据模型影响
+
+- **无**：不改变任何环境变量语义、接口契约与数据库结构。`config.envVars` 是新增的内部字段，
+  唯一对外的可观察差异是"探针判定不再受宿主环境变量影响"（这本身就是修复目标）。
+
+### 验证方式
+
+```bash
+npm run typecheck                    # exit 0
+npm test                             # server 16 文件 / 339 用例 + web 4 文件 / 106 用例 = 445 全绿
+npm run build                        # web (vite) + server (tsc) 均成功
+
+# 关键：把宿主机搞成"污染态"也必须全绿（修复前该状态下必失败）
+$env:PORTAL_TAILSCALE_API_TOKEN='tskey-api-ambient-pollution'; $env:PORTAL_TAILSCALE_MODE='api'
+npx vitest run --root server         # 339 passed
+```
+
+### 已知限制 / 后续
+
+1. `auth.test.ts` 里仍有一条用例（`保存设置：敏感项提交占位符不覆盖原值`）依赖真实写入敏感项，
+   靠 `afterEach` 复位；若将来新增"写设置"的用例，仍需把键名加进这个复位列表。
+2. `envBoundary.test.ts` 的源码扫描按文件判断，无法识别"通过间接包装读环境变量"的写法；
+   它拦的是最常见、也最容易发生的直接读取。
+3. `settings.test.ts` / `settingsCrypto.test.ts` 仍在用例内直接改 `process.env`（已有
+   `MANAGED_ENV` + 保存/恢复）。它们验的正是"环境变量层"，保留这种写法；后续可改用
+   `loadConfig({ envVars })` 注入，进一步减少对全局状态的依赖。
+
 
 

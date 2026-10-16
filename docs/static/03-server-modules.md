@@ -13,14 +13,26 @@
 
 唯一读取 `process.env` 的地方。所有环境变量在此收敛为强类型 `PortalConfig`。
 
+> **这条约定是可执行的**：`server/tests/envBoundary.test.ts` 会扫描 `src/**/*.ts`
+> （去掉注释后）断言只有 `config.ts` 出现 `process.env`。需要环境变量的其它模块走两个口子：
+> `config.envVars`（快照，用于"继承环境"或批量取值）与 `config.readEnvVar(name)`
+> （单个取值，去空白、空串视为未设置，供设置注册表展示"环境变量层原值"）。
+>
+> 为什么较真：环境变量读点散落各处时不会报错，只会让**行为取决于宿主机** ——
+> 真实踩到的例子是 tailnet 连通性测试因宿主环境里存在 `PORTAL_TAILSCALE_API_TOKEN`
+> 而走进 API 分支、真的发起网络请求，本机与 CI 的结论不同。
+> 具体分支：`util/exec.ts` 不传 `env` 即"继承父进程环境"（Node 默认行为），
+> 因此连继承都不需要读 `process.env`。
+
 | 导出 | 签名 | 说明 |
 | --- | --- | --- |
 | `LogLevel` | `'debug' \| 'info' \| 'warn' \| 'error'` | 日志级别 |
 | `MountConfig` | interface | 磁盘挂载点配置：`{ path, containerPath, label, statPath, readOnly }` |
-| `PortalConfig` | interface | 全部配置字段（见 `02-configuration.md` 的逐项对照） |
+| `PortalConfig` | interface | 全部配置字段（见 `02-configuration.md` 的逐项对照）；含 `envVars` 环境快照 |
 | `parseMounts` | `(raw: string) => MountConfig[]` | 解析 `PORTAL_DISK_MOUNTS`。**必须**是 `展示路径=容器内路径[|标签[|statfs路径]]`；缺少 `=` 抛错 |
 | `defaultMountLabel` | `(displayPath: string) => string`（内部） | 取路径最后一段，并去掉 Windows 盘符冒号（`C:` → `C`） |
-| `loadConfig` | `(overrides?: Partial<PortalConfig>) => PortalConfig` | 读取并校验全部环境变量。非法值直接抛错。`overrides` 供测试替换 |
+| `loadConfig` | `(overrides?: Partial<PortalConfig>) => PortalConfig` | 读取并校验全部环境变量。非法值直接抛错。`overrides` 供测试替换（可用 `envVars` 追加环境变量而不改 `process.env`） |
+| `readEnvVar` | `(name: string) => string \| null` | 读取单个环境变量原值：去空白，空串按"未设置"处理 |
 | `ensureDataDir` | `(config: PortalConfig) => void` | `mkdir -p dataDir` |
 | `SERVER_ROOT` | `string` | server 包根目录（由 `import.meta.url` 推导，源码/构建后均正确） |
 | `REPO_ROOT` | `string` | 仓库根目录 = `SERVER_ROOT/..` |
