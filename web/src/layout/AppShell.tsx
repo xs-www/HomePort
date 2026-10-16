@@ -68,7 +68,7 @@ export function AppShell({ children, topbarExtra, title }: AppShellProps): React
               <Icon name="container" className="size-5" />
             </div>
             <div className="min-w-0">
-              <p className="truncate text-sm font-semibold">HomePage</p>
+              <p className="truncate text-sm font-semibold">HomePort</p>
               <p className="muted truncate text-[11px]">Tailnet 控制面板</p>
             </div>
           </div>
@@ -152,7 +152,7 @@ export function AppShell({ children, topbarExtra, title }: AppShellProps): React
         </main>
 
         <footer className="muted px-4 pb-6 text-center text-[11px] sm:px-6">
-          HomePage 门户 · 只读展示，不提供容器写操作 · 数据源不可用时会在对应卡片上标注原因
+          HomePort 门户 · 只读展示，不提供容器写操作 · 数据源不可用时会在对应卡片上标注原因
         </footer>
       </div>
     </div>

@@ -10,8 +10,8 @@ cp .env.example .env
 docker compose up -d --build
 
 # 3) 取首启令牌（二选一）
-docker compose logs homepage | grep 初始化令牌          # Linux/NAS
-docker compose logs homepage | Select-String 初始化令牌  # Windows
+docker compose logs homeport | grep 初始化令牌          # Linux/NAS
+docker compose logs homeport | Select-String 初始化令牌  # Windows
 
 # 4) 浏览器打开
 #    http://<宿主 tailnet IP>:8899   或   http://<MagicDNS 名>:8899
@@ -188,7 +188,7 @@ PORTAL_TAILSCALE_BIN=/usr/local/bin/tailscale
 忘记密码只能重置，不能找回。先确认账号现状：
 
 ```bash
-docker compose exec homepage node -e "
+docker compose exec homeport node -e "
 const D=require('/app/node_modules/better-sqlite3');
 const db=new D('/data/portal.sqlite',{readonly:true});
 console.log(db.prepare('SELECT id,username,display_name,role,disabled,last_login_at FROM users ORDER BY id').all());
@@ -203,7 +203,7 @@ console.log(db.prepare('SELECT id,username,display_name,role,disabled,last_login
    把下面命令里的 `新密码` 与 `admin` 换成你要的：
 
    ```bash
-   docker compose exec homepage node -e "
+   docker compose exec homeport node -e "
      const D=require('/app/node_modules/better-sqlite3');
      const b=require('/app/node_modules/bcryptjs');
      const db=new D('/data/portal.sqlite');
@@ -226,7 +226,7 @@ console.log(db.prepare('SELECT id,username,display_name,role,disabled,last_login
 
 首次启动时用于创建管理员的那个令牌，和登录密码是两回事：
 
-- `docker compose logs homepage | grep 初始化令牌`
+- `docker compose logs homeport | grep 初始化令牌`
 - 容器内文件 `/data/setup-token.txt`
 - 或部署时由 `PORTAL_SETUP_TOKEN` 环境变量指定
 
@@ -239,7 +239,7 @@ console.log(db.prepare('SELECT id,username,display_name,role,disabled,last_login
 
 ```bash
 docker compose down
-docker volume rm homepage-data
+docker volume rm homeport-data
 docker compose up -d
 # 然后从日志重新取首启令牌
 ```
@@ -312,8 +312,8 @@ docker inspect <容器> --format '{{json .HostConfig.PortBindings}}'
 门户自身日志是单行 JSON（生产）：
 
 ```bash
-docker compose logs -f --tail=100 homepage
-docker compose logs homepage | jq -r 'select(.level=="warn" or .level=="error") | "\(.time) \(.msg) \(.detail // "")"'
+docker compose logs -f --tail=100 homeport
+docker compose logs homeport | jq -r 'select(.level=="warn" or .level=="error") | "\(.time) \(.msg) \(.detail // "")"'
 ```
 
 ## 7. 升级

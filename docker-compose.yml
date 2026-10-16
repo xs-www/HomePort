@@ -1,5 +1,5 @@
 # ==============================================================================
-# HomePage 门户 — 一键启动
+# HomePort（母港）门户 — 一键启动
 #
 #   docker compose up -d --build
 #
@@ -7,17 +7,25 @@
 # 平台差异全部通过 `.env` 变量表达（见 .env.example 的「部署矩阵」）。
 #
 # 首次启动后从日志取初始化令牌：
-#   docker compose logs homepage | Select-String "初始化令牌"     # Windows
-#   docker compose logs homepage | grep 初始化令牌                 # Linux/NAS
+#   docker compose logs homeport | Select-String "初始化令牌"     # Windows
+#   docker compose logs homeport | grep 初始化令牌                 # Linux/NAS
+#
+# 从旧名 HomePage 升级过来（服务名/homepage → homeport，数据卷同名变化）：
+#   1) 先迁移数据卷，保住已初始化的 admin 账号（旧卷不会被删除，可回退）：
+#        docker volume create homeport-data
+#        docker run --rm -v homepage-data:/from:ro -v homeport-data:/to alpine sh -c "cp -a /from/. /to/"
+#      不想迁移也行：新卷是空的，启动后重新走一次首启初始化即可。
+#   2) 再启动，并清掉旧容器（旧容器仍占着 8899 端口，不清会启动失败）：
+#        docker compose up -d --build --remove-orphans
 # ==============================================================================
 
 services:
-  homepage:
+  homeport:
     build:
       context: .
       dockerfile: Dockerfile
-    image: homepage-portal:local
-    container_name: homepage-portal
+    image: homeport:local
+    container_name: homeport-portal
     restart: unless-stopped
 
     ports:
@@ -76,8 +84,9 @@ services:
       TZ: "${TZ:-Asia/Shanghai}"
 
     volumes:
-      # 门户数据（SQLite + 首启令牌）—— 必须持久化，否则每次重建都要重新初始化
-      - homepage-data:/data
+      # 门户数据（SQLite + 首启令牌）—— 必须持久化，否则每次重建都要重新初始化。
+      # 卷名随项目改名为 homeport-data；从 HomePage 升级需按文件头注释迁移数据。
+      - homeport-data:/data
       # Docker 引擎（只读）。Windows 上若下面那行报错，改用：
       #   - //var/run/docker.sock:/var/run/docker.sock
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
@@ -132,5 +141,5 @@ services:
         max-file: "3"
 
 volumes:
-  homepage-data:
-    name: homepage-data
+  homeport-data:
+    name: homeport-data

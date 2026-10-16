@@ -318,7 +318,7 @@ export function registerStatic(app: FastifyInstance, config: PortalConfig, logge
         .type('text/html; charset=utf-8')
         .send(
           [
-            '<!doctype html><meta charset="utf-8"><title>HomePage Portal</title>',
+            '<!doctype html><meta charset="utf-8"><title>HomePort Portal</title>',
             '<body style="font-family:system-ui;padding:2rem;line-height:1.8">',
             '<h1>前端尚未构建</h1>',
             `<p>未找到 <code>${escapeHtml(indexFile)}</code>。</p>`,

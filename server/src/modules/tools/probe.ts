@@ -109,7 +109,7 @@ export function httpStatus(
           path,
           method: 'GET',
           timeout: timeoutMs,
-          headers: { 'user-agent': 'homepage-portal-probe/1.0', accept: '*/*' },
+          headers: { 'user-agent': 'homeport-probe/1.0', accept: '*/*' },
           // 自签证书场景（NAS 常见）不阻断探测
           ...(scheme === 'https' ? { rejectUnauthorized: false } : {}),
         },

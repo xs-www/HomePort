@@ -38,7 +38,7 @@ export function LoginPage(): ReactNode {
             <Icon name="container" className="size-6.5" />
           </div>
           <div>
-            <h1 className="text-lg font-semibold">HomePage 门户</h1>
+            <h1 className="text-lg font-semibold">HomePort 门户</h1>
             <p className="muted mt-1 text-xs">本机容器入口 · tailnet 设备状态 · 硬件占用</p>
           </div>
         </div>

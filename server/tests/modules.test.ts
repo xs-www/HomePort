@@ -59,6 +59,7 @@ describe('config · 环境变量解析', () => {
     expect(testConfig.session.cookieName).toBe('hp_session');
     expect(loadConfig().bootstrap.tokenFile.endsWith('setup-token.txt')).toBe(true);
     // 默认 webDistDir 应指向仓库根的 web/dist（而不是 server 包内）
+    // 注意：产品名为 HomePort，但仓库目录名仍是 HomePage，故此处匹配 HomePage
     expect(loadConfig().webDistDir).toMatch(/HomePage[\\/]web[\\/]dist$/);
   });
 });

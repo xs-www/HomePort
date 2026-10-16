@@ -1,8 +1,8 @@
 {
-  "name": "homepage-portal",
+  "name": "homeport",
   "version": "0.1.0",
   "private": true,
-  "description": "Tailnet 动态门户控制面板：容器入口、设备状态、系统指标、工具聚合与登录权限管理",
+  "description": "HomePort（母港）· Tailnet 动态门户控制面板：容器入口、设备状态、系统指标、工具聚合与登录权限管理",
   "license": "MIT",
   "type": "module",
   "engines": {

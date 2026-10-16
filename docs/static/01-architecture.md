@@ -33,7 +33,7 @@
 │                                                                                │
 │   宿主服务：Ollama(11434) / DSH(3080) / ComfyUI(8188) ...                       │
 │                                                                                │
-│   ┌─────────────── homepage-portal 容器（本门户，唯一新增容器） ───────────────┐  │
+│   ┌─────────────── homeport-portal 容器（本门户，唯一新增容器） ───────────────┐  │
 │   │  Node.js 22 + Fastify  :  API + 静态前端                                │  │
 │   │  ├─ /var/run/docker.sock  (ro)     → 容器清单/端口/网络                  │  │
 │   │  ├─ 宿主 /proc 挂载      (ro)      → CPU/内存 真实占用（Linux 宿主）      │  │
@@ -61,9 +61,9 @@
 ## 3. 代码组织
 
 ```
-HomePage/
+HomePage/                     # 仓库目录名（产品名为 HomePort，目录名保留历史值）
 ├── docs/static/              # 静态函数文档（本目录）
-├── server/                   # 后端 workspace @homepage/server
+├── server/                   # 后端 workspace @homeport/server
 │   ├── src/
 │   │   ├── index.ts               # 进程入口：装配 app 并监听
 │   │   ├── app.ts                 # Fastify 实例装配（插件/路由/错误处理）
@@ -82,7 +82,7 @@ HomePage/
 │   │   ├── routes/                # 路由注册（薄层，仅做校验 + 调用 module）
 │   │   └── util/                  # net/format/cache/proc 等纯函数
 │   └── tests/                     # vitest 单测
-├── web/                      # 前端 workspace @homepage/web（React + Vite + Tailwind）
+├── web/                      # 前端 workspace @homeport/web（React + Vite + Tailwind）
 │   └── src/
 │       ├── main.tsx / App.tsx     # 入口与路由
 │       ├── api/                   # 类型化 API 客户端

@@ -736,3 +736,247 @@ curl /api/containers | jq .serve
    如需区分要另行调用 `tailscale funnel status`。
 3. serve 的 `Text` handler（静态文案）不生成入口，会被跳过。
 4. 未实现 `tailscale serve` 的**写操作**（配置/取消路径）—— 与"只读展示"的产品边界一致。
+
+---
+
+## [2026-10-16] 项目改名为 HomePort（母港）
+
+### 背景与决策
+
+用户要求给项目起名。原命名 `HomePage` 过于通用（`package.json` 的 `homepage-portal`
+与全网大量同名仓库无法区分），且没有表达产品实际在做的事。
+
+定名 **HomePort（母港）**，理由：
+
+1. **名副其实**：`port` 双关"端口 / 港口"。F1 的核心逻辑正是**端口可达性判定**
+   （宿主端口绑定地址分类、`tailscale serve` 路径级暴露、工具端口探测），
+   名字直接指涉产品最核心的能力，而不是硬凹的比喻。
+2. **迁移成本最低**：与 `HomePage` 只差一个字母（`Page` → `Port`），老用户不会认不出。
+3. **意象自洽**：容器 = 船只，宿主 = 母港，tailnet = 私有海域，符合"只读守望、不入港操舵"的产品边界。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 修改 | `package.json` | 包名 `homepage-portal` → `homeport`；描述补上中文名"母港" |
+| 修改 | `server/package.json` | workspace 名 `@homepage/server` → `@homeport/server` |
+| 修改 | `web/package.json` | workspace 名 `@homepage/web` → `@homeport/web` |
+| 修改 | `package-lock.json` | 同步 6 处包名（root ×2、两个 link 条目、两个 packages 条目） |
+| 修改 | `docker-compose.yml` | 服务/镜像/容器/数据卷四项改名 + 升级迁移说明 |
+| 修改 | `web/index.html` | `<title>` |
+| 修改 | `web/src/layout/AppShell.tsx` | 侧边栏品牌区、页脚 |
+| 修改 | `web/src/pages/LoginPage.tsx` | 登录页标题 |
+| 修改 | `server/src/app.ts` | 前端未构建兜底页 `<title>` |
+| 修改 | `server/src/modules/tools/probe.ts` | 探测 User-Agent |
+| 修改 | `server/tests/modules.test.ts` | 补注释说明"产品名 ≠ 目录名" |
+| 修改 | `.env` / `.env.example` | 文件头注释（`.env` 被 gitignore，不入库） |
+| 修改 | `README.md` | 标题、取令牌命令、**新增「从旧名 HomePage 升级」节** |
+| 修改 | `docs/static/README.md` | 文档定位句 |
+| 修改 | `docs/static/01-architecture.md` | 架构图容器名、目录树 workspace 名 |
+| 修改 | `docs/static/07-data-model.md` | 数据卷名 + 备份/恢复命令 |
+| 修改 | `docs/static/08-operations.md` | 8 处实时运维命令 |
+| 修改 | `todo.md` | 新增「品牌与命名」小节、环境备忘同步 |
+| 修改 | `node_modules/@homepage/` → `@homeport/` | 构建产物（未纳入 git），见"验证方式" |
+
+### 逐项明细
+
+#### 修改：`package.json`
+
+- `name` — `homepage-portal` → `homeport`。npm 包名不允许大写，故取全小写 `homeport`。
+- `description` — 前置 `HomePort（母港）·`，让 `npm view`/仓库首页一眼看到产品名。
+
+#### 修改：`server/package.json` / `web/package.json` / `package-lock.json`
+
+- workspace 名 `@homepage/{server,web}` → `@homeport/{server,web}`。
+- **依据**：全仓 grep `@homepage/` 在 `*.ts` 中**零命中** —— 两个 workspace 之间没有互相
+  import（前端通过 HTTP 访问后端，不共享包），因此改 scope 不影响任何解析路径，属零风险改动。
+- `package-lock.json` 手工同步 6 处（该文件由 npm 生成，未跑 `npm install` 以免触发
+  `better-sqlite3` 原生模块重建）。注意 `"  name": "homepage-portal",` 是
+  `"      name": ...` 的**子串**，首轮编辑因匹配到 2 处而失败，改为带上一行 `{` 定位才成功。
+
+#### 修改：`docker-compose.yml`
+
+- `services.homepage` → `services.homeport`
+- `image: homepage-portal:local` → `homeport:local`
+- `container_name: homepage-portal` → `homeport-portal`
+- 数据卷 `homepage-data` → `homeport-data`（引用处 + `volumes:` 定义处的 `name:` 同时改）
+- 文件头新增**升级迁移区块**：Compose 以服务名标识容器，改名后旧容器不会被接管，
+  **且旧容器仍占用 8899 端口会让新容器启动失败**，故明确要求
+  `docker compose up -d --build --remove-orphans`。
+- 数据卷迁移采用**非破坏性**方案：`docker volume create` + 一次性 alpine 容器 `cp -a`，
+  旧卷不删除，可随时回退；也明确写了"不迁移则重新初始化"的替代路径。
+
+#### 修改：`server/src/app.ts`
+
+- 前端产物缺失时的兜底 HTML `<title>HomePage Portal</title>` → `HomePort Portal`。
+  该页在前端未构建/未挂载时展示，属用户可见文案。
+
+#### 修改：`server/src/modules/tools/probe.ts`
+
+- 工具可用性探测的 `user-agent` — `homepage-portal-probe/1.0` → `homeport-probe/1.0`。
+  行为无变化，仅标识字符串，**不影响探测判定逻辑**。
+
+#### 修改：`server/tests/modules.test.ts`
+
+- `默认配置含有合理默认值` 用例**断言本身未改**（仍匹配 `/HomePage[\\/]web[\\/]dist$/`），
+  仅补一行注释说明原因：**产品名是 HomePort，但仓库目录名仍是 `HomePage/`**，
+  默认 `webDistDir` 由目录位置推导，故此处继续匹配 `HomePage`。
+  不改断言是因为改的是产品名而非磁盘布局 —— 若强行改断言则测试会真的失败。
+
+#### 修改：界面文案（`web/index.html` · `AppShell.tsx` · `LoginPage.tsx`）
+
+- 页面标题 `HomePage · Tailnet 门户` → `HomePort · Tailnet 门户`
+- 侧边栏品牌区 `HomePage` → `HomePort`（副标题"Tailnet 控制面板"不变）
+- 页脚 `HomePage 门户 · 只读展示…` → `HomePort 门户 · 只读展示…`
+- 登录页 `<h1>` `HomePage 门户` → `HomePort 门户`
+
+#### 修改：文档（`README.md` · `docs/static/*` · `todo.md`）
+
+**改写原则 —— 区分"实时操作文档"与"历史记录"**：
+
+- **实时命令全部改**（不改则命令照抄会直接失败）：`README`、`01-architecture`、
+  `07-data-model`（备份/恢复）、`08-operations`（取令牌、改密码、删卷、看日志等 8 处）。
+- **`09-changelog.md` 既有历史条目一律不动**：那些条目记录的是当时的真实操作与真实输出
+  （如 `Container homepage-portal Started`），改动等于篡改历史。本条新记录即分界线。
+- **`todo.md` 的 admin 密码值已打码为 `********`**（原本是明文）：它本是已部署账号的事实记录，
+  但本任务还要把仓库推送到公开 GitHub，而该明文已进入提交历史 `7f1d92a`，
+  故工作区与历史一并清除，详见下方「密钥处理与公开推送」。
+- `01-architecture.md` 目录树保留 `HomePage/` 并加注"仓库目录名（产品名为 HomePort，目录名保留历史值）"。
+- `README.md` 新增「从旧名 HomePage 升级（改名后必看）」节，含迁移命令与
+  "`.env` 不用改"的说明。
+
+### 配置/接口/数据模型影响
+
+- **环境变量：无变化。** 前缀仍是 `PORTAL_*`（`PORTAL_HOST_PORT`、`PORTAL_TAILSCALE_*` …），
+  既有 `.env` 无需任何改动 —— 这次只改"名字"，不动配置键。
+- **HTTP 接口：无变化**（路径、字段、错误码全部未动）。
+- **数据模型：无变化**（表结构、迁移历史未动）。SQLite 文件名仍是 `portal.sqlite`。
+- **会话 Cookie：无变化**，仍是 `hp_session`（`hp` 对新名 `HomePort` 同样成立）。
+- **容器运行时标识变化（需部署侧配合）**：
+
+  | 项 | 改名前 | 改名后 |
+  | --- | --- | --- |
+  | compose 服务名 | `homepage` | `homeport` |
+  | 镜像名 | `homepage-portal:local` | `homeport:local` |
+  | 容器名 | `homepage-portal` | `homeport-portal` |
+  | 数据卷名 | `homepage-data` | `homeport-data` |
+
+- **有意保留不改**：环境变量前缀、Cookie 名、DB 文件名、仓库目录 `HomePage/`。
+
+### 验证方式
+
+```bash
+npm run typecheck
+# → @homeport/server@0.1.0  tsc --noEmit  ✅ 通过
+#   @homeport/web@0.1.0     tsc --noEmit  ✅ 通过
+#   两个 workspace 均已按新包名解析，说明 package-lock 改名无误
+
+npm test
+# → Test Files  5 passed (5)
+#   Tests       179 passed (179)   Duration 20.42s
+#   （改名前后用例数一致，无新增/失败）
+
+# 旧 workspace 软链悬空确认与修复（node_modules 为构建产物，未纳入 git）：
+#   node_modules/@homepage/{server,web} 是改名前的 junction，改名后成为悬空软链
+node -e "console.log(require.resolve('@homeport/server/package.json'))"
+# → D:\桌面\sisi_apps\HomePage\server\package.json
+node -e "console.log(require.resolve('@homeport/web/package.json'))"
+# → D:\桌面\sisi_apps\HomePage\web\package.json
+```
+
+> `npm test` 在受限沙箱下会因 esbuild 需要 `spawn` 子进程并通过管道读输出而报
+> `EPERM`（这是沙箱边界，不是代码问题），需放宽文件沙箱后才可执行。
+
+**容器部署实测**（沙箱放宽到 danger-full-access 后执行，Docker 29.8.0）：
+
+```bash
+# 0) 改名前状态：旧容器在跑、只有旧卷
+docker ps -a          # → homepage-portal | homepage-portal:local | Up 4 hours (healthy) | 0.0.0.0:8899->8899/tcp
+docker volume ls      # → homepage-data（无 homeport-data）
+
+# 1) 先在旧容器继续服务时构建，避免把停机时间耗在编译上
+docker compose build
+# → naming to docker.io/library/homeport:local done   ✅
+
+# 2) 停旧容器：干净的 SIGTERM 让 SQLite 把 WAL 合并回主库（关键，见下方说明）
+docker stop homepage-portal
+docker run --rm -u 0 --entrypoint sh -v homepage-data:/from:ro alpine:latest -c "ls -la /from"
+# → 停机后只剩 portal.sqlite (61440) + setup-token.txt，
+#    运行中的 358KB portal.sqlite-wal / -shm 已消失（已 checkpoint）
+
+# 3) 迁移数据卷（非破坏性，旧卷保留）
+docker volume create homeport-data
+docker run --rm -u 0 -v homepage-data:/from:ro -v homeport-data:/to alpine:latest sh -c "cp -a /from/. /to/"
+
+# 4) 起新容器并清理孤儿旧容器
+docker compose up -d --remove-orphans --wait
+# → Container homepage-portal Removed
+#   Container homeport-portal Started / Healthy
+```
+
+**上线后验证**：
+
+```bash
+docker ps --format '{{.Names}} | {{.Image}} | {{.Status}} | {{.Ports}}'
+# → homeport-portal | homeport:local | Up (healthy) | 0.0.0.0:8899->8899/tcp
+
+# 数据迁移是否真的保住账号（本次最关键的一项）
+docker compose exec -T homeport node -e "…SELECT … FROM users / sessions / user_preferences…"
+# → users: admin(admin), Sisi(admin) 两个账号都在；sessions: 11；prefs: 2
+#   ✅ 未触发重新初始化，既有登录态与偏好全部保留
+
+curl.exe -s http://127.0.0.1:8899/api/health
+# → status:ok, setupRequired:false,
+#   sources: docker/tailscale/system/disk 全 available，gpu 不可用（Windows 容器化预期行为）
+
+(Invoke-WebRequest http://127.0.0.1:8899/).Content
+# → <title>HomePort · Tailnet 门户</title>   ✅ 改名已在运行时生效
+```
+
+> **为什么必须"先停容器再拷卷"**：拷贝时容器仍在运行，源卷里有 358KB 未 checkpoint 的
+> `portal.sqlite-wal`。此时直接 `cp` 会把主库与 WAL 在**不同时刻**的状态混在一起，
+> 属于典型的 SQLite 撕裂备份。先 `docker stop` 让 WAL 合并，拷贝才是一致的单文件快照。
+> 为压缩停机时间，构建（约 30s+）安排在停机之前完成，实际停机仅数秒。
+
+### 密钥处理与公开推送
+
+### 问题
+
+推送到 `https://github.com/xs-www/HomePort.git`（公开仓库）前的审计发现：
+
+- `.env` **从未被提交**（`git log --all -- .env` 为空），`.gitignore` 已覆盖 `.env`、`data/`、`*.sqlite` ✅
+- 文档中所有 `tskey-*` 均为占位符（`xxxxxxxx` / `********`），测试密码为一次性夹具 ✅
+- ❌ **`todo.md` 里含已部署门户的真实 admin 明文密码**，且已进入提交历史 `7f1d92a`
+  （`git log -S` 命中），**只改工作区不足以阻止泄漏 —— 公开的是历史**
+
+### 处理（经用户确认选择"重写历史清除密码"）
+
+1. 工作区打码：`todo.md` 与本文档中的明文 → `********`。
+2. 历史清除：环境无 `git-filter-repo`，改用内置 `git filter-branch` 对全部提交重写
+   （仓库当时**无 remote、仅 5 个提交、无人拉取过**，改写 SHA 无外部影响，代价为零）。
+3. 验证：`git log --all -S '<原密码>'` 返回空。
+4. 推送后再复核远端不含该串。
+
+### 影响与后续
+
+- 历史的提交 SHA 已全部改变（`filter-branch` 的必然结果）；因从未推送，无协作者受影响。
+- **建议仍轮换该密码**：它此前存在于本机 git 对象库中（`filter-branch` 的备份 ref
+  `refs/original/` 需一并清理，见下方命令），且曾以明文写在磁盘上。
+
+```bash
+git for-each-ref --format='%(refname)' refs/original/ | xargs -n1 git update-ref -d
+git reflog expire --expire=now --all && git gc --prune=now --aggressive
+```
+
+### 已知限制 / 后续
+
+1. **数据卷归属告警（无害但会复现）**：`homeport-data` 由手工 `docker volume create` 建立，
+   缺少 Compose 的归属标签，故每次 `docker compose up` 会打印
+   `volume "homeport-data" already exists but was not created by Docker Compose`。
+   容器挂载与数据一切正常。若要消除告警需重建该卷（重新拷数据），收益不抵风险，故保留；
+   **不要**改用 `external: true`，那会让新机器上的首次 `docker compose up` 直接失败。
+2. **升级必须两步走，不能只 `up`**：旧容器不移除会继续占用 8899 端口，新容器启动即失败。
+3. 仓库目录名仍是 `HomePage/`，未随改名调整 —— 重命名目录会影响本机 `.env`、
+   文档中的绝对路径，以及 `modules.test.ts` 中基于目录名的断言，风险大于收益，故有意保留。
+4. 若日后要开源对外发布，`HomePort` 与 `Tailscale` 无品牌绑定，但仍建议先做一次同名检索。
+

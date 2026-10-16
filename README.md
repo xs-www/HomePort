@@ -1,4 +1,4 @@
-# HomePage · Tailnet 动态门户
+# HomePort · 母港 — Tailnet 动态门户
 
 跑在 Docker 里的**本机控制面板**。把宿主机上所有可经 tailnet 访问的容器、tailnet 设备在线状态、
 宿主 CPU/内存/磁盘/GPU 占用，以及 Ollama / DSH / ComfyUI 等本机工具，聚合成一个带登录权限管理的入口页。
@@ -27,8 +27,8 @@ cp .env.example .env          # Windows: Copy-Item .env.example .env
 docker compose up -d --build
 
 # 3) 取首启令牌
-docker compose logs homepage | grep 初始化令牌            # Linux/NAS
-docker compose logs homepage | Select-String 初始化令牌    # Windows
+docker compose logs homeport | grep 初始化令牌            # Linux/NAS
+docker compose logs homeport | Select-String 初始化令牌    # Windows
 
 # 4) 打开（把 IP 换成你宿主的 tailnet IP 或 MagicDNS 名）
 #    http://100.x.y.z:8899
@@ -36,6 +36,29 @@ docker compose logs homepage | Select-String 初始化令牌    # Windows
 
 首次打开会引导你创建管理员账号（需要上面那个令牌）。令牌也可从
 容器内 `/data/setup-token.txt` 读取。
+
+### 从旧名 HomePage 升级（改名后必看）
+
+产品已改名为 **HomePort**，随之变化的是 compose 服务名（`homepage` → `homeport`）、
+容器名（`homepage-portal` → `homeport-portal`）与数据卷名（`homepage-data` → `homeport-data`）。
+
+改名会让 Compose 把它当成"新服务"，所以旧容器不会被自动接管，旧卷也不会被自动挂上。
+两步完成迁移 —— **旧卷保持不动，随时可回退**：
+
+```bash
+# 1) 迁移数据卷，保住已初始化的 admin 账号、偏好与审计日志
+docker volume create homeport-data
+docker run --rm -v homepage-data:/from:ro -v homeport-data:/to alpine sh -c "cp -a /from/. /to/"
+
+# 2) 启动新容器，并清掉仍占着 8899 端口的旧容器
+docker compose up -d --build --remove-orphans
+```
+
+不想迁移也可以：新卷是空的，启动后重新走一次首启初始化，重建管理员账号。
+
+> **`.env` 不用改**：环境变量前缀仍是 `PORTAL_*`，会话 Cookie 名仍是 `hp_session`，
+> SQLite 文件名仍是 `portal.sqlite` —— 这次只改了"名字"，没有动任何配置键。
+> 目录名也仍然是 `HomePage/`。
 
 ### 本机开发
 

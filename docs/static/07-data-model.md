@@ -148,17 +148,17 @@
 
 ## 4. 备份与恢复
 
-数据库位于 `homepage-data` 卷的 `/data/portal.sqlite`。
+数据库位于 `homeport-data` 卷的 `/data/portal.sqlite`。
 
 **备份**（推荐用 SQLite 在线备份，避免 WAL 中间态）：
 
 ```bash
-docker compose exec homepage node -e "
+docker compose exec homeport node -e "
   const D=require('/app/node_modules/better-sqlite3');
   const db=new D('/data/portal.sqlite',{readonly:true});
   db.backup('/data/backup-' + Date.now() + '.sqlite').then(()=>console.log('ok'));
 "
-docker compose cp homepage:/data/ ./backup/
+docker compose cp homeport:/data/ ./backup/
 ```
 
 **恢复**：停容器 → 用备份文件替换 `portal.sqlite`（并删除同目录的 `-wal` / `-shm`）→ 启动。

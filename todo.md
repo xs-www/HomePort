@@ -96,6 +96,19 @@
 - [x] 129 个测试用例（3 个文件）全部通过
 - [x] 真实环境实测（Docker + Tailscale + 硬件，逐项交叉验证）
 
+### 品牌与命名
+- [x] 产品定名 **HomePort（母港）**：`port` 双关"端口/港口"，与 F1 的端口可达性判定名副其实
+- [x] 包名统一：`homeport` / `@homeport/server` / `@homeport/web`（含 `package-lock.json`）
+- [x] 容器侧改名：service `homeport`、image `homeport:local`、container `homeport-portal`、volume `homeport-data`
+- [x] 界面与文档改称（页面标题 / 侧边栏 / 登录页 / 兜底页 / README / 静态文档）
+- [x] **决定不改**：环境变量前缀 `PORTAL_*`、会话 Cookie `hp_session`、DB 文件 `portal.sqlite`、
+      仓库目录 `HomePage/` —— 只改"名字"，不动配置键，避免 `.env` 与既有部署失效
+- [x] **部署侧迁移已执行并实测通过**：先建新镜像（旧容器继续服务）→ `docker stop` 合并 WAL
+      → `docker volume create homeport-data` + `cp -a` 迁数据 → `up -d --remove-orphans`
+      清掉旧容器。实测账号/会话/偏好全部保留，`homeport-portal` `Up (healthy)`
+- [x] 推送公开仓库前清除历史中的明文 admin 密码（工作区打码 + `filter-branch` 重写历史）
+- [ ] 数据卷 `homeport-data` 缺 Compose 归属标签，每次 `up` 会打印一条无害告警（有意保留，见 changelog）
+
 ## 待办
 
 ### 高优先级（影响可用性）
@@ -172,15 +185,20 @@
 | 项目 | 值 |
 | --- | --- |
 | Docker | 29.8.0，Docker Desktop，容器内 endpoint = `unix:///var/run/docker.sock` |
-| 现有容器 | 6 个（cs22-backend / cs22-web / cs22-ml-service / sisi-calendar / worldforge / homepage-portal 自身） |
+| 现有容器 | 6 个（cs22-backend / cs22-web / cs22-ml-service / sisi-calendar / worldforge / homeport-portal 自身） |
 | Tailscale | 1.102.4，本机 `Sisi-Laptop` / `100.72.255.29`，11 台设备 |
 | GPU | RTX 4060 Laptop 8G。**容器化下不可读**（容器内无 `/usr/lib/wsl/lib`）；原生运行可读 |
 | Node | v22.23.2 |
 | 平台 | Windows 11，宿主 20 线程 / 31.63 GB；容器内只可见 WSL2 的 4 线程 / 3.9 GB |
 
-部署状态（2026-10-16）：
+部署状态（2026-10-16，改名迁移后已实测）：
 
-- 容器 `homepage-portal` 已构建并运行，`Up (healthy)`，映射 `0.0.0.0:8899->8899`
-- 数据卷 `homepage-data` 持久化，重建容器后 admin 账号与偏好保留
-- 登录账号：`admin` / `********`（**建议登录后立即修改**）
+- 新容器 `homeport-portal`（镜像 `homeport:local`）`Up (healthy)`，映射 `0.0.0.0:8899->8899`
+- 旧容器 `homepage-portal` 已由 `--remove-orphans` 清除
+- 数据卷已迁移到 `homeport-data`，实测两个 admin 账号 / 11 个会话 / 2 条偏好全部保留，
+  `setupRequired: false`（未触发重新初始化）
+- 旧卷 `homepage-data` **保留未删**，如需回退可直接挂回去
+- **注意**：日后若从更早的备份重建，旧容器不移除会继续占用 8899 端口，`up` 需带 `--remove-orphans`
+- 登录账号：`admin` / `********`（**建议登录后立即修改**；密码值已在推公开仓库前打码，
+  真实值请自行保管 —— 需要查看可用 `docs/static/08-operations.md` 的重置密码流程）
 - 访问地址：`http://100.72.255.29:8899`（tailnet）或 `http://localhost:8899`
