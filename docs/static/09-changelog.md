@@ -1016,3 +1016,117 @@ curl.exe -s http://127.0.0.1:8899/api/health
    文档中的绝对路径，以及 `modules.test.ts` 中基于目录名的断言，风险大于收益，故有意保留。
 4. 若日后要开源对外发布，`HomePort` 与 `Tailscale` 无品牌绑定，但仍建议先做一次同名检索。
 
+---
+
+## [2026-10-16] 远程构建：GitHub Actions 产出 arm64 镜像并推送 GHCR
+
+### 背景与决策
+
+需求："在远程编译一个 docker 镜像"。先做环境勘察，避免猜错方向：
+
+| 勘察项 | 结果 |
+| --- | --- |
+| 远程 Docker context | 无（只有 `default` 与 `desktop-linux`，均本机） |
+| 远程 buildx builder | 无（`default` / `desktop-linux` 两个 docker driver） |
+| 已登录 registry | 无（`~/.docker/config.json` 无 `auths`） |
+| 仓库 CI | 无 `.github/` |
+| 目标机 NAS | `family-nas` / `100.103.230.37` / Linux 6.18.15 / Tailscale 1.104.1；tailnet 直连（ping 294ms），22 与 443 开放，2375/2376 未开放 |
+
+经用户确认的两项决策：
+
+1. **构建载体**：GitHub Actions 构建 → 推 GHCR（NAS 只是部署目标，不适合当构建机；
+   且其 Docker API 未暴露，本机也无 SSH 配置）。
+2. **目标架构**：只构建 `linux/arm64`。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 新增 | `.github/workflows/docker-publish.yml` | 在 GitHub runner 上构建 arm64 镜像并推 GHCR |
+| 新增 | `.dockerignore` | 缩小构建上下文，并阻止 `.env` 上传到构建器 |
+| 修改 | `docs/static/08-operations.md` | 新增 §1.1「用预构建镜像」；§7 升级拆成 A/B 两种方式 |
+| 修改 | `todo.md` | arm64 实测项转为已完成；CI 项拆分更新 |
+
+### 逐项明细
+
+#### 新增：`.github/workflows/docker-publish.yml`
+
+- 触发：`push` 到 `master`、`v*` tag，以及 `workflow_dispatch`（便于手动出图/换架构）。
+- `concurrency` 按 ref 分组并 `cancel-in-progress`，避免排队堆积。
+- `permissions`：`contents: read` + `packages: write`（推 GHCR 必需）。
+- 步骤：checkout → setup-qemu → setup-buildx → login(GHCR) → metadata → build-push。
+- **镜像名写 `ghcr.io/${{ github.repository_owner }}/homeport`，不写 `${{ github.repository }}`** ——
+  后者会展开成 `xs-www/HomePort`，含大写字母，Docker 会直接报
+  `repository name must be lowercase` 而构建失败。这是本 workflow 最容易踩的坑。
+- **`provenance: false` + `sbom: false`（有意关闭）**：这两项会产出 attestation manifest，
+  较老的 Docker（如 NAS 上的 20.10、未启用 containerd 镜像存储）拉取时报
+  `no match for platform in manifest`。本镜像的消费方正是这类设备，故关闭。
+- `cache-from/to: type=gha`：避免每次都在 QEMU 下重编 `better-sqlite3`。
+- 架构由 `env.PLATFORMS` 单点控制，多架构改成 `linux/amd64,linux/arm64` 即可。
+- 末尾输出 `$GITHUB_STEP_SUMMARY`，在 Actions 页面直接看到标签与拉取命令。
+
+#### 新增：`.dockerignore`
+
+排除 `node_modules/`、`dist/`、`.env`、`data/`、`docs/`、`.git/` 等。
+
+- **不是为了缩小镜像** —— Dockerfile 只显式 `COPY package.json / server/ / web/`，
+  本来就不会把 `.env` 装进镜像。
+- 真正的收益有两个：构建上下文从 144 MB（`node_modules`）降到 KB 级；
+  以及 `.env` 不再被**上传到构建守护进程**（本地构建上下文里它此前是包含的）。
+
+#### 修改：`docs/static/08-operations.md`
+
+- 新增 §1.1：`docker pull ghcr.io/xs-www/homeport:latest`、compose 改用 `image:`、
+  标签含义表、只构建 arm64 的说明、attestation 关闭的原因。
+- §7 升级拆成 A) 本机构建（`up -d --build`）与 B) 预构建镜像（`compose pull` + `up -d`）。
+
+### 配置/接口/数据模型影响
+
+- 环境变量、HTTP 接口、数据模型**均无变化**。
+- 新增外部产物依赖：`ghcr.io/xs-www/homeport`（公开可匿名拉取）。
+- 未改动 `docker-compose.yml` —— 本机部署仍走 `build:`；
+  改用镜像的写法记录在文档中，由部署方按需替换。
+
+### 验证方式
+
+```bash
+# 1) 本机 arm64 预检（QEMU），先于 CI 排除"架构下编译不过"的风险
+docker buildx build --platform linux/arm64 -t homeport:arm64-preflight --load .
+# → better-sqlite3 在 QEMU 下从源码编译成功（约 77s），web/server 构建正常，
+#   镜像导出成功。此前 todo.md 记录"arm64 尚未实测"，此项已转为实测通过
+
+# 2) 触发 CI 并观察
+git push origin master                      # run #1
+# → completed / success，耗时 5 分 48 秒，全部步骤（含 Log in / Build and push）通过
+
+# 3) 匿名拉取（验证包可见性，未使用任何凭据）
+docker pull ghcr.io/xs-www/homeport:latest
+# → 成功。说明 GHCR 包对匿名用户可读，无需在包设置里手动改可见性
+
+# 4) 架构校验（关键：必须是 arm64）
+docker image inspect ghcr.io/xs-www/homeport:latest --format '{{.Os}} {{.Architecture}} {{.Size}}'
+# → linux arm64 283999337
+
+# 5) 启动冒烟（光"构建成功"不等于"能跑"）
+docker run -d --name homeport-ci-smoke -p 18899:8899 ghcr.io/xs-www/homeport:latest
+docker ps --filter name=homeport-ci-smoke
+# → Up (healthy)   ← 镜像自带 HEALTHCHECK 通过
+curl -s http://127.0.0.1:18899/api/health
+# → status:ok
+#   docker/tailscale/disk/gpu 均 available:false 并给出具体原因
+#   （未挂载 socket/tailscale/磁盘所致，属设计内的降级说明，非故障）
+(Invoke-WebRequest http://127.0.0.1:18899/).Content
+# → <title>HomePort · Tailnet 门户</title>   ✅ CI 产物含改名后的前端
+```
+
+### 已知限制 / 后续
+
+1. **CI 只构建镜像，不跑测试**：`typecheck` + `test` 尚未纳入 CI（已记入 `todo.md`）。
+2. **只构建 arm64**：在 amd64 机器上需把 `PLATFORMS` 改成
+   `linux/amd64,linux/arm64`（或 `linux/amd64`），再手动触发一次 workflow。
+3. **NAS 侧部署尚未执行**：本次只验证到"镜像可拉取、可运行"，
+   `family-nas` 上的实际部署与 NAS 环境的指标取数边界未实测。
+4. `.dockerignore` 排除了 `docs/`，若日后 Dockerfile 需要把文档打进镜像，需同步调整。
+5. GHCR 包的标签列表接口需鉴权，故标签核对以本地 `docker pull` 结果为准。
+
+

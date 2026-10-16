@@ -17,6 +17,40 @@ docker compose logs homeport | Select-String 初始化令牌  # Windows
 #    http://<宿主 tailnet IP>:8899   或   http://<MagicDNS 名>:8899
 ```
 
+### 1.1 用预构建镜像（免本机编译）
+
+CI 在 GitHub runner 上构建 **linux/arm64** 镜像并推送到 GHCR。架构受限或不想在
+NAS 上跑编译时，直接拉镜像即可：
+
+```bash
+# 公开镜像，无需登录
+docker pull ghcr.io/xs-www/homeport:latest
+
+# 用具体版本（回滚比 latest 可靠）
+docker pull ghcr.io/xs-www/homeport:sha-85159b8
+```
+
+改用镜像时，`docker-compose.yml` 把 `build:` 段去掉/注释，改成：
+
+```yaml
+    image: ghcr.io/xs-www/homeport:latest
+```
+
+镜像标签：
+
+| 标签 | 含义 |
+| --- | --- |
+| `latest` | 默认分支（master）最近一次成功构建 |
+| `master` | 分支名 |
+| `sha-<短哈希>` | 每次提交，适合精确回滚 |
+| `v1.2.3` / `1.2` | 推了 `v*` tag 时（semver） |
+
+- **只构建 arm64**。需要 amd64 或多架构：改 `.github/workflows/docker-publish.yml`
+  的 `PLATFORMS`（多架构写 `linux/amd64,linux/arm64`），再手动触发一次 workflow。
+- 镜像**不含** provenance / SBOM attestation —— 这类 manifest 会让较老的 Docker
+  （如 NAS 上的 20.10）报 `no match for platform in manifest`，故有意关闭。
+- 拉取后 `docker compose up -d` 即可，数据库迁移照常在启动时自动执行。
+
 ## 2. 指标取数边界（重要，先看这个）
 
 门户展示的是**宿主**资源，但它跑在容器里，两者的可见范围不同。
@@ -318,9 +352,16 @@ docker compose logs homeport | jq -r 'select(.level=="warn" or .level=="error") 
 
 ## 7. 升级
 
+两种方式，按部署形态选：
+
 ```bash
+# A) 本机构建（开发机 / Windows）
 git pull
 docker compose up -d --build
+
+# B) 用 CI 预构建镜像（NAS 等不适合本机编译的机器）
+docker compose pull homeport      # 拉取 image: 指定的标签
+docker compose up -d
 ```
 
 - 数据库迁移在启动时自动执行（幂等，已应用的会跳过）。

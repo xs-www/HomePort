@@ -123,8 +123,9 @@
       tailscaled 走 named pipe，REST API 也不提供 serve 配置）。
       可选方案：让 TsController 暴露本地 HTTP 接口，门户作为 host-agent 读取。
       `ServeRoutesProvider` 是注入式接口，换实现即可，无需改容器模块
-- [ ] **arm64（NAS）镜像构建实测**：设计上应可成功（builder 阶段原生编译
-      better-sqlite3），但尚未实跑
+- [x] **arm64（NAS）镜像构建实测**：`docker buildx build --platform linux/arm64` 通过
+      （2026-10-16）。`better-sqlite3` 在本机 QEMU 下从源码编译成功（约 77s），
+      web/server 构建与镜像导出均正常。同时已加入 CI 在 GitHub runner 上产出 arm64 镜像
 - [ ] **Windows 宿主真实硬件指标**：容器化部署只能看到 WSL2 虚拟机资源。
       可选方案：
       1. 补充「原生运行」的部署文档与一键启动脚本（推荐，实测可行）
@@ -169,7 +170,7 @@
 - [ ] 支持 PostgreSQL（当前 SQLite 足够，仅在多实例部署时才有必要）
 - [ ] **补 `LICENSE` 文件**：`package.json` 已声明 `"license": "MIT"`，但没有 LICENSE 文件，
       默认等于"保留所有权利"，与声明不一致（公开仓库尤其明显）
-- [ ] 仓库尚未配置 CI（与「技术债」中的 CI 项合并考虑）
+- [x] CI：GitHub Actions 构建 arm64 镜像并推送 GHCR（`ghcr.io/xs-www/homeport`）
 
 ## 技术债
 
@@ -181,7 +182,8 @@
 - [ ] `TtlCache` 的 `evictIfNeeded` 每次都全量遍历，条目数大时是 O(n)。
       当前 maxEntries=200，暂不构成问题
 - [ ] 无 E2E 测试（Playwright）。关键路径：首启初始化 → 登录 → 各页面加载
-- [ ] 未配置 CI（建议：typecheck + test + build 三件事）
+- [ ] **CI 尚未覆盖测试**：`.github/workflows/docker-publish.yml` 只做镜像构建与推送，
+      还没跑 `typecheck` + `test`。建议补一个在 push/PR 上跑的校验 job
 
 ## 环境备忘
 

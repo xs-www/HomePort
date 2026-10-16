@@ -37,6 +37,14 @@ docker compose logs homeport | Select-String 初始化令牌    # Windows
 首次打开会引导你创建管理员账号（需要上面那个令牌）。令牌也可从
 容器内 `/data/setup-token.txt` 读取。
 
+> **不想在本机编译？** CI 已构建好 arm64 镜像，可直接拉取：
+> ```bash
+> docker pull ghcr.io/xs-www/homeport:latest
+> ```
+> 把 `docker-compose.yml` 里的 `build:` 段换成
+> `image: ghcr.io/xs-www/homeport:latest` 即可（NAS 等不便编译的机器推荐）。
+> 详见[运维手册 §1.1](docs/static/08-operations.md)。
+
 ### 从旧名 HomePage 升级（改名后必看）
 
 产品已改名为 **HomePort**，随之变化的是 compose 服务名（`homepage` → `homeport`）、

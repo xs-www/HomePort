@@ -22,6 +22,14 @@ on:
   push:
     branches: [master]
     tags: ['v*']
+    # 纯文档/元数据改动不会影响镜像内容，跳过构建以省 CI 时间。
+    # 注意：需要出图时用 workflow_dispatch 手动触发即可。
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.gitattributes'
   # 允许在 Actions 页面手动触发（换架构/临时出图时不必空提交）
   workflow_dispatch:
 
