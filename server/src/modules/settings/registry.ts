@@ -32,7 +32,15 @@ export type SettingEffect = 'live' | 'reload' | 'restart';
 export type SettingValueType = 'string' | 'number' | 'boolean' | 'enum' | 'string-list';
 
 /** 设置项所属分组（前端按此分区展示）。 */
-export type SettingGroup = 'tailscale' | 'docker' | 'system' | 'tools' | 'performance' | 'boot';
+export type SettingGroup =
+  | 'tailscale'
+  | 'docker'
+  | 'system'
+  | 'tools'
+  | 'performance'
+  | 'metrics'
+  | 'health'
+  | 'boot';
 
 export interface SettingDefinition {
   /** 稳定键名，等于环境变量名（便于对照） */
@@ -126,6 +134,17 @@ export const SETTING_GROUPS: ReadonlyArray<{ id: SettingGroup; label: string; de
     id: 'performance',
     label: '缓存与超时',
     description: '调大缓存可降低宿主机压力；调小则数据更新更快。',
+  },
+  {
+    id: 'metrics',
+    label: '历史指标采样',
+    description:
+      '后台把宿主/磁盘/关键容器的指标按分钟聚合落库，供「历史」页查看。全部为 live 生效：改完下一个采样周期即按新值跑。',
+  },
+  {
+    id: 'health',
+    label: '健康监测',
+    description: '逐服务三维状态（容器 / HEALTHCHECK / HTTP 探测）的探测节奏与并发上限。',
   },
   {
     id: 'boot',
@@ -437,6 +456,93 @@ export function buildSettingDefinitions(config: PortalConfig): SettingDefinition
         { value: 'error', label: 'error' },
       ],
       restartReason: '日志器在进程启动时创建，改为 debug 需重建容器（docker compose up -d --force-recreate）。',
+    },
+
+    // ------------------------------------------------------------ metrics
+    {
+      key: 'PORTAL_METRICS_SAMPLE_INTERVAL_SEC',
+      group: 'metrics',
+      label: '后台采样间隔',
+      description:
+        '后台采样的 tick 间隔（秒）。它同时决定"每分钟应有多少个样本"：缺测判定按此基准，改动后既有历史不受影响（旧桶里的 expected 保持写入时的值）。',
+      effect: 'live',
+      valueType: 'number',
+      envVar: 'PORTAL_METRICS_SAMPLE_INTERVAL_SEC',
+      defaultValue: 30,
+      min: 5,
+      max: 3600,
+      unit: '秒',
+    },
+    {
+      key: 'PORTAL_METRICS_RETENTION_MINUTE_HOURS',
+      group: 'metrics',
+      label: '分钟数据保留',
+      description:
+        'minute 桶（1h / 24h 视图用）保留小时数。稳态行数与库大小由它封顶——超过即删，因此分钟行数不随运行时长增长。',
+      effect: 'live',
+      valueType: 'number',
+      envVar: 'PORTAL_METRICS_RETENTION_MINUTE_HOURS',
+      defaultValue: 24,
+      min: 1,
+      max: 168,
+      unit: '小时',
+    },
+    {
+      key: 'PORTAL_METRICS_RETENTION_HOUR_DAYS',
+      group: 'metrics',
+      label: '小时数据保留',
+      description: 'hour 桶（7d / 30d 视图用）保留天数。',
+      effect: 'live',
+      valueType: 'number',
+      envVar: 'PORTAL_METRICS_RETENTION_HOUR_DAYS',
+      defaultValue: 30,
+      min: 1,
+      max: 3650,
+      unit: '天',
+    },
+    {
+      key: 'PORTAL_METRICS_CONTAINER_LIMIT',
+      group: 'metrics',
+      label: '采集容器数量上限',
+      description:
+        '只采"最关键的若干个容器"（按运行态与稳定身份排序）。设为 0 表示完全不采容器指标；宿主与磁盘指标不受影响。',
+      effect: 'live',
+      valueType: 'number',
+      envVar: 'PORTAL_METRICS_CONTAINER_LIMIT',
+      defaultValue: 10,
+      min: 0,
+      max: 100,
+      unit: '个',
+    },
+
+    // ------------------------------------------------------------- health
+    {
+      key: 'PORTAL_HEALTH_PROBE_INTERVAL_SEC',
+      group: 'health',
+      label: 'HTTP 探测间隔',
+      description:
+        '每个服务两次 HTTP 探测之间的最小间隔（秒）。设为 0 表示关闭自动探测：此时只按容器维度判定，HTTP 维固定为 unknown，仍可手动探测。',
+      effect: 'live',
+      valueType: 'number',
+      envVar: 'PORTAL_HEALTH_PROBE_INTERVAL_SEC',
+      defaultValue: 300,
+      min: 0,
+      max: 86400,
+      unit: '秒',
+    },
+    {
+      key: 'PORTAL_HEALTH_PROBE_CONCURRENCY',
+      group: 'health',
+      label: '探测并发上限',
+      description:
+        '同一轮里最多同时在飞的探测数。达到上限的服务顺延到下一轮（不排队、不无限等待），避免探测风暴打满宿主。',
+      effect: 'live',
+      valueType: 'number',
+      envVar: 'PORTAL_HEALTH_PROBE_CONCURRENCY',
+      defaultValue: 4,
+      min: 1,
+      max: 32,
+      unit: '个',
     },
 
     // --------------------------------------------------------------- boot
@@ -933,6 +1039,76 @@ export function applyTo(
   setIfChanged('PORTAL_PUBLIC_HOST', config.publicHost, publicHost, () => {
     config.publicHost = publicHost;
   });
+
+  // -------------------------------------------------------------- metrics
+  // 采样器与调度器每次排期/每 tick 都从 config 读（`intervalSec()` 闭包），
+  // 所以这里就地写回即可"下次读取即生效"，不需要重建任何对象。
+  const sampleInterval = pickNumber(
+    map,
+    'PORTAL_METRICS_SAMPLE_INTERVAL_SEC',
+    config.metrics.sampleIntervalSec,
+  );
+  setIfChanged(
+    'PORTAL_METRICS_SAMPLE_INTERVAL_SEC',
+    config.metrics.sampleIntervalSec,
+    sampleInterval,
+    () => {
+      config.metrics.sampleIntervalSec = sampleInterval;
+    },
+  );
+
+  const minuteRetention = pickNumber(
+    map,
+    'PORTAL_METRICS_RETENTION_MINUTE_HOURS',
+    config.metrics.minuteRetentionHours,
+  );
+  setIfChanged(
+    'PORTAL_METRICS_RETENTION_MINUTE_HOURS',
+    config.metrics.minuteRetentionHours,
+    minuteRetention,
+    () => {
+      config.metrics.minuteRetentionHours = minuteRetention;
+    },
+  );
+
+  const hourRetention = pickNumber(
+    map,
+    'PORTAL_METRICS_RETENTION_HOUR_DAYS',
+    config.metrics.hourRetentionDays,
+  );
+  setIfChanged(
+    'PORTAL_METRICS_RETENTION_HOUR_DAYS',
+    config.metrics.hourRetentionDays,
+    hourRetention,
+    () => {
+      config.metrics.hourRetentionDays = hourRetention;
+    },
+  );
+
+  const containerLimit = pickNumber(map, 'PORTAL_METRICS_CONTAINER_LIMIT', config.metrics.containerLimit);
+  setIfChanged('PORTAL_METRICS_CONTAINER_LIMIT', config.metrics.containerLimit, containerLimit, () => {
+    config.metrics.containerLimit = containerLimit;
+  });
+
+  // --------------------------------------------------------------- health
+  const probeInterval = pickNumber(map, 'PORTAL_HEALTH_PROBE_INTERVAL_SEC', config.health.probeIntervalSec);
+  setIfChanged('PORTAL_HEALTH_PROBE_INTERVAL_SEC', config.health.probeIntervalSec, probeInterval, () => {
+    config.health.probeIntervalSec = probeInterval;
+  });
+
+  const probeConcurrency = pickNumber(
+    map,
+    'PORTAL_HEALTH_PROBE_CONCURRENCY',
+    config.health.probeConcurrency,
+  );
+  setIfChanged(
+    'PORTAL_HEALTH_PROBE_CONCURRENCY',
+    config.health.probeConcurrency,
+    probeConcurrency,
+    () => {
+      config.health.probeConcurrency = probeConcurrency;
+    },
+  );
 
   // ------------------------------------------------- restart 级：显式跳过
   for (const key of [

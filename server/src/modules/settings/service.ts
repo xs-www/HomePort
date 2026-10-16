@@ -22,6 +22,7 @@ import type { SettingsRepository, SettingsStore } from '../../db/settings.js';
 import type { AuditRepository } from '../../db/users.js';
 import {
   MASK_TOKEN,
+  SETTING_GROUPS,
   applyTo,
   buildSettingDefinitions,
   maskSecret,
@@ -375,27 +376,14 @@ export class SettingsService {
   }
 }
 
-/** 分组列表（与 registry 的定义保持同源）。 */
+/**
+ * 分组列表。
+ *
+ * **必须直接返回 `SETTING_GROUPS`**：这里曾经是一份手抄的副本，Sprint 2 新增
+ * `metrics` / `health` 两组时只改了 registry，于是设置接口返回的 `groups` 少了这两组，
+ * `tests/auth.test.ts` 的"每一项的 group 必须在 groups 里声明过，否则前端会漏渲染"
+ * 立刻抓到了用户可见的缺陷。同源之后，新增分组只可能改一处。
+ */
 function groupList(): SettingsView['groups'] {
-  // 延迟取用避免顶层循环依赖；定义是静态的
-  return [
-    {
-      id: 'tailscale',
-      label: 'tailnet 数据源',
-      description: '查询 tailnet 设备与在线状态。Windows 容器化部署必须用 API 模式。',
-    },
-    {
-      id: 'docker',
-      label: 'Docker 数据源',
-      description: '读取容器清单。容器内应使用 unix socket。',
-    },
-    { id: 'system', label: '系统指标', description: 'CPU / 内存 / 磁盘 / GPU 的采集方式与频率。' },
-    { id: 'tools', label: '工具入口探测', description: 'Ollama / ComfyUI 等本机工具的可用性探测行为。' },
-    { id: 'performance', label: '缓存与超时', description: '调大缓存可降低宿主机压力。' },
-    {
-      id: 'boot',
-      label: '引导期配置（只读）',
-      description: '容器创建参数，改动需要重建容器，此处仅展示当前值。',
-    },
-  ];
+  return SETTING_GROUPS;
 }

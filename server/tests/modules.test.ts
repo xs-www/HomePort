@@ -329,6 +329,7 @@ describe('docker/service · 容器映射', () => {
       servePaths: [],
       servedUrl: null,
       stats: null,
+      exitCode: null,
     };
     const summary = summarize([
       { ...base, id: 'a', reachability: 'tailnet' },

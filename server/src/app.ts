@@ -24,11 +24,17 @@ import { createAuthHook } from './http/guards.js';
 import { registerSecurityHeaders } from './http/securityHeaders.js';
 import { AuthService } from './modules/auth/service.js';
 import { SessionsRepository } from './modules/auth/sessions.js';
+import { AlertEngine, createAlertSnapshotSource } from './modules/alerts/engine.js';
+import { AlertsService } from './modules/alerts/service.js';
 import { DockerProvider } from './modules/docker/provider.js';
 import { ContainerService } from './modules/docker/service.js';
+import { HealthMonitor } from './modules/health/monitor.js';
+import { MetricsSampler } from './modules/metrics/sampler.js';
+import { BackgroundScheduler } from './modules/metrics/scheduler.js';
 import { OverviewService } from './modules/overview/service.js';
 import { SettingsService } from './modules/settings/service.js';
 import { createSecretBox, loadOrCreateKey, parsePreviousKeys } from './modules/settings/secretBox.js';
+import { runHealthProbe } from './modules/services/healthProbe.js';
 import { ServiceRegistryService } from './modules/services/service.js';
 import { SystemProvider } from './modules/system/provider.js';
 import { SystemService } from './modules/system/service.js';
@@ -49,6 +55,14 @@ export interface BuildAppOptions {
   serveStatic?: boolean;
   /** 会话清理间隔（ms）；0 表示不启动定时器 */
   sessionCleanupIntervalMs?: number;
+  /**
+   * 是否启动后台任务（采样 / 健康监测 / 告警评估）。
+   *
+   * **默认 `false`**：`buildApp` 被大量测试 `inject` 复用，默认开定时器会让
+   * 测试变慢、相互干扰（同一个库被多路 tick 写），而且进程会被定时器吊住。
+   * 生产入口只有一个（`server/src/index.ts`），由它显式传 `backgroundJobs: true`。
+   */
+  backgroundJobs?: boolean;
 }
 
 export interface AppHandle {
@@ -57,7 +71,14 @@ export interface AppHandle {
   db: Db;
   config: PortalConfig;
   logger: Logger;
-  /** 优雅关闭：停止定时器 + 关闭 Fastify + 关闭数据库 */
+  /** 历史指标采样器（测试可直接调 `metrics.tick(now)`，无需等定时器） */
+  metrics: MetricsSampler;
+  /** 健康监视器与告警引擎/服务（Sprint 2 的另外两条线，装配由本文件统一负责） */
+  health: HealthMonitor;
+  alerts: AlertsService;
+  /** 后台单例（测试调 `scheduler.tickOnce(now)` 做确定性推进） */
+  scheduler: BackgroundScheduler;
+  /** 优雅关闭：停止后台任务与定时器 + 关闭 Fastify + 关闭数据库 */
   close: () => Promise<void>;
 }
 
@@ -254,7 +275,86 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
     audit: auditRepo,
   };
 
-  registerRoutes(app, ctx);
+  // ---- Sprint 2：历史采样 / 健康监测 / 告警（后台单例，全进程各一份）----
+  //
+  // 装配顺序即依赖方向：health → metrics（指标里的 service.health.up_ratio
+  // 要用**本 tick 刚更新**的判定）→ alerts（评估**本 tick 刚写入**的样本）。
+  // 三者都挂在同一个 `BackgroundScheduler` 上，执行顺序由它保证。
+  //
+  // 探测入口复用 Sprint 1 的 `runHealthProbe`（SSRF 防护、3s 超时、16KB 上限
+  // 都在它里面），这里只把"对象参数"适配成规格 §4.2 的 `(target, options)`。
+  const health = new HealthMonitor({
+    config,
+    logger,
+    registry: serviceRegistry,
+    containers,
+    probe: (target: string, options?: { timeoutMs?: number }) =>
+      runHealthProbe({ target, ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }),
+    // 闭包读取（而不是装配期取一次值）：设置页改完立刻生效（live 级），无需重启。
+    // 不接这两个闭包的话，`PORTAL_HEALTH_PROBE_INTERVAL_SEC` / `…_CONCURRENCY`
+    // 在界面上"能改、能保存、看起来生效了"，但监视器仍按 300s/4 跑 —— 静默失效。
+    intervalSec: () => config.health.probeIntervalSec,
+    concurrency: () => config.health.probeConcurrency,
+  });
+
+  const metrics = new MetricsSampler({
+    db,
+    config,
+    logger,
+    system,
+    containers,
+    registry: serviceRegistry,
+    health,
+  });
+
+  const alerts = new AlertsService({ db, config, logger, audit: auditRepo });
+  const alertEngine = new AlertEngine({
+    db,
+    config,
+    logger,
+    audit: auditRepo,
+    // **必须接快照来源**：不接的话引擎每轮拿到空快照，
+    // 四条内置规则会永远 `evaluated = 0` —— 所有单测照样全绿，但生产上任何告警都不触发。
+    // 这是"装配缺口"而非"逻辑错误"的典型：模块自己完全正确，缺的是把它接到真实世界。
+    // （判别力已验证：只撤掉这几行，`schedulerIntegration.test.ts` 的告警端到端用例
+    //   就会红在那条 `evaluated > 0` 的断言上。）
+    snapshot: createAlertSnapshotSource({
+      config,
+      system,
+      containers,
+      registry: serviceRegistry,
+      health,
+      logger,
+    }),
+    // 把每轮结果回灌给服务层，`GET /api/alerts/summary` 的 suppressed/evaluatedAt 才是真值
+    onTick: (result) => alerts.recordTick(result),
+  });
+  // 幂等补齐四条内置规则（默认 `enabled = 0`：装了但不吵）。
+  // 放在装配期而不是迁移里：迁移只建结构，业务数据由业务层负责。
+  // 失败只告警不阻断启动（规则表为空时告警页显示空列表，比整个门户起不来好）。
+  await Promise.resolve(alerts.ensureBuiltinRules()).catch((error: unknown) => {
+    logger.warn('补齐内置告警规则失败', { error });
+  });
+
+  const scheduler = new BackgroundScheduler({
+    health,
+    metrics,
+    alerts: alertEngine,
+    logger,
+    // 每次排期都重新求值 → 设置页改了采样间隔，下一个周期即生效（live 级）
+    intervalMs: () => config.metrics.sampleIntervalSec * 1000,
+  });
+  if (options.backgroundJobs === true) scheduler.start();
+
+  registerRoutes(app, ctx, {
+    metrics,
+    scheduler,
+    // 健康监视器：与调度器共用同一个实例（判定只算一次）
+    health,
+    // 告警域的路由依赖形状由 alerts 模块定义（见 api/index.ts），这里只负责把
+    // 已经装配好的对象传过去：服务（读规则/事件、确认）、引擎与调度器（状态透出）。
+    alerts: { alerts, engine: alertEngine, scheduler },
+  });
 
   // 统一错误处理
   app.setErrorHandler((error, request, reply) => {
@@ -336,12 +436,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<AppHandle
   }
 
   const close = async (): Promise<void> => {
+    // 后台任务先停：否则关闭 db 之后还可能有一轮 tick 在写库
+    scheduler.stop();
     if (cleanupTimer) clearInterval(cleanupTimer);
     await app.close();
     db.close();
   };
 
-  return { app, ctx, db, config, logger, close };
+  return { app, ctx, db, config, logger, metrics, health, alerts, scheduler, close };
 }
 
 /**

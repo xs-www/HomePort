@@ -8,7 +8,10 @@ import { buildApp } from './app.js';
 import { config } from './config.js';
 
 async function main(): Promise<void> {
-  const handle = await buildApp();
+  // 生产入口**显式**开启后台任务（历史采样 / 健康监测 / 告警评估）。
+  // `buildApp` 默认关闭，因为测试大量复用它，默认开定时器会让测试变慢、互相干扰；
+  // 全进程只有一个入口，后台单例也只有一个（见 modules/metrics/scheduler.ts）。
+  const handle = await buildApp({ backgroundJobs: true });
   const { app, config: cfg, logger } = handle;
   const auth = handle.ctx.auth;
 

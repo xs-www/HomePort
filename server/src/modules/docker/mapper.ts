@@ -102,6 +102,13 @@ export function mapContainer(
     createdAt: toIso(parseDockerTime(inspect.Created)),
     startedAt: toIso(parseDockerTime(inspect.State?.StartedAt)),
     finishedAt: toIso(parseDockerTime(inspect.State?.FinishedAt)),
+    // `?? null` 而不是 `?? 0`：0 是"正常退出"，null 是"不知道退出码"。
+    // 告警规则 container_exit 只在**已知且非 0** 时触发，把未知写成 0 会让
+    // 异常退出（inspect 读不到 State 的场景）永远静默。
+    exitCode:
+      typeof inspect.State?.ExitCode === 'number' && Number.isFinite(inspect.State.ExitCode)
+        ? inspect.State.ExitCode
+        : null,
     composeProject: labels['com.docker.compose.project'] ?? null,
     composeService: labels['com.docker.compose.service'] ?? null,
     composeWorkingDir: labels['com.docker.compose.project.working_dir'] ?? null,

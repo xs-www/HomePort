@@ -131,7 +131,9 @@ beforeAll(async () => {
 
   await before.close();
 
-  // ---- 阶段 2：把库退回 v2 形态（同时抹掉 v4 引入的服务注册表，让整条迁移链重放）----
+  // ---- 阶段 2：把库退回 v2 形态（同时抹掉 v3/v4/v5 引入的东西，让整条迁移链重放）----
+  // ⚠️ 新增迁移时必须同步扩展这里的降级清单（DROP 新表 + 删掉对应的 schema_migrations 行），
+  //    否则各版本的"真实回落"夹具会一起报 `expected N to be <更早的版本>`。
   const raw = new Database(DB_PATH);
   const tables = raw
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'totp_%'")
@@ -148,7 +150,10 @@ beforeAll(async () => {
     DROP TABLE service_bindings;
     DROP TABLE services;
     DROP TABLE service_preferences;
-    DELETE FROM schema_migrations WHERE version IN (3, 4);
+    DROP TABLE alert_events;
+    DROP TABLE alert_rules;
+    DROP TABLE metric_buckets;
+    DELETE FROM schema_migrations WHERE version IN (3, 4, 5);
   `);
   const applied = raw.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number };
   expect(applied.v).toBe(2); // 确认已退回 v2
@@ -165,7 +170,15 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-  fs.rmSync(TMP_DIR, { recursive: true, force: true });
+  // 断言失败时 SQLite 句柄可能没关（Windows 上 WAL 文件仍被占用），
+  // 此时 rmSync 会抛 EBUSY 把真正的失败盖住。清理必须容忍失败。
+  try {
+    fs.rmSync(TMP_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch (error) {
+    // 这里刻意用 console 而不是测试用的静默 logger：清理异常是"环境噪音"，
+    // 但要能在输出里看见，否则下次还会有人以为是迁移本身炸了。
+    console.warn(`[migrationV3] 临时目录清理失败（不影响测试结论）: ${String(error)}`);
+  }
 });
 
 describe('迁移 v3 · 既有部署升级后无损', () => {

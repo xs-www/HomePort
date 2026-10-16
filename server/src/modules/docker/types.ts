@@ -79,6 +79,15 @@ export interface ContainerSummary {
   mounts: ContainerMountView[];
   /** 容器整体可达性（取所有端口中最佳者） */
   reachability: Reachability;
+  /**
+   * 退出码（`inspect.State.ExitCode`）。
+   *
+   * `null` = **未知**（容器从未退出、或 inspect 的 State 缺失/不可读），
+   * `0` = 正常退出。两者语义完全不同，任何一方都不许伪装成另一方：
+   * 告警规则 `container_exit` 只在**非 0 且已知**时触发，
+   * 所以这里绝不能用 `?? 0` 兜底（那会把"未知"变成"一切正常"）。
+   */
+  exitCode: number | null;
   /** 首选入口；无可达端口时为 null */
   primaryUrl: string | null;
   ports: ContainerPortView[];

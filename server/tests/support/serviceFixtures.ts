@@ -73,6 +73,8 @@ export function makeContainer(partial: Partial<ContainerSummary> & { id: string;
     servePaths: [],
     servedUrl: null,
     stats: null,
+    // null = 退出码未知（夹具默认是运行中的容器）；0 才是"正常退出"
+    exitCode: null,
     ...partial,
   };
 }

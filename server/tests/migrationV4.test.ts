@@ -157,12 +157,17 @@ beforeAll(async () => {
   await before.close();
 
   // ---- 阶段 2：把库退回 v3 形态（删表 + 删迁移记录）----
+  // ⚠️ 新增迁移时必须同步扩展这里的降级清单（DROP 新表 + 删掉对应的 schema_migrations 行）。
+  //    夹具的语义是"精确模拟某一版老库"，所以版本号断言保持硬编码。
   const downgrade = new Database(DB_PATH);
   downgrade.exec(`
     DROP TABLE service_bindings;
     DROP TABLE services;
     DROP TABLE service_preferences;
-    DELETE FROM schema_migrations WHERE version = 4;
+    DROP TABLE alert_events;
+    DROP TABLE alert_rules;
+    DROP TABLE metric_buckets;
+    DELETE FROM schema_migrations WHERE version IN (4, 5);
   `);
   const applied = downgrade.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number };
   expect(applied.v).toBe(3);
@@ -170,7 +175,13 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-  fs.rmSync(TMP_DIR, { recursive: true, force: true });
+  // 断言失败时 SQLite 句柄可能没关（Windows 上 WAL 文件仍被占用），
+  // 此时 rmSync 会抛 EBUSY 把真正的失败盖住。清理必须容忍失败。
+  try {
+    fs.rmSync(TMP_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch (error) {
+    console.warn(`[migrationV4] 临时目录清理失败（不影响测试结论）: ${String(error)}`);
+  }
 });
 
 describe('迁移 v4 · 既有部署升级后无损', () => {
@@ -187,13 +198,18 @@ describe('迁移 v4 · 既有部署升级后无损', () => {
     await handle.close();
   });
 
-  it('v4 的表回来了，schema_migrations 恰好 4 行', () => {
+  it('v4 的表回来了，schema_migrations 记录到"当前最新版本"', () => {
+    const latest = Math.max(...MIGRATIONS.map((migration) => migration.version));
     const raw = new Database(DB_PATH, { readonly: true });
     const maxVersion = raw.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number };
-    expect(maxVersion.v).toBe(4);
+    expect(maxVersion.v).toBe(latest);
 
     const rows = raw.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
-    expect(rows.map((row) => row.version)).toEqual([1, 2, 3, 4]);
+    // 本次跑的是 v3 老库重放：v4 与它之后的迁移都必须补上（版本号连续、无跳号）
+    expect(rows.map((row) => row.version)).toEqual(
+      Array.from({ length: latest }, (_unused, index) => index + 1),
+    );
+    expect(rows.map((row) => row.version)).toContain(4); // 本文件关心的那一步
 
     const tables = raw
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'service%'")
@@ -211,8 +227,17 @@ describe('迁移 v4 · 既有部署升级后无损', () => {
     const v4 = MIGRATIONS.find((migration) => migration.version === 4);
     expect(v4?.name).toBe('services_registry');
     expect(v4 && 'down' in v4).toBe(false);
-    // 版本号单调递增（不允许插队/改写历史）
-    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4]);
+    // 版本号单调递增（不允许插队/改写历史）：1..4 的名字必须原样保留，
+    // 之后只允许**追加**更大版本号（所以这里不写死整张表，否则每加一个迁移就要改一次）
+    expect(MIGRATIONS.slice(0, 4).map((migration) => [migration.version, migration.name])).toEqual([
+      [1, 'initial_auth_schema'],
+      [2, 'runtime_settings'],
+      [3, 'totp_two_factor'],
+      [4, 'services_registry'],
+    ]);
+    const versions = MIGRATIONS.map((migration) => migration.version);
+    expect(versions).toEqual([...versions].sort((left, right) => left - right));
+    expect(new Set(versions).size).toBe(versions.length); // 无重复版本号
   });
 
   it('重复 runMigrations 幂等（第二次什么都不做）', () => {
@@ -221,7 +246,7 @@ describe('迁移 v4 · 既有部署升级后无损', () => {
       const appliedAgain = runMigrations(db, MIGRATIONS, logger);
       expect(appliedAgain).toEqual([]);
       const count = db.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number };
-      expect(count.n).toBe(4);
+      expect(count.n).toBe(MIGRATIONS.length);
     } finally {
       db.close();
     }

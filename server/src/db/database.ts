@@ -221,6 +221,92 @@ export const MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 5,
+    name: 'metrics_alerts_schema',
+    up: (db) => {
+      // Sprint 2：轻量历史监控（S2-01/S2-02）与告警（S2-04）的表。
+      //
+      // 设计要点（对应 docs/sprint2-implementation-spec.md §2）：
+      //
+      // 1. **缺测绝不写 0**：`metric_buckets` 只存"这一个时间桶里确实有样本"的行。
+      //    没有样本的分钟/整点**没有行** —— 图表按时间间隔断开，而不是画一条 0 的平线。
+      //    因此 `samples < expected` 是"部分缺测"的唯一信号，两者都必须落库。
+      // 2. **一个桶只写一次**：`UNIQUE (resolution, metric, target, bucket_at)` 是
+      //    幂等重写（`INSERT … ON CONFLICT DO UPDATE`）的依据，也是不变量的载体 ——
+      //    同一分钟内多次刷新不会产生重复行（Sprint 1 的教训：约束比调用方自觉更可靠）。
+      // 3. **`target` 用稳定身份**（`host` / `disk:<label>` / `container:<sourceRef>` /
+      //    `service:<sourceRef>`），**不含容器 ID**：容器重建后历史曲线仍然连续。
+      // 4. **告警用 episode 模型**：一次"故障"一行，恢复写 `resolved_at`，
+      //    静默期内再次触发是**重开同一行**而不是插新行。这条不变量的落地方式是
+      //    下面的部分唯一索引 `idx_alert_events_open`（同一规则同一目标最多一行未恢复），
+      //    而不是靠引擎代码自觉 —— 重启后靠它避免重复通知。
+      // 5. `alert_rules.enabled` 默认 0：内置规则"装了但不吵"，由管理员显式开启；
+      //    四条内置规则的数据由 `AlertsService.ensureBuiltinRules()` 幂等补齐，
+      //    **不放迁移里**（迁移只建结构，不塞业务数据）。
+      db.exec(`
+        CREATE TABLE metric_buckets (
+          id           TEXT PRIMARY KEY,
+          resolution   TEXT NOT NULL,
+          metric       TEXT NOT NULL,
+          target       TEXT NOT NULL,
+          target_label TEXT NOT NULL,
+          unit         TEXT NOT NULL,
+          bucket_at    INTEGER NOT NULL,
+          value        REAL NOT NULL,
+          min_value    REAL NOT NULL,
+          max_value    REAL NOT NULL,
+          samples      INTEGER NOT NULL,
+          expected     INTEGER NOT NULL,
+          created_at   TEXT NOT NULL,
+          UNIQUE (resolution, metric, target, bucket_at)
+        );
+        CREATE INDEX idx_metric_buckets_series ON metric_buckets (resolution, metric, target, bucket_at);
+        CREATE INDEX idx_metric_buckets_retention ON metric_buckets (resolution, bucket_at);
+
+        CREATE TABLE alert_rules (
+          id              TEXT PRIMARY KEY,
+          kind            TEXT NOT NULL,
+          name            TEXT NOT NULL,
+          description     TEXT NOT NULL DEFAULT '',
+          enabled         INTEGER NOT NULL DEFAULT 0,
+          threshold       REAL,
+          duration_sec    INTEGER NOT NULL DEFAULT 0,
+          target          TEXT,
+          silence_sec     INTEGER NOT NULL DEFAULT 3600,
+          notify_recovery INTEGER NOT NULL DEFAULT 1,
+          severity        TEXT NOT NULL DEFAULT 'warning',
+          builtin         INTEGER NOT NULL DEFAULT 1,
+          updated_at      TEXT NOT NULL,
+          created_at      TEXT NOT NULL
+        );
+
+        CREATE TABLE alert_events (
+          id              TEXT PRIMARY KEY,
+          rule_id         TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+          kind            TEXT NOT NULL,
+          rule_name       TEXT NOT NULL,
+          target          TEXT NOT NULL,
+          target_label    TEXT NOT NULL,
+          severity        TEXT NOT NULL,
+          value           REAL,
+          threshold       REAL,
+          unit            TEXT,
+          message         TEXT NOT NULL,
+          started_at      TEXT NOT NULL,
+          fired_at        TEXT NOT NULL,
+          resolved_at     TEXT,
+          reopen_count    INTEGER NOT NULL DEFAULT 0,
+          acknowledged_at TEXT,
+          acknowledged_by TEXT,
+          created_at      TEXT NOT NULL
+        );
+        -- 不变量：同一规则同一目标最多一行未恢复（部分唯一索引，见上文要点 4）
+        CREATE UNIQUE INDEX idx_alert_events_open ON alert_events (rule_id, target) WHERE resolved_at IS NULL;
+        CREATE INDEX idx_alert_events_recent ON alert_events (fired_at DESC);
+      `);
+    },
+  },
 ];
 
 export interface OpenDbOptions {

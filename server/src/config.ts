@@ -190,6 +190,29 @@ export interface PortalConfig {
     /** 登录第二步挑战令牌的有效期（秒） */
     challengeTtlSeconds: number;
   };
+  /**
+   * 历史指标采样与保留（Sprint 2 / S2-01）。
+   *
+   * 与 `system.metricsIntervalMs`（SSE 实时推送频率）**是两件事**：
+   * 那一个面向"人正在看的页面"，这一个面向"落库的历史曲线"。
+   */
+  metrics: {
+    /** 后台采样 tick 间隔（秒）；同时是 minute 桶期望样本数的基准 */
+    sampleIntervalSec: number;
+    /** minute 桶保留小时数（超过即删，稳态行数由此封顶，不随时间累积） */
+    minuteRetentionHours: number;
+    /** hour 桶保留天数 */
+    hourRetentionDays: number;
+    /** 采集容器的数量上限（0 = 完全不采容器） */
+    containerLimit: number;
+  };
+  /** 健康监测（Sprint 2 / S2-03）。 */
+  health: {
+    /** 自动 HTTP 探测间隔（秒）；**0 = 关闭自动探测**（只在手动探测时更新状态） */
+    probeIntervalSec: number;
+    /** 全局在飞探测并发上限 */
+    probeConcurrency: number;
+  };
 }
 
 const DEFAULT_MOUNTS = 'C:=/host/disk/C,D:=/host/disk/D';
@@ -434,6 +457,19 @@ export function loadConfig(overrides: Partial<PortalConfig> = {}): PortalConfig 
       issuer: str('PORTAL_TOTP_ISSUER', 'HomePort'),
       window: num('PORTAL_TOTP_WINDOW', 1, 0, 5),
       challengeTtlSeconds: num('PORTAL_TOTP_CHALLENGE_TTL_SECONDS', 300, 60, 1800),
+    },
+    // 非法值在启动时抛错（与 parseTrustProxy 同风格）：静默截断会让人以为
+    // "保留 3 天"真的生效了，而实际上库里留的是别的东西。
+    metrics: {
+      sampleIntervalSec: num('PORTAL_METRICS_SAMPLE_INTERVAL_SEC', 30, 5, 3600),
+      minuteRetentionHours: num('PORTAL_METRICS_RETENTION_MINUTE_HOURS', 24, 1, 168),
+      hourRetentionDays: num('PORTAL_METRICS_RETENTION_HOUR_DAYS', 30, 1, 3650),
+      containerLimit: num('PORTAL_METRICS_CONTAINER_LIMIT', 10, 0, 100),
+    },
+    health: {
+      // 0 是合法值（= 关闭自动探测），因此下界为 0
+      probeIntervalSec: num('PORTAL_HEALTH_PROBE_INTERVAL_SEC', 300, 0, 86400),
+      probeConcurrency: num('PORTAL_HEALTH_PROBE_CONCURRENCY', 4, 1, 32),
     },
   };
 

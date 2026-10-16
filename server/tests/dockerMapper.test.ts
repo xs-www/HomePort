@@ -59,17 +59,30 @@ interface InspectInput {
   image?: string;
   env?: string[];
   networks?: Record<string, { IPAddress?: string }>;
+  /** `State.Status`（缺省 running） */
+  stateStatus?: string;
+  /** `State.ExitCode`（缺省 0：运行中的容器 docker 也是 0） */
+  exitCode?: number;
+  /** true = 整个 `State` 缺失（模拟 inspect 只读到一半 / 老版本 Docker） */
+  omitState?: boolean;
+  /** true = `State` 在但 `ExitCode` 字段缺失 */
+  omitExitCode?: boolean;
 }
 
 function makeInspect(input: InspectInput = {}): ContainerInspectInfo {
   const ports = input.ports ?? {};
   const name = input.name ?? 'cs22-web';
-  return {
+  const inspect: ContainerInspectInfo = {
     Id: input.id ?? idFor(name),
     Name: `/${name}`,
     Created: '2026-02-20T08:00:00Z',
     Image: 'sha256:imageid',
-    State: { Status: 'running', StartedAt: '2026-02-25T06:00:00Z', FinishedAt: '0001-01-01T00:00:00Z' },
+    State: {
+      Status: input.stateStatus ?? 'running',
+      StartedAt: '2026-02-25T06:00:00Z',
+      FinishedAt: '0001-01-01T00:00:00Z',
+      ExitCode: input.exitCode ?? 0,
+    },
     Config: { Image: input.image ?? 'cs22-marketplace-web:local', Env: input.env ?? ['PATH=/usr/bin'], Labels: {} },
     HostConfig: {
       NetworkMode: input.networkMode ?? 'bridge',
@@ -78,6 +91,12 @@ function makeInspect(input: InspectInput = {}): ContainerInspectInfo {
     NetworkSettings: { Ports: ports, Networks: input.networks ?? {} },
     Mounts: [],
   } as unknown as ContainerInspectInfo;
+
+  // "字段缺失"逼真地模拟：真 Docker 有时读不到 State / ExitCode，
+  // 用 delete 而不是赋 undefined，避免被误认为"字段存在但为空"
+  if (input.omitState === true) delete (inspect as { State?: unknown }).State;
+  else if (input.omitExitCode === true) delete (inspect.State as { ExitCode?: unknown }).ExitCode;
+  return inspect;
 }
 
 /** 访客从 tailnet 访问门户时的主机上下文。 */
@@ -504,6 +523,46 @@ describe('docker/mapper · 边界输入', () => {
     expect(container.reachability).toBe('none');
     expect(container.primaryUrl).toBeNull();
     expect(container.urlCandidates).toEqual([]);
+  });
+});
+
+describe('docker/mapper · 容器退出码（null ≠ 0）', () => {
+  it('exited 容器映射真实退出码：137 就是 137', () => {
+    const container = mapContainer(makeInspect({ stateStatus: 'exited', exitCode: 137 }), ctx, [TSNET_IP]);
+
+    expect(container.state).toBe('exited');
+    expect(container.exitCode).toBe(137);
+    // 关键区分：137 不是"未知"，所以 container_exit 规则会触发
+    expect(container.exitCode).not.toBeNull();
+    expect(container.exitCode).not.toBe(0);
+  });
+
+  it('正常退出（ExitCode = 0）保留 0，而不是被当成未知', () => {
+    const container = mapContainer(makeInspect({ stateStatus: 'exited', exitCode: 0 }), ctx, [TSNET_IP]);
+
+    expect(container.exitCode).toBe(0);
+    expect(container.exitCode !== null && container.exitCode !== 0).toBe(false); // 不触发告警
+  });
+
+  it('State 缺失（inspect 读不到状态）→ 退出码 null，绝不退化成 0', () => {
+    const container = mapContainer(makeInspect({ omitState: true }), ctx, [TSNET_IP]);
+
+    expect(container.exitCode).toBeNull();
+    expect(container.state).toBe('unknown');
+    expect(container.exitCode).not.toBe(0); // "未知"不允许伪装成"正常退出"
+  });
+
+  it('State 在但 ExitCode 字段缺失 → null（未知就是不触发，而不是正常）', () => {
+    const container = mapContainer(makeInspect({ stateStatus: 'exited', omitExitCode: true }), ctx, [TSNET_IP]);
+
+    expect(container.state).toBe('exited');
+    expect(container.exitCode).toBeNull();
+  });
+
+  it('运行中的容器退出码是 0（不是 null）：语义是"还没异常退出过"', () => {
+    const container = mapContainer(makeInspect({ stateStatus: 'running' }), ctx, [TSNET_IP]);
+    expect(container.state).toBe('running');
+    expect(container.exitCode).toBe(0);
   });
 });
 
