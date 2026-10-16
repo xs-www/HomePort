@@ -1,5 +1,6 @@
 /**
- * Sprint 0 冒烟用例（S0-05）：首启初始化 / 登录登出 / 关键页面降级展示 / 角色权限。
+ * 冒烟用例：Sprint 0（首启初始化 / 登录登出 / 关键页面降级展示 / 角色权限）
+ * + Sprint 1（服务墙、手工服务持久化、Ctrl+K 搜索、viewer 管理边界）。
  *
  * 前置条件由 `e2e/start-server.mjs` 保证（Playwright 的 webServer）：
  * 每次运行都会**清空 `.e2e-data`** 后重新构建并启动生产服务，因此：
@@ -10,7 +11,8 @@
  * - 断言落在**可见文案或 URL** 上，不只断言 HTTP 200 —— "接口通但页面白屏"必须能被发现；
  * - 每个用例都用默认的独立浏览器上下文（Cookie 不跨用例），需要登录时走真实登录表单。
  *
- * 顺序敏感：用例按声明顺序串行执行（`workers: 1`），第 2 条会真正创建管理员。
+ * 顺序敏感：用例按声明顺序串行执行（`workers: 1`），第 2 条会真正创建管理员，
+ * 倒数第 2 条创建 viewer，末尾两条 Sprint 1 用例依赖这两类账号。
  */
 import { expect, test, type Page } from '@playwright/test';
 
@@ -56,7 +58,8 @@ async function loginAs(page: Page, username: string, password: string): Promise<
   // 等登录真正完成（离开登录页）再导航，否则整页跳转会打断还在飞的登录请求
   await expect(page.getByRole('heading', { name: 'HomePort 门户' })).toHaveCount(0);
   await page.goto('/');
-  await expect(page.getByRole('heading', { level: 1, name: '总览' })).toBeVisible();
+  // Sprint 1 起 `/` 是服务墙（总览迁到 `/overview`），登录成功的落点断言也随之改变
+  await expect(page.getByRole('heading', { level: 1, name: '服务' })).toBeVisible();
 }
 
 /**
@@ -112,8 +115,8 @@ test('首启初始化：正确令牌创建管理员并直接进入已登录状�
   await page.locator('#confirm').fill(ADMIN_PASSWORD);
   await page.getByRole('button', { name: '创建管理员并进入门户' }).click();
 
-  // bootstrap 成功后前端会立刻用同一凭据登录并跳回首页
-  await expect(page.getByRole('heading', { name: '你好，管理员' })).toBeVisible();
+  // bootstrap 成功后前端会立刻用同一凭据登录并跳回首页（`/` = 服务墙）
+  await expect(page.getByRole('heading', { level: 1, name: '服务' })).toBeVisible();
   expect(new URL(page.url()).pathname, '初始化成功后应回到首页').toBe('/');
 
   // 已登录的直接证据：侧栏出现管理员专属入口
@@ -149,7 +152,8 @@ test('关键页面可加载：Docker 与 tailnet 均不可用时显示降级提�
   const errors = trackPageErrors(page);
   await loginAs(page, ADMIN_USERNAME, ADMIN_PASSWORD);
 
-  // ---- 总览：聚合告警卡列出各数据源故障原因
+  // ---- 总览（Sprint 1 起在 `/overview`）：聚合告警卡列出各数据源故障原因
+  await page.goto('/overview');
   await expect(page.getByRole('heading', { name: '数据源提示' })).toBeVisible();
   await expect(page.locator('li').filter({ hasText: '容器：' }).first()).toBeVisible();
   await expect(page.locator('li').filter({ hasText: 'tailnet：' }).first()).toBeVisible();
@@ -225,6 +229,85 @@ test('权限：viewer 看不到「账号管理」入口，管理员可见；view
   await expect(page).toHaveURL(/\/login$/);
   await loginAs(page, ADMIN_USERNAME, ADMIN_PASSWORD);
   await expect(navLink(page, '账号管理')).toBeVisible();
+
+  await expectNoCrash(page, errors);
+});
+
+/* ------------------------------------------------------------------ *
+ * Sprint 1：服务注册表与首页服务墙
+ *
+ * 为什么追加在本文件末尾而不是新建 spec 文件：`.e2e-data` 只在整轮开始时清空一次，
+ * 而 admin/viewer 两个账号是由本文件上面的用例创建的，Playwright 按文件名排序执行文件
+ * （`services.spec.ts` 会排到 `smoke.spec.ts` 之前），新建文件就会在"还没有账号"时运行。
+ * 放在文件末尾即可确定性地复用已建好的账号。
+ *
+ * 另一件必须知道的事：E2E 环境里 Docker 指向不存在的 socket、Tailscale 为 off，
+ * 也就是**自动发现一定拿不到数据**。这不是缺陷，而是最值得验的场景 ——
+ * 服务墙必须在数据源全挂时依然可读、可解释，并允许管理员手工建服务。
+ * ------------------------------------------------------------------ */
+
+test('服务墙：数据源全不可用时给出可解释的降级提示，管理员可手工新建服务且刷新后仍在', async ({ page }) => {
+  const errors = trackPageErrors(page);
+  await loginAs(page, ADMIN_USERNAME, ADMIN_PASSWORD);
+
+  // 首页就是服务墙（Sprint 1 起 `/` 不再是总览）
+  await expect(page.getByRole('heading', { level: 1, name: '服务' })).toBeVisible();
+  // 降级必须被解释，而不是静默空白（Docker 源在 E2E 里是故意故障的）
+  await expect(page.getByText(/Docker/).first()).toBeVisible();
+
+  // ---- 管理员新建一个自定义服务（不依赖任何数据源）
+  await page.goto('/admin/services');
+  await expect(page.getByRole('heading', { level: 1, name: '服务管理' })).toBeVisible();
+
+  await page.getByRole('button', { name: '新建服务' }).click();
+  await page.locator('#service-name').fill('测试服务');
+  await page.locator('#service-category').fill('测试');
+  await page.locator('#service-url').fill('https://example.ts.net/app');
+  await page.getByRole('button', { name: '保存' }).click();
+
+  await expect(page.getByText('测试服务').first()).toBeVisible();
+
+  // 刷新后仍在 = 真的落库了（用户配置不得只活在内存里）
+  await page.reload();
+  await expect(page.getByText('测试服务').first()).toBeVisible();
+
+  // ---- 首页服务墙能看到它，首选入口就是刚填的那个
+  await page.goto('/');
+  await expect(page.getByRole('link', { name: '测试服务' })).toBeVisible();
+  await expect(page.locator('a[href="https://example.ts.net/app"]').first()).toBeVisible();
+
+  await expectNoCrash(page, errors);
+});
+
+test('服务墙：Ctrl+K 搜索并进入服务详情；viewer 看不到任何管理入口', async ({ page }) => {
+  const errors = trackPageErrors(page);
+
+  // ---- 管理员：Ctrl+K → 搜到服务 → Enter 落到详情页
+  await loginAs(page, ADMIN_USERNAME, ADMIN_PASSWORD);
+  await page.keyboard.press('Control+K');
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  // 输入框是 `role="combobox"`（显式 role 会覆盖隐式的 textbox，所以不能用 getByRole('textbox')）
+  await dialog.getByRole('combobox').fill('测试服务');
+  await expect(dialog.getByRole('option').first()).toBeVisible();
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(/\/services\/[^/]+$/);
+  await expect(page.getByRole('heading', { level: 1, name: '服务详情' })).toBeVisible();
+
+  // ---- viewer：只读，服务可见但没有管理入口
+  await page.getByRole('button', { name: '退出' }).click();
+  await expect(page).toHaveURL(/\/login$/);
+  await loginAs(page, VIEWER_USERNAME, VIEWER_PASSWORD);
+
+  await expect(navLink(page, '服务')).toBeVisible();
+  await expect(navLink(page, '服务管理')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '新建服务' })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: '测试服务' })).toBeVisible();
+
+  // 直接敲管理页 → 权限不足（后端也会独立拒绝写接口）
+  await page.goto('/admin/services');
+  await expect(page.getByRole('heading', { level: 1, name: '权限不足' })).toBeVisible();
 
   await expectNoCrash(page, errors);
 });
