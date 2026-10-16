@@ -23,7 +23,16 @@ import { ServiceRegistryService } from '../src/modules/services/service.js';
 import type { ContainerService } from '../src/modules/docker/service.js';
 import type { TailscaleService } from '../src/modules/tailscale/service.js';
 import type { ServiceListResponse, ServiceDetailResponse, ServiceDeleteResponse, ServiceView } from '../src/modules/services/types.js';
-import { TS_HOST, makeContainerList, realTopology } from './support/serviceFixtures.js';
+import {
+  TS_HOST,
+  makeContainer,
+  makeContainerList,
+  makePort,
+  makeServeRoute,
+  realTopology,
+  type Topology,
+} from './support/serviceFixtures.js';
+import { containerServiceRef, serveServiceRef } from '../src/modules/services/registry.js';
 
 const SETUP_TOKEN = 'SERVICES-SETUP-TOKEN';
 const ADMIN_PASSWORD = 'ServicesAdmin2026!';
@@ -49,8 +58,17 @@ let repo: ServicesRepository;
 /** 拓扑：门户 8899（serve 443 `/`）、日历 36065（serve 8443 `/calendar`）、Gitea 3000（serve 8443 `/git/`）。 */
 const topology = realTopology();
 
+/**
+ * 当前假数据源返回的拓扑。
+ *
+ * 做成可替换的（见 `withTopology`），是为了让"多副本 / 端口冲突"这类回归用例
+ * 不必再建一个 app + 库：直接把外部世界换掉，路由、鉴权、CSRF、SQLite 全是真的。
+ * 必须在读取时取 `liveTopology`（不是把 `topology` 捕获进闭包），否则替换不生效。
+ */
+let liveTopology: Topology = topology;
+
 const fakeContainers = {
-  list: async () => makeContainerList(topology.containers, { routes: topology.serveRoutes }),
+  list: async () => makeContainerList(liveTopology.containers, { routes: liveTopology.serveRoutes }),
 } as unknown as ContainerService;
 
 const fakeTailscale = {
@@ -134,6 +152,46 @@ async function createService(body: Record<string, unknown>): Promise<ServiceView
   const response = await inject({ method: 'POST', url: '/api/services', cookie: admin.cookie, csrf: admin.csrf, body });
   expect(response.statusCode, response.body).toBe(201);
   return response.json() as ServiceView;
+}
+
+/** 强制重新发现（admin），返回列表；发现落库失败会在这里的 statusCode 上暴露出来。 */
+async function discover(): Promise<{ statusCode: number; body: string; list: ServiceListResponse }> {
+  const response = await inject({ method: 'POST', url: '/api/services/discover', cookie: admin.cookie, csrf: admin.csrf });
+  return {
+    statusCode: response.statusCode,
+    body: response.body,
+    list: response.statusCode === 200 ? (response.json() as ServiceListResponse) : { items: [], total: 0, categories: [], discovery: null as never, generatedAt: '' },
+  };
+}
+
+/**
+ * 临时替换假数据源返回的拓扑，用完恢复。
+ *
+ * 两个清理动作都是必要的（本文件所有用例共享一个内存库与一个发现缓存）：
+ * 1. 删掉这次临时拓扑**新引入**的服务 —— 否则后续用例会看到多出来的服务；
+ * 2. 重新发现真实拓扑 —— 让缓存与内存里的发现快照复位。
+ */
+async function withTopology<T>(next: Topology, run: () => Promise<T>): Promise<T> {
+  const previous = liveTopology;
+  const previousRefs = new Set<string>([
+    ...previous.containers.map((container) => containerServiceRef(container)),
+    ...previous.serveRoutes.map((route) => serveServiceRef(route)),
+  ]);
+  liveTopology = next;
+  try {
+    return await run();
+  } finally {
+    liveTopology = previous;
+    for (const sourceRef of [
+      ...next.containers.map((container) => containerServiceRef(container)),
+      ...next.serveRoutes.map((route) => serveServiceRef(route)),
+    ]) {
+      if (previousRefs.has(sourceRef)) continue;
+      const introduced = repo.listAll().find((service) => service.sourceRef === sourceRef);
+      if (introduced) repo.delete(introduced.id);
+    }
+    await discover();
+  }
 }
 
 beforeAll(async () => {
@@ -666,5 +724,91 @@ describe('服务 API · 健康探测（S1-03）', () => {
     expect(row?.healthTarget).toBe('http://127.0.0.1:9/health');
     const columns = (handle.db.prepare('PRAGMA table_info(services)').all() as Array<{ name: string }>).map((c) => c.name);
     expect(columns.some((name) => name.includes('health_result'))).toBe(false);
+  });
+});
+
+/**
+ * 回归：验收时发现的两个 P1。
+ *
+ * 共同点：都是"归属/身份聚合"没做到底 —— 内存里的规划看起来对，
+ * 一旦真的落库（唯一约束）或生成视图（视图阶段重新推断归属）就露出来。
+ * 所以这两条用例都走真实路由 + 真实 SQLite，而不是只断言 planDiscovery 的返回值。
+ */
+describe('服务发现 · 多副本与端口冲突（P1 回归）', () => {
+  it('多副本：合并成一个服务，发现落库不撞唯一约束（曾经整个发现事务失败）', async () => {
+    const replicas: Topology = {
+      containers: [
+        makeContainer({
+          id: 'c-web-1',
+          name: 'demo-web-1',
+          composeProject: 'demo',
+          composeService: 'web',
+          state: 'exited',
+          status: 'Exited (0) 2 hours ago',
+          reachability: 'lan',
+          primaryUrl: `http://${TS_HOST}:8080/`,
+          ports: [makePort({ hostPort: 8080 })],
+        }),
+        makeContainer({
+          id: 'c-web-2',
+          name: 'demo-web-2',
+          composeProject: 'demo',
+          composeService: 'web',
+          reachability: 'lan',
+          primaryUrl: `http://${TS_HOST}:8081/`,
+          ports: [makePort({ hostPort: 8081 })],
+        }),
+      ],
+      serveRoutes: [],
+    };
+
+    await withTopology(replicas, async () => {
+      const result = await discover();
+      // 修好之前这里是 500：UNIQUE constraint failed: service_bindings.service_id, kind, ref
+      expect(result.statusCode, result.body).toBe(200);
+
+      const web = result.list.items.filter((item) => item.sourceRef === 'docker:demo/web');
+      expect(web).toHaveLength(1);
+      // 副本共享 sourceRef → 只有一份绑定落库（唯一约束）
+      const rows = repo.listBindings([web[0]!.id]);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.containerId).toBe('c-web-2');
+      // 代表容器是**正在运行**的那个副本：web-1 是 exited，别让人去重启它
+      expect(web[0]?.container?.name).toBe('demo-web-2');
+      expect(web[0]?.status.container).toBe('running');
+    });
+  });
+
+  it('端口冲突：路由不被挂回第一个容器（独立服务与容器服务不能同时认领它）', async () => {
+    const conflictUrl = `https://${TS_HOST}:8443/conflict`;
+    const conflict: Topology = {
+      containers: [
+        makeContainer({ id: 'c-a', name: 'app-a', ports: [makePort({ hostPort: 9000 })] }),
+        makeContainer({ id: 'c-b', name: 'app-b', ports: [makePort({ hostPort: 9000 })] }),
+      ],
+      // 真实 mapper 按宿主端口取第一个匹配容器 → 故意把 owner 指给 app-a
+      serveRoutes: [
+        makeServeRoute({ path: '/conflict', targetPort: 9000, containerName: 'app-a', containerId: 'c-a' }),
+      ],
+    };
+
+    await withTopology(conflict, async () => {
+      const result = await discover();
+      expect(result.statusCode, result.body).toBe(200);
+
+      // 1) 作为独立 serve 服务列出，并带自己的入口
+      const independent = bySource(result.list.items, `serve:${TS_HOST}:8443/conflict`);
+      expect(independent.entries.map((entry) => entry.url)).toContain(conflictUrl);
+
+      // 2) 两个候选容器都**不能**认领它（这正是被修掉的 P1：视图阶段又挂回第一个容器）
+      for (const ref of ['docker:app-a', 'docker:app-b']) {
+        const service = bySource(result.list.items, ref);
+        expect(service.entries.map((entry) => entry.url), `${ref} 不该认领冲突路由`).not.toContain(conflictUrl);
+        expect(service.bindingRefs, `${ref} 不该记住冲突路由`).not.toContain(`serve:${TS_HOST}:8443/conflict`);
+      }
+
+      // 3) 原因要说得出来
+      expect(result.list.discovery.notes.join('\n')).toContain('无法确定归属');
+    });
   });
 });

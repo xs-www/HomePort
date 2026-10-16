@@ -63,7 +63,7 @@ describe('服务发现 · 稳定身份（S1-01）', () => {
     expect(containerServiceRef({ name: 'Gitea' })).toBe('docker:gitea');
   });
 
-  it('副本容器合并成一个服务（不会出现两张卡片）', () => {
+  it('副本容器合并成一个服务，且只留一份绑定（数据库对 (service_id, kind, ref) 唯一）', () => {
     const replica = makeContainer({ id: 'c-1', name: 'web-1' });
     const plan = planDiscovery({
       containers: [replica, makeContainer({ id: 'c-2', name: 'web-2' })],
@@ -74,7 +74,79 @@ describe('服务发现 · 稳定身份（S1-01）', () => {
     });
     const web = plan.services.filter((service) => service.sourceRef === 'docker:web');
     expect(web).toHaveLength(1);
-    expect(web[0]?.bindings).toHaveLength(2);
+    // **必须是 1，不是 2**：副本共享同一个 `sourceRef`，而绑定表的唯一约束是
+    // `(service_id, kind, ref)`。曾按"一个副本一行绑定"实现（并在此断言 2），
+    // 结果是发现落库时撞唯一约束 → 整个事务回滚 → `/api/services` 直接报错，
+    // 而不是"多一张卡片"。所以这条用例的断言本身就是契约的一部分。
+    expect(web[0]?.bindings).toHaveLength(1);
+    expect(web[0]?.bindingRefs).toEqual(['docker:web']);
+  });
+
+  it('多副本能真正落库：replaceBindings 不撞唯一约束，且只存一行', () => {
+    const { db } = initDatabase({ file: ':memory:' });
+    try {
+      const repo = new ServicesRepository(db);
+      const plan = planDiscovery({
+        containers: [makeContainer({ id: 'c-1', name: 'web-1' }), makeContainer({ id: 'c-2', name: 'web-2' })],
+        serveRoutes: [],
+        dockerAvailable: true,
+        serveAvailable: true,
+        serveDetail: null,
+      });
+      const web = plan.services[0];
+      expect(web?.sourceRef).toBe('docker:web');
+
+      const id = 'svc-web';
+      repo.insert({
+        id,
+        slug: repo.uniqueSlug('web'),
+        displayName: web!.displayName,
+        description: web!.description,
+        icon: web!.icon,
+        category: web!.category,
+        sourceType: web!.sourceType,
+        sourceRef: web!.sourceRef,
+        bindingRefs: web!.bindingRefs,
+        userEdited: false,
+      });
+      // 这一步以前会抛 UNIQUE constraint failed（发现事务回滚）
+      expect(() => repo.replaceBindings(id, web!.bindings)).not.toThrow();
+      const rows = repo.listBindings([id]);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.ref).toBe('docker:web');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('副本代表优先取正在运行的容器（否则会让人去重启一个没坏的服务）', () => {
+    const plan = planDiscovery({
+      containers: [
+        makeContainer({ id: 'c-1', name: 'web-1', state: 'exited' }),
+        makeContainer({ id: 'c-2', name: 'web-2', state: 'running' }),
+      ],
+      serveRoutes: [],
+      dockerAvailable: true,
+      serveAvailable: true,
+      serveDetail: null,
+    });
+    const web = plan.services[0];
+    expect(web?.bindings).toHaveLength(1);
+    expect(web?.bindings[0]?.containerName).toBe('web-2');
+    expect(web?.bindings[0]?.containerId).toBe('c-2');
+
+    // 反序（运行中的先出现）时保持先出现的那个，不被后面停掉的副本替换
+    const reversed = planDiscovery({
+      containers: [
+        makeContainer({ id: 'c-2', name: 'web-2', state: 'running' }),
+        makeContainer({ id: 'c-1', name: 'web-1', state: 'exited' }),
+      ],
+      serveRoutes: [],
+      dockerAvailable: true,
+      serveAvailable: true,
+      serveDetail: null,
+    });
+    expect(reversed.services[0]?.bindings[0]?.containerName).toBe('web-2');
   });
 
   it('用户字段在重新发现后保留（仓储纪律：发现只写自动字段）', () => {
@@ -198,7 +270,7 @@ describe('服务发现 · serve 归属与门户自身（S1-01 / 验收用例）'
       containerNames: [],
       containers,
     });
-    const routes = serveRoutesForService({ bindingRefs: portal.bindingRefs, container, serveRoutes });
+    const routes = serveRoutesForService({ bindingRefs: portal.bindingRefs, container, serveRoutes, containers });
     const entries = buildServiceEntries({ preferredUrl: null, container, serveRoutes: routes, hostContext: host });
     const entry = pickEntry(entries);
     expect(entry?.url).toBe(`https://${TS_HOST}/`);
@@ -213,7 +285,7 @@ describe('服务发现 · serve 归属与门户自身（S1-01 / 验收用例）'
       containerNames: [],
       containers,
     });
-    const routes = serveRoutesForService({ bindingRefs: calendar.bindingRefs, container, serveRoutes });
+    const routes = serveRoutesForService({ bindingRefs: calendar.bindingRefs, container, serveRoutes, containers });
     const entries = buildServiceEntries({ preferredUrl: null, container, serveRoutes: routes, hostContext: host });
 
     expect(pickEntry(entries)?.url).toBe(`https://${TS_HOST}:8443/calendar`);
@@ -227,7 +299,7 @@ describe('服务发现 · serve 归属与门户自身（S1-01 / 验收用例）'
   it('Gitea：取 `/git/`（serve 优先级高于 tailnet 端口）', () => {
     const gitea = plan.services.find((service) => service.sourceRef === 'docker:gitea')!;
     const container = findContainerForService({ sourceRef: gitea.sourceRef, containerIds: [], containerNames: [], containers });
-    const routes = serveRoutesForService({ bindingRefs: gitea.bindingRefs, container, serveRoutes });
+    const routes = serveRoutesForService({ bindingRefs: gitea.bindingRefs, container, serveRoutes, containers });
     const entries = buildServiceEntries({ preferredUrl: null, container, serveRoutes: routes, hostContext: host });
 
     expect(pickEntry(entries)?.url).toBe(`https://${TS_HOST}:8443/git/`);
@@ -264,6 +336,56 @@ describe('服务发现 · serve 归属与门户自身（S1-01 / 验收用例）'
     expect(independent?.bindings[0]?.containerName).toBeNull();
     expect(independent?.bindings[0]?.containerId).toBeNull();
     expect(conflict.notes.join('\n')).toContain('无法确定归属');
+  });
+
+  it('冲突路由在**视图阶段**也不许被挂回第一个容器（serveRoutesForService 复用同一判定）', () => {
+    const a = makeContainer({ id: 'c-a', name: 'app-a', ports: [makePort({ hostPort: 9000 })] });
+    const b = makeContainer({ id: 'c-b', name: 'app-b', ports: [makePort({ hostPort: 9000 })] });
+    // 真实 mapper 在冲突时会把 owner 指给第一个匹配容器 —— 视图阶段不能凭这个认领
+    const route = makeServeRoute({ path: '/conflict', targetPort: 9000, containerName: 'app-a', containerId: 'c-a' });
+    const containers = [a, b];
+
+    expect(
+      serveRoutesForService({ bindingRefs: ['docker:app-a'], container: a, serveRoutes: [route], containers }),
+    ).toEqual([]);
+
+    // 独立 serve 服务靠 bindingRefs 里的稳定 ref 拿到它（不受归属判定影响）
+    expect(
+      serveRoutesForService({
+        bindingRefs: [`serve:${TS_HOST}:8443/conflict`],
+        container: null,
+        serveRoutes: [route],
+        containers,
+      }),
+    ).toHaveLength(1);
+
+    // 唯一占用时容器归属仍然有效（别把正常路径一起关掉）
+    const solo = makeServeRoute({ path: '/solo', targetPort: 9000, containerName: 'app-a', containerId: 'c-a' });
+    expect(
+      serveRoutesForService({ bindingRefs: [], container: a, serveRoutes: [solo], containers: [a] }),
+    ).toHaveLength(1);
+    // 目标端口为 null（不是容器端口）→ 也不认领
+    const detached = makeServeRoute({ path: '/detached', targetPort: 9001, containerName: 'app-a', containerId: 'c-a' });
+    expect(
+      serveRoutesForService({ bindingRefs: [], container: a, serveRoutes: [detached], containers }),
+    ).toEqual([]);
+  });
+
+  it('重复的 serve 路由合并成一份绑定（否则同样会撞 (service_id, kind, ref) 唯一约束）', () => {
+    const a = makeContainer({ id: 'c-a', name: 'app-a', ports: [makePort({ hostPort: 9000 })] });
+    const route = makeServeRoute({ path: '/dup', targetPort: 9000, containerName: 'app-a', containerId: 'c-a' });
+    const plan = planDiscovery({
+      containers: [a],
+      // 同一 host/port/path 出现两次（CLI 输出重复、或两条配置归一后相同）
+      serveRoutes: [route, { ...route }],
+      dockerAvailable: true,
+      serveAvailable: true,
+      serveDetail: null,
+    });
+
+    const service = plan.services.find((item) => item.sourceRef === 'docker:app-a');
+    expect(service?.bindings.filter((binding) => binding.kind === 'serve')).toHaveLength(1);
+    expect(service?.bindingRefs.filter((ref) => ref.startsWith('serve:'))).toHaveLength(1);
   });
 
   it('serve 不可用时给出可读解释（而不是静默少几条入口）', () => {
