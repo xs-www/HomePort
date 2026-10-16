@@ -3035,5 +3035,201 @@ node migrate-rehearsal-s2.mjs portal-v4-fixture.sqlite portal-live-pre-sprint1.s
 4. `e2e/**` 仍不在类型检查内（`todo.md` 技术债）；本轮 E2E 又踩到一次"断言写错但类型检查无感"。
 5. **尚未部署到 NAS**：生产仍是 Sprint 0 镜像，Sprint 1 + Sprint 2 待一起部署验收。
 
+---
+
+## [2026-10-16] 修复：Sprint 2 验收驳回的三个 P1（健康监视器泄漏 / 历史指标绕过可见性 / 测试依赖墙钟）
+
+### 背景与目标
+
+Sprint 2 提交后，用户手工复现真实场景**驳回了三个 P1**。三条同属一类：
+
+> **"看得见什么"这件事只做了一半就被当成做完了。**
+> 采集侧固定 viewer 视角看着很安全，但**读侧**与**清理路径**各自留了一个缺口；
+> 而测试因为把"跑测试的真实时刻"当输入，既挡不住这些缺口，自己还会时红时绿。
+
+第一条与第二条是**同一个泄漏面的两半**（隐藏服务的名字与曲线），第三条是**测试自身的可判别性**问题
+——它正好解释了为什么前两条能一路通过自动化门禁。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 修改 | `server/src/modules/health/monitor.ts` | 新增 `ServiceListViewResult`（`ok` 判别位）、`visibleRefs`、`isVisible()`；`loadServices()` 区分"读失败/契约破损"与"成功读到空列表"；成功即（含空列表）更新可见集合并 `dropStaleStates()`（**同时删 `labelsByRef`**）；`states()` / `state()` / `view()` 按可见集合过滤 |
+| 修改 | `server/src/modules/metrics/sampler.ts` | 新增 `visibleServiceRefs()`（**每次读都查注册表、刻意不缓存**）、`isHostOwnedTarget()`、`targetVisible()`；`availableTargets()` / `resolveTarget()` / `catalog()` 改 async 并按**当前**可见性过滤；`resolveTarget()` 在**任何存在性查找之前**先过可见性；注册表读失败 **fail-closed** |
+| 修改 | `server/src/api/metrics.ts` | `await deps.metrics.resolveTarget(...)`；注释写明"不可见与从未采集过走同一条 400 分支、刻意不用 404/403" |
+| 修改 | `server/tests/healthMonitor.test.ts` | 新增 4 条（现 21 条）：成功读到空列表必须清状态**与服务名**；删空 ≠ 降级；读失败保留旧状态且 notes 说明；**读路径纵深防御**（绕过 `dropStaleStates` 直接塞回不可见状态） |
+| 新增 | `server/tests/metricsVisibility.test.ts` | **13 条**，全走 `buildApp()` + `app.inject()`（真实路由 / 会话 Cookie / CSRF / SQLite），夹具是**真的采集**；隐藏后 catalog 不列、history 与陌生 target **逐字节一致**、admin 同样不可见、宿主指标不受影响、恢复可见后曲线与隐藏前逐字段相同、删除与"曾采过的容器序列"同样受控 |
+| 修改 | `server/tests/schedulerIntegration.test.ts` | 起点由固定 `EPOCH` 推出（原 `minuteStart(Date.now()/1000) - 3600` **必然横跨一个整点**）；三个数据源换成注入假夹具；序列数从区间断言收紧为等号；新增**跨整点用例**（22:59:30 → 23:00:30） |
+| 修改 | `server/tests/metricsApi.test.ts` | `vi.setSystemTime(EPOCH * 1000)` + 三个假数据源；原 `Date.now()` 与"用墙钟推导保留截止时刻"全部改为固定量；显式断言"本夹具不跨整点" |
+| 新增 | `server/tests/clockBoundary.test.ts` | **4 条**：把"这两条线只许用固定 epoch"变成可执行约定（扫源码禁止 `Date.now(` / `new Date(` / `performance.now(`；必须声明同一个 `EPOCH`；必须注入三个数据源；受约束文件缺失或为空时用例必须失败） |
+| 修改 | `docs/static/{03,04,06,09}.md`、`todo.md`、`IMPLEMENTATION_REPORT_S2.md` | 本次归档 |
+
+### 逐项明细
+
+#### 修复 1（P1）：健康监视器把已隐藏的服务状态与服务名永久留在内存
+
+- **现象**：把服务全部隐藏（或删除）之后，`GET /api/health/monitor` 仍然列出它们，
+  `services[].label` 就是服务名 —— 用户的"隐藏"被后台绕过。
+- **根因**：`tick()` 里写的是 `if (tracked.length > 0) this.dropStaleStates(tracked);`。
+  `loadServices()` 把"`list()` 抛错"与"成功读到空列表"都返回 `[]`，
+  于是**成功读到空列表**（= 用户把服务全隐藏/全删了）与"这次没读到服务列表"不可区分，
+  而条件 `tracked.length > 0` 让两者**都**跳过 reconcile → 旧状态与旧服务名永久留存。
+  即使 reconcile 被执行，`dropStaleStates()` 原来也只删 `statesByRef`，
+  **`labelsByRef` 里的服务名不受影响** —— 名字照样能从视图里取出来。
+- **修法**：
+  1. `loadServices()` 返回带判别位的 `ServiceListViewResult`：`list()` 抛错或响应缺 `items`
+     数组 → `{ ok: false }`；正常返回（哪怕 `items` 为空）→ `{ ok: true }`。
+     **不靠"数组是否为空"事后猜** —— 用户隐藏掉最后一个服务时 `items` 同样是空数组。
+  2. `if (loaded.ok)` 才更新 `visibleRefs` 并 `dropStaleStates(tracked)`：**空列表也走全清**，
+     且 `dropStaleStates()` 同时删 `statesByRef` 与 `labelsByRef`（名字与状态同生同灭）。
+  3. 读失败时**不碰**任何既有状态、`visibleRefs` 保持不变，原因写进 `lastRegistryError`
+     → 由 `view().notes` 的"服务列表不可用：…"说明（取数抖动 ≠ 服务消失）。
+  4. **纵深防御**：新增 `visibleRefs` + `isVisible()`，`states()` / `state()` / `view()` 都过滤
+     不在最近一次成功读取集合里的状态。`visibleRefs === null`（还没成功读过）时不过滤（无数据可漏）。
+     **语义收紧**：`state(ref)` 对不可见 ref 现在返回 `null`。
+- **验证**：`healthMonitor.test.ts` 新增 4 条，其中"读路径纵深防御"一条**故意绕过 reconcile**
+  往 `statesByRef` / `labelsByRef` 里塞回一个不可见的 `docker:ghost`，断言三个读出口都不发出它
+  —— 只修写路径的版本在这条用例下会红。另有一条断言 `JSON.stringify(view())` 里
+  **连服务名都不出现**（比"字段为空"更严）。
+
+#### 修复 2（P1）：历史指标读接口绕过当前可见性
+
+- **现象**：一个服务被采集过、随后被隐藏，viewer 仍能在 `/api/metrics/catalog` 里看到它的
+  target 与 `targetLabel`（= 服务名），并能在 `/api/metrics/history` 里查到它的完整曲线，
+  直到历史数据过期（分钟桶 24h / 小时桶 30d）。
+- **根因**：采集侧固定 `role: 'viewer'` 只保证"隐藏之后不再产生新样本"。
+  **隐藏之前**已落库的 `metric_buckets` 行与进程内 `liveTargets` 仍然带着服务名，
+  而读路径 `availableTargets()` 直接遍历 `repo.listTargets()`、`resolveTarget()` 直接查存在性，
+  **两处都没有核对当前 hidden**。这是"读取侧"整半缺失。
+- **修法**：
+  1. 新增 `visibleServiceRefs()`：用与采集**同一个** `backgroundHostRequest(config)` 调
+     `registry.list(request, {}, 'viewer')`，返回可见 `sourceRef` 集合；
+     **读失败返回 `null`**，调用方按 **fail-closed** 处理。
+  2. 新增 `isHostOwnedTarget()`（`targetKind ∈ {host, disk}`）与 `targetVisible()`：
+     宿主/磁盘恒可见（响应不变），服务/容器类必须命中当前可见集合，
+     `visible === null` 一律不可见。
+  3. `availableTargets()` 过滤候选，并且**只在真的存在非宿主 target 时**才查注册表
+     （纯宿主/磁盘目录完全不变）；`resolveTarget()` 在**任何存在性查找之前**先过可见性
+     —— 否则"库里曾经有过"本身就是存在性证据。
+  4. `catalog()` / `availableTargets()` / `resolveTarget()` 因此变成 **async**；
+     路由层 `await` 之（`api/metrics.ts`）。
+- **为什么"不可见"必须与"从未采集过"完全一致**：两者都返回 `null` → 同一个 400
+  `VALIDATION_FAILED` + `details.targetPattern`。**刻意不用 404/403、也不加任何区分字段** ——
+  那等于向调用者承认"这个目标存在，只是你看不到"。
+- **代价（有意取舍，写在源码注释里）**：`visibleServiceRefs()` **不做任何缓存**
+  （"任何 TTL 都是泄漏窗口"），因此每次 catalog 与每次服务类 history 读都会查一次注册表。
+  默认 `PORTAL_CACHE_CONTAINERS_TTL_MS = 2000` 时由注册表既有的 TTL 缓存吸收（不产生 Docker 调用，
+  并发读被 single-flight 合并）；该 TTL 允许设为 0（不缓存），那时每次读都会真的跑一遍服务发现。
+- **验证**：`metricsVisibility.test.ts`（13 条，真实路由 + 真实鉴权 + 真实 SQLite）。
+  关键断言是"抹平调用者自己传入的 target 串后，隐藏目标的响应体与陌生 target 的响应体
+  **逐字节相同**"，以及 `Object.keys(error)` 集合相同 —— 任何区分字段都会在这里红。
+  **判别力（修复方实测，归档时未复跑）**：临时关掉读路径过滤后，13 条里 12 条依赖可见性的用例有
+  **6 条变红**。
+
+#### 修复 3（P1）：两条服务端测试用墙钟构造起点，必然/可能横跨整点
+
+- **现象**：同一份代码在一天里时红时绿。
+  `schedulerIntegration.test.ts` 的 `BASE = minuteStart(Math.floor(Date.now()/1000)) - 3600`
+  **必然横跨一个整点**，`BASE + 60` 跨过整点后整点滚动凭空多出 hour 行，
+  而断言写的是"总行数 === 本轮 flush 的行数" → 实测出现 `10 === 5`；
+  `metricsApi.test.ts` 用 `Date.now()` 取 T0、并用墙钟推导保留截止时刻，
+  23:01 跑时 T0 已落到上一个整点，hour 桶被滚出来而断言仍写着"hour 窗口为空"。
+- **根因**：起点来自真实墙钟 = **"跑测试的真实时刻"成了输入**；同时断言依赖真实宿主采样器与真实 Docker
+  （"这台机器恰好有没有 CPU 基线、有没有 Docker"也成了输入）。
+  这类缺陷不编译报错、不运行抛错，只在某些时刻红，靠"重跑一次看看"几乎定位不到。
+- **修法**：
+  1. 两条线改用**固定 epoch** `EPOCH = 1_700_000_000`（= `2023-11-14T22:13:20Z`）：
+     `schedulerIntegration` 的 `BASE = hourStart(EPOCH) + 15min`（与 `BASE+60` / `BASE+120` 同处一小时），
+     `metricsApi` 用 `vi.setSystemTime(EPOCH * 1000)` 把被测进程的读侧时钟钉住。
+     取值只要求"好算、落在整点内"，**不是为了回避边界**（注释里明写）。
+  2. 三个"外部世界"（`ctx.system.snapshot` / `ctx.containers.list` / `ctx.services.list`）
+     **全部**换成注入假夹具 → 一次采集的序列数是确定值，断言从区间收紧为等号
+     （`schedulerIntegration` 的 `HOST_SERIES = 5`）。
+  3. 每个"本该没有 hour 行"的地方都**显式断言 `hoursRolledUp === 0`**，不再靠"恰好没跨"。
+  4. **跨整点从"随机撞上"变成"被测行为"**：新增用例 22:59:30 → 23:00:30，
+     断言 minute 落 5 行、22 点滚出 5 行 hour（`samples = 1` / `expected = 60` / 值等于唯一读数）、
+     总行数 = 5 + 5、未结束的 23 点**不许提前滚出**、同整点重复 tick 不重复滚。
+  5. 新增 `clockBoundary.test.ts` 把这套约定变成**可执行约束**：扫这两个文件的源码
+     （去注释后）禁止 `Date.now(` / `new Date(` / `performance.now(`；必须声明同一个 `EPOCH`
+     并写明"为了确定性、不是为了回避边界"；必须注入三个数据源；
+     **受约束文件不存在或为空时用例必须失败**（否则一次重命名就让守卫退化成空断言）。
+- **顺带发现的真问题（不是测试问题，是装配顺序）**：`buildApp` 内部会跑
+  `settings.initialize()`，它把设置表/环境变量层的值**就地写回同一个 `config` 对象** ——
+  于是测试传进去的 `metrics.sampleIntervalSec = 5` 会被"设置默认值 30"取代
+  （实测 `expected` 从 12 悄悄变成 2）。`schedulerIntegration.test.ts` 因此在 `openApp` 里
+  把生效值显式钉回 5 并写明原因。**这不是本轮要修的产品缺陷**，但它是一条值得记住的接线语义：
+  后台模块每次读 `config` 才拿到"最新值"（这是 `live` 生效的实现方式），
+  因此任何"先在 config 上改一个值、再 `buildApp`"的写法都可能被 `settings.initialize()` 覆盖。
+
+#### 归档与文档
+
+- `03-server-modules.md`：`sampler.ts` 的函数表与新增"读路径的可见性"小节（含三条 why 与代价）、
+  新增 `ServiceListViewResult` / `visibleRefs` / `isVisible` 表与"成功读到空列表必须清理"逐分支表、
+  `monitor.ts` 的状态淘汰与 notes 行改写（原文写着"仅在服务列表非空时执行"—— 那正是被驳回的行为）、
+  `api/metrics.ts` 与 `api/healthMonitor.ts` 的行、§5 测试表。
+- `04-api-contract.md`：§6.7 新增"可见性语义（不变量）"小节（不可枚举 / 不可查询 / 不泄漏存在性 /
+  没有 404·403 / 不做角色特例 / 宿主不受影响 / 隐藏≠删除数据 / fail-closed / 代价）、
+  catalog 与 history 的参数与边界、§6.8 健康监测的可见性语义。
+- `06-security.md`：§3 后台任务表新增"读取侧的可见性强制"行与"不变量：双重落实"表、
+  "冻结三件事"第 3 条改写、§9 残余风险第 10 条改写并**新增第 11 条**（告警读路径仍未收口，见下）、
+  §10 清单新增一条。
+- `todo.md` / `IMPLEMENTATION_REPORT_S2.md`：勾掉三条 P1 并记录未做项与残留风险。
+
+### 配置 / 接口 / 数据模型影响
+
+- **环境变量**：无新增、无默认值变化。
+- **数据模型**：无迁移。**历史行一条都不删** —— 隐藏只是访问受控，
+  重新可见后曲线与隐藏前逐字段相同（有用例断言）。
+- **HTTP 契约**：路径、方法、权限、字段名全部未变。**语义收紧两处**：
+  ① `/api/metrics/history` 的 target 闸门多一条"当前可见性"，
+  不可见目标与陌生目标返回**完全一致**的 400（仍带 `details.targetPattern`，**没有** 404/403）；
+  ② `/api/health/monitor` 的 `services[]` 只含当前可见服务，`state(ref)` 对不可见 ref 返回 `null`。
+- **内部签名**：`MetricsSampler.availableTargets()` / `resolveTarget()` / `catalog()` 由同步改为
+  **async**（唯一调用方 `api/metrics.ts` 已 `await`）；
+  `HealthMonitor.loadServices()` 返回类型改为 `ServiceListViewResult`；新增三个私有成员。
+
+### 验证方式
+
+```
+npx vitest run tests/clockBoundary.test.ts tests/healthMonitor.test.ts \
+  tests/metricsVisibility.test.ts tests/metricsApi.test.ts \
+  tests/schedulerIntegration.test.ts --root server
+# → Test Files 5 passed (5)；Tests 59 passed (59)
+#   clockBoundary 4 / healthMonitor 21 / metricsVisibility 13 / metricsApi 14 / schedulerIntegration 7
+#   （归档时刻实测：2026-10-16 23:15；全库 `npm test` 由父任务在提交前跑）
+
+# 判别力（修复方实测，本轮归档未复跑）
+#   临时关掉读路径可见性过滤 → metricsVisibility.test.ts 13 条里 12 条依赖可见性的用例有 6 条变红
+#   clockBoundary.test.ts 的守卫：往受约束文件里加一行 `Date.now()` 即红
+```
+
+### 已知限制 / 后续（照实记录，未在本次修复中解决）
+
+1. **`visibleServiceRefs()` 的 fail-closed 分支没有单测**：现有用例都通过"真隐藏 / 真删除"走到
+   `visible = Set(...)` 的路径；"注册表抛错 → 服务类 target 全部不可见、宿主指标不受影响"
+   目前只有实现与注释，**没有可区分性证明**。补法很简单（注入一个抛错的 registry 走真实路由），
+   本轮未做 —— 已记入 `todo.md`。
+2. **告警读接口是同一类泄漏面上仍未收口的一块**：`/api/alerts/events` / `summary` 返回的
+   `target`（`service:<sourceRef>`）与 `target_label`（服务展示名）是**触发时**写进
+   `alert_events` 的，不随可见性变化 → 隐藏前产生的告警事件仍会带出服务名；
+   隐藏后 `health.states()` 不再包含该服务，引擎"目标不在快照里 → 不动，不假恢复"的既有语义
+   又让它的未恢复告警**停在未恢复状态**。本轮范围只覆盖 `metrics/*` 与 `health/monitor`。
+   详见 `06-security.md` §9-11 与 `todo.md`。
+3. **`state(ref)` 语义收紧的连带影响**：`MetricsSampler.verdictOf` 走
+   `health.state(ref)?.verdict ?? 'unknown'`，因此"不可见"在采样侧表现为 `unknown` → 该 tick
+   **不产生样本**（不是写 0，方向安全）；`AlertEngine` 的快照用 `health.states()`，
+   因此隐藏服务会从告警快照里消失（即上文第 2 条的"停在未恢复"）。两个模块的可见性口径
+   由此绑在一起，改任一处都要一起看。
+4. **每次读都查一次注册表**：默认 TTL（2s）下由注册表既有缓存吸收，但
+   `PORTAL_CACHE_CONTAINERS_TTL_MS = 0`（合法的"不缓存"取值）时，每个
+   `/api/metrics/catalog` 与每个服务类 `/api/metrics/history` 都会真的跑一遍服务发现。
+   这是**有意的**安全优先取舍，不是疏漏；若将来要优化，**不能**用"给可见性加 TTL"的办法。
+5. **`docs/sprint2-implementation-spec.md` §3.1 的方法签名清单已过期**（仍写着
+   `availableTargets / resolveTarget / catalog` 的同步形态）。冻结规格本轮未改，
+   已记入 `todo.md`；`03-server-modules.md` 与 `04-api-contract.md` 按实现为准。
+6. **未在本轮复核的既有台账**：`README.md` 的测试规模数字仍是 Sprint 2 提交时的值
+   （本轮新增 2 个测试文件、新增 21 条用例：13 + 4 + 4），且 `03-server-modules.md` 里
+   `metricsSampler.test.ts` 等既有条目的条数未逐个重数。已记入 `todo.md`。
+
 
 

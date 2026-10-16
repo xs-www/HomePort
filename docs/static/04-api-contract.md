@@ -510,6 +510,30 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
 **本域没有写接口**：`POST /api/metrics/history` → `404` —— 采样是后台单例（`BackgroundScheduler`）的事，
 不开放给前端触发。
 
+#### 可见性语义（S2 验收驳回修复后必须遵守的不变量）
+
+> **hidden / 已删除的服务，对任何已登录会话（viewer **与** admin）都不可枚举、不可查询，
+> 且不泄漏其存在性。** 这条不变量在**读取侧**也强制，不只是采集侧。
+
+| 规则 | 具体表现 |
+| --- | --- |
+| 采集侧（既有） | 采样固定 `role: 'viewer'` —— 隐藏之后不再产生新样本 |
+| **读取侧（本轮新增）** | `catalog.targets` 与 `history` 的 target 闸门都按**当前** viewer 可见服务集合过滤（`MetricsSampler.visibleServiceRefs()`）。**隐藏之前**已落库的历史行与进程内 `liveTargets` 一并失效：行还在库里，但读不到 |
+| 不可枚举 | 隐藏后 `catalog` 里该 target 的 `target` 与 `targetLabel` 都消失，**整个响应体里连服务名都不出现**；`metrics[].availableTargets` 同步减 1（不是显示一个选不中的数量）。`storage` 响应本来就不含 target 名 |
+| 不可查询 | `history` 对它返回 `400 VALIDATION_FAILED` |
+| **不泄漏存在性** | 被隐藏/删除的目标与"**从未采集过**的陌生 target"返回**逐字段、逐字节一致**的 400：`error.details.targetPattern` 相同、`error` 的键集合相同、没有 `reason` / `visibility` / `hidden` 之类的区分字段。测试的判定方式是"抹平调用者自己传入的 target 串后整段响应体 `toBe` 相等" |
+| **没有 404 / 403** | 刻意为之：404 或 403 等于向调用者承认"这个目标存在，只是你看不到"。**任何存在性信号都不给** |
+| 不做角色特例 | admin 与 viewer 拿到的是同一套可见集合：admin 打这个接口也看不到 hidden 服务的历史（门户的"隐藏"是服务层的展示意图，与登录角色无关；要改可见性请走 `PATCH /api/services/:id`） |
+| 宿主/磁盘不受影响 | `host` / `disk:<label>` 不属于任何服务，不查注册表、响应与可见性改动前逐字一致（`host.memory.used_bytes` 等照常返回） |
+| 隐藏不等于删除数据 | 重新设为可见后，同一 target 的历史点、`summary`、`gaps` **与隐藏前逐字段相同** —— 访问受控，行从未被删 |
+| 注册表读失败时 | **fail-closed**：服务/容器类 target 一律视为不可见（宁可少列一个也不泄露一个）；宿主与磁盘指标仍照常返回 |
+
+**代价（照实记）**：可见性**刻意不做任何缓存**（源码注释：任何 TTL 都是泄漏窗口），
+因此每次 `catalog` 与每次针对服务/容器 target 的 `history` 都会查一次服务注册表。
+默认 `PORTAL_CACHE_CONTAINERS_TTL_MS = 2000` 时这一次读被服务注册表既有的 TTL 缓存吸收
+（不产生 Docker 调用，并发读由 single-flight 合并）；该 TTL 允许设为 **0（不缓存）**，
+那时每次读都会真的跑一遍服务发现。
+
 | 接口 | 权限 | 说明 |
 | --- | --- | --- |
 | `GET /api/metrics/catalog` | viewer | 指标目录 + 可用 target + range 表 + 采样/调度状态；前端据此渲染选择器 |
@@ -559,6 +583,10 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
   "磁盘用了 900GB"都是原始事实，不会因为某处除了一个总数而悄悄变成另一个量纲。
 - `targets` = "库里出现过的行" ∪ "本进程刚采到但还没落库的"；后者的 `lastSeenAt` 为 `null`。
   target 形态与 `targetKind` 对应：`host` / `disk:<label>` / `container:<sourceRef>` / `service:<sourceRef>`。
+- `targets` **再按当前 viewer 可见性过滤**（见上文"可见性语义"）：不可见服务的 `target` 与
+  `targetLabel` 都不出现，`metrics[].availableTargets` 同步减少。只有候选里**真的存在服务/容器类
+  target** 时才会去查注册表 —— 纯宿主/磁盘的目录完全不触碰服务层（例如没有 Docker 的环境，
+  响应与改动前逐字节一致）。
 - `scheduler` 可以是 `null`（装配方没接调度器）。`running: false` **不等于"没在采"**：
   `backgroundJobs: false` 的测试里调度器被构造但定时器没起，手工 `tick()` 照样落库。
 - `containerLimit` 为 `0` 时 `containerNote` 换成"完全不采容器指标（宿主与磁盘指标不受影响）"。
@@ -571,7 +599,7 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
 | 参数 | 取值 | 说明 |
 | --- | --- | --- |
 | `metric` | 8 个指标键之一 | 未知 → `400`，`details.allowed` 给出**全部 8 项**（前端可直接渲染候选） |
-| `target` | `host` / `disk:<label>` / `container:<sourceRef>` / `service:<sourceRef>` | 形态不匹配或**从未出现过** → `400`；后者另带 `details.targetPattern`，好让用户知道该指标要的是哪种 target |
+| `target` | `host` / `disk:<label>` / `container:<sourceRef>` / `service:<sourceRef>` | 形态不匹配、**从未出现过**或**当前不可见** → 一律 `400`；后两者另带 `details.targetPattern`，好让用户知道该指标要的是哪种 target。**"被隐藏"与"从未采集过"的响应完全一致**（见下文可见性语义），没有 404/403 |
 | `range` | `1h` / `24h` / `7d` / `30d` | 未知 → `400`，`fieldErrors.range` 写明"只能是 1h / 24h / 7d / 30d" |
 
 → `200`
@@ -605,6 +633,12 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
 - `source` 是**本进程最近一次采集**该指标的数据源状态；重启后还没采过时返回
   `{ "available": false, "mode": "none", "detail": "本进程尚未采集到该指标的数据源状态（重启后需要一次采样）" }`
   —— 宁可说"这次没采到"，也不假装可用。
+- **可见性校验发生在任何存在性查找之前**（`resolveTarget` 的闸门顺序：形态 → 可见性 → 存在性）。
+  因此"库里曾经有过"不构成存在性证据；被隐藏/已删除的服务与陌生 target 得到同一个 400。
+  逐字节一致性由 `server/tests/metricsVisibility.test.ts` 覆盖
+  （真实 `buildApp()` + 真实会话 Cookie + 真实 CSRF + 真实 SQLite；夹具是**真的采集**：
+  建手工服务 → 健康判定 → 采样落库 → 隐藏 → 断言 catalog/history/storage 都不再泄漏，
+  恢复可见后曲线与隐藏前逐字段相同）。
 - 本接口是**手工校验**三个参数（不是 zod `.strict()`），因此多传的未知查询参数被忽略、不会 `400`；
   对比 `GET /api/alerts/events` 用的是 `.strict()`。两条路由的写法不同，不要互相推断。
 
@@ -701,6 +735,19 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
 - `probe.intervalSec = 0` 表示关闭自动 HTTP 探测（此时只评估容器维度，`http` 维保持 `unknown`）。
 - **监视器由 `app.ts` 构造一次**（与调度器共用同一实例），本路由只读它的内存状态：
   在这里 `new` 一个 `HealthMonitor` 会产生第二条探测循环，把宿主服务探两遍。
+- **可见性语义（S2 验收驳回修复）**：`services[]` 只包含**当前 viewer 可见**的服务。
+  hidden / 已删除的服务不在列表里，它的 `label`（服务名）、`sourceRef`、`verdict` 与
+  `reasons` 一并消失 —— **整个响应体里连服务名都不出现**。
+  与 `/api/metrics/*` 一致：**没有 404 / 403，也不给任何"存在但不可见"的区分字段**
+  （本接口是"视图"，不可见即不在视图里；调用者无法据此判断某服务是被隐藏了还是从来不存在）。
+  admin 与 viewer 看到的是同一份被过滤后的视图。
+  - 三条实现细节（决定了边界行为）：**成功读到空列表 = 用户把服务全隐藏/全删了** → 状态与
+    服务名**一起清空**（旧实现只在非空时清理，导致旧名字永久残留 —— 这就是被驳回的 P1）；
+    **读取失败**（`list()` 抛错，或响应缺 `items` 数组）→ 旧状态与服务名**原样保留**，
+    原因写进 `notes`（取数抖动 ≠ 服务消失）；**读路径再拦一道**
+    （`states()` / `state()` / `view()` 都过同一个可见集合，写路径将来出问题也不会漏名字）。
+  - `state(ref)` 对不可见 ref 现在返回 `null`（**语义收紧**，此前会返回内存里的旧状态）。
+  - 宿主/磁盘类指标不经过注册表，因此不受影响。
 - 装配方没把监视器传进来时 → `503 UPSTREAM_UNAVAILABLE`（"健康监视器尚未装配"）。
   **不返回空列表**：空数组会被读成"全部健康 / 没有服务"。
 - admin 与 viewer 拿到的是同一份视图（纯只读，无角色差异）。

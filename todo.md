@@ -166,6 +166,39 @@
 - [x] 顺带修掉两个真缺陷：设置分组 `groupList()` 手抄副本漏了 metrics/health（导致设置页少渲染 6 个键）；
       `ContainerSummary` 未映射 `State.ExitCode`（导致"容器异常退出"规则名不副实，只有 `dead` 能触发）
 
+#### Sprint 2 验收驳回修复（三个 P1，已修；改动见 `09-changelog.md` 最后一条）
+
+- [x] **P1-1 健康监视器泄漏隐藏服务**：`if (tracked.length > 0) dropStaleStates(...)` 让"**成功读到空列表**"
+      （= 用户把服务全隐藏/全删）永不 reconcile，旧状态与**旧服务名**永久留在
+      `GET /api/health/monitor`。修法：`loadServices()` 返回带 `ok` 判别位的 `ServiceListViewResult`
+      （`list()` 抛错 / 响应缺 `items` = 读失败；正常返回**含空 `items`** = 读成功）——
+      **不靠"数组是否为空"事后猜**；`loaded.ok` 时（**空列表也**）更新可见集合并
+      `dropStaleStates()`，且**同时删 `labelsByRef`**（名字与状态同生同灭）；读失败时旧状态与
+      `visibleRefs` 原样保留、原因进 `view().notes`。另加**读路径纵深防御**
+      （`visibleRefs` + `isVisible()`，`states()` / `state()` / `view()` 都过滤；
+      `null` = 还没成功读过则不过滤）。**语义收紧**：`state(ref)` 对不可见 ref 返回 `null`。
+      回归 4 条（`healthMonitor.test.ts`，现 21 条），含"绕过 `dropStaleStates` 直接塞回不可见状态"的
+      可区分性用例
+- [x] **P1-2 历史指标读接口绕过当前可见性**：采集侧固定 viewer 只保证"隐藏之后不再新增样本"，
+      **隐藏之前**已落库的行与进程内 `liveTargets` 仍带着服务名 → catalog 列出、history 查得到，
+      直到历史过期。修法：新增 `visibleServiceRefs()`（与采集同一个 `backgroundHostRequest(config)`，
+      **刻意不缓存 —— 注释写明"任何 TTL 都是泄漏窗口"**）、`isHostOwnedTarget()`、`targetVisible()`；
+      `availableTargets()` / `resolveTarget()` / `catalog()` 改 async 并按**当前**可见性过滤；
+      注册表读失败 **fail-closed**（服务/容器类 target 一律不可见，宿主/磁盘不受影响）；
+      `resolveTarget()` 在**任何存在性查找之前**先过可见性 → "被隐藏"与"从未采集过"返回**同一条**
+      400 `VALIDATION_FAILED` + `targetPattern`（**没有** 404/403，也没有任何区分字段）。
+      回归 13 条（新增 `metricsVisibility.test.ts`，全走 `buildApp()` + `app.inject()` 真实路由与鉴权，
+      夹具是真的采集；判别力实测：临时关掉过滤 → 6 条变红）
+- [x] **P1-3 服务端测试依赖墙钟**：`schedulerIntegration.test.ts` 原
+      `BASE = minuteStart(Date.now()/1000) - 3600` **必然横跨一个整点**（实测 `10 === 5`）；
+      `metricsApi.test.ts` 用 `Date.now()` 取 T0 并用墙钟推导保留截止时刻。修法：两条线改用**固定 epoch
+      `1_700_000_000`**（`BASE = hourStart(EPOCH) + 15min`；`vi.setSystemTime`）+
+      **三个数据源全部换成注入假夹具**（序列数因此是确定值，断言从区间收紧为等号），
+      每个"本该没有 hour 行"的地方显式断言 `hoursRolledUp === 0`，并**新增跨整点用例**
+      （22:59:30 → 23:00:30）。另新增守卫 `clockBoundary.test.ts`（4 条）：扫源码禁止这两个文件出现
+      `Date.now(` / `new Date(` / `performance.now(`，要求同一个 `EPOCH` 与三个注入点，
+      文件缺失或为空时必须失败
+
 ### 前端
 - [x] React 19 + Vite 6 + Tailwind 4 + React Router 7
 - [x] 类型化 API 客户端（CSRF 自动注入、401 回调、超时）
@@ -362,6 +395,43 @@
       与"分钟落库"在算术上不可兼得（真实是 60 次 flush + 1 次 rollup = 61 次/小时）。
       已加勘误块并改为机器可证的三条判据。**验收判据必须能被一条命令证伪**，
       否则它只是措辞
+
+### Sprint 2 验收驳回修复的未做项与残留风险（照实记录）
+
+- [ ] **`visibleServiceRefs()` 的 fail-closed 分支没有单测**：现有用例都走"真隐藏 / 真删除 →
+      `visible` 是集合"的路径；"注册表抛错 → 服务/容器类 target 全部不可见、宿主与磁盘不受影响"
+      只有实现与注释，**没有可区分性证明**。补法：注入一个抛错的 registry 走真实路由断言
+      catalog 不含服务类 target、host 仍返回
+- [ ] **告警读接口未按可见性过滤（同类泄漏面的残留）**：`/api/alerts/events`、`/api/alerts/summary`
+      返回的 `target`（`service:<sourceRef>` / `container:<sourceRef>`）与 `target_label`
+      是**触发时**写进 `alert_events` 的，不随可见性变化 → 隐藏前产生的告警事件仍会带出服务名。
+      另有一条后果：隐藏后 `health.states()` 不再包含该服务，而引擎的既有语义是
+      "目标不在快照里 → 不动，不假恢复"，于是它的未恢复告警**停在未恢复状态**。
+      本轮范围只覆盖 `/api/metrics/*` 与 `/api/health/monitor`。
+      修法与 metrics 侧同形（读时按当前可见集合过滤 `target` / `target_label`，或只给聚合计数），
+      但**必须先决定"隐藏服务的未恢复告警算不算还在故障"** —— 那是产品语义，不只是过滤
+- [ ] **`state(ref)` 语义收紧的连带影响需一起看**：`MetricsSampler.verdictOf` 是
+      `health.state(ref)?.verdict ?? 'unknown'`，因此"不可见"在采样侧表现为 `unknown` → 该 tick
+      不产生样本（方向安全：宁缺测不写 0）；`AlertEngine` 快照用 `health.states()`，
+      隐藏服务从快照消失（即上一条的"停在未恢复"）。**改任一处都要一起看**
+- [ ] **每次读都查一次注册表的代价**：`visibleServiceRefs()` 刻意不缓存（"任何 TTL 都是泄漏窗口"）。
+      默认 `PORTAL_CACHE_CONTAINERS_TTL_MS = 2000` 时由服务注册表既有的 TTL 缓存吸收
+      （不产生 Docker 调用 + single-flight 合并并发），但该 TTL 允许设为 **0（不缓存）**，
+      那时每个 `/api/metrics/catalog` 与每个服务类 `/api/metrics/history` 都会真的跑一遍服务发现。
+      若将来要优化，**不能**用"给可见性加 TTL"的办法（那就把泄漏窗口换回来了），
+      只能从"读路径是否需要全量服务视图"入手
+- [ ] **`docs/sprint2-implementation-spec.md` §3.1 的方法签名清单已过期**：仍写着
+      `availableTargets / resolveTarget / catalog` 的同步形态（实现已改 async 并多一层可见性校验）。
+      冻结规格本轮**未改**（按"实现为准"归档在 `03-server-modules.md` 与 `04-api-contract.md`），
+      是否回填规格由下一轮决定
+- [ ] **`README.md` 的测试规模数字未随本轮更新**：本轮新增 2 个测试文件
+      （`metricsVisibility.test.ts` 13 条、`clockBoundary.test.ts` 4 条）与 4 条 `healthMonitor` 用例，
+      即 **+2 文件 / +21 用例**；README 里的数字仍是 Sprint 2 提交时的值。
+      另：`03-server-modules.md` §5 既有条目的用例数（如 `metricsSampler.test.ts`）本轮未逐个重数
+- [x] **归档完成度**：三个 P1 的实现 / 契约 / 安全 / 变更记录已分别落到
+      `03-server-modules.md`、`04-api-contract.md`、`06-security.md`、`09-changelog.md`，
+      并在 `IMPLEMENTATION_REPORT_S2.md` 新增一节（现象 / 根因 / 修法 / 验证证据 +
+      修正被本轮推翻的表述）
 
 ## 环境备忘
 

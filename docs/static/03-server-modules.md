@@ -623,7 +623,7 @@ Sprint 2 的"轻量历史监控"。六层严格分开，**副作用只出现在 
 | `buckets.ts` | 纯函数 + **唯一写入点** | `MINUTE_SECONDS` `HOUR_SECONDS` `HOUR_EXPECTED_MINUTE_ROWS` `minuteStart` `hourStart` `alignTo` `expectedSamples` `isPartial` `BucketAccumulator` `accumulatorKey` `addSample` `takeEnded` `BucketWriteInput` `accumulatorToRow` `HourAggregate` `hourValue` `hourAggregateToRow` `MetricBucketRow` `MetricBucketsRepository` `combineWriteResults` |
 | `collector.ts` | 纯函数（无 I/O、无时钟） | `HOST_TARGET` `HOST_TARGET_LABEL` `verdictToRatio` `collectHostSamples` `collectContainerSamples` `collectServiceSamples` `mergeCollections` `collectionOf` `containerSource` `containersWithStats` |
 | `history.ts` | 纯函数 | `bucketAtToIso` `METRIC_RANGES` `isMetricRange` `rangeSpec` `resolutionForRange` `rangeWindow` `expectedBucketsIn` `samplingNote` `bucketToPoint` `countGaps` `summarizeBuckets` `unknownSource` `BuildHistoryInput` `buildHistoryView` |
-| `sampler.ts` | 编排（内存累积 + 落库 + 滚动 + 清理） | `MetricsDeps` `FlushResult` `RollupResult` `BASELINE_SERIES_PER_MINUTE` `METRIC_BYTES_PER_ROW` `STEADY_STATE_BUDGET_BYTES` `estimateBudget` `MetricsSampler` |
+| `sampler.ts` | 编排（内存累积 + 落库 + 滚动 + 清理）**+ 读路径可见性过滤** | `MetricsDeps` `FlushResult` `RollupResult` `BASELINE_SERIES_PER_MINUTE` `METRIC_BYTES_PER_ROW` `STEADY_STATE_BUDGET_BYTES` `estimateBudget` `MetricsSampler` |
 | `scheduler.ts` | 编排（后台单例，见下） | `DEFAULT_SCHEDULER_INTERVAL_MS` `MIN_SCHEDULER_INTERVAL_MS` `SchedulerDeps` `TickSummary` `BackgroundScheduler` |
 
 **指标目录（`METRIC_CATALOG`，8 个 key）** —— `key` 是稳定标识，进库、进 URL、进前端，
@@ -648,6 +648,11 @@ Sprint 2 的"轻量历史监控"。六层严格分开，**副作用只出现在 
 `host` 要求严格等于 `'host'`；其余要求以 `disk:` / `container:` / `service:` 开头**且前缀后非空**。
 "是否出现过"由 `MetricsSampler.resolveTarget()` 负责 —— 两件事分开，是因为
 "格式对但库里没有"与"格式就不对"要给前端不同的提示。
+
+> **S2 验收驳回修复后，读路径的闸门顺序是「形态 → 当前可见性 → 存在性」**（见下"读路径的可见性"）：
+> `resolveTarget()` 在**任何存在性查找之前**先过可见性。顺序本身就是契约 ——
+> 若先查存在性，"库里曾经有过"就已经是"这个服务存在"的证据（哪怕最后仍返回 400，
+> 时序上也可以被时间差或日志观察到）。
 
 **`buckets.ts` —— 桶语义与"为什么缺测不写 0"**
 
@@ -736,15 +741,52 @@ UPSERT 语句是 `INSERT … ON CONFLICT(resolution, metric, target, bucket_at) 
 | `rollupHours` | `(now) => RollupResult` | 构造后**第一次调用必然执行**（用于补齐停机期间的整点） |
 | `prune` | `(now) => number` | 返回删除行数；只 `DELETE`，不做 `VACUUM`（空闲页留给后续写入复用） |
 | `lastTick` | `() => MetricsTickResult \| null` | 供 `/api/metrics/storage` 透出 |
-| `availableTargets` | `() => MetricTargetView[]` | 库中出现过的 + **本进程刚采到但还没落库**的（后者 `lastSeenAt: null`） |
-| `resolveTarget` | `(metric, target) => string \| null` | 形态对且**确实出现过**才返回标签；未知 → `null`（API 层转 400） |
-| `history` | `({ metric, target, targetLabel, range }) => MetricHistoryView` | 一次 SELECT + 纯函数组装 |
-| `catalog` | `(scheduler?) => MetricCatalogView` | 目录 + 可用 target + range 表 + 采样状态 |
-| `storage` | `() => MetricStorageView` | 行数 / 文件占用 / 时间边界 / 保留配置 / 预算 / 最近一次采样摘要 |
+| `availableTargets` | `() => Promise<MetricTargetView[]>` | 库中出现过的 + **本进程刚采到但还没落库**的（后者 `lastSeenAt: null`），**再按当前 viewer 可见性过滤**（见下） |
+| `resolveTarget` | `(metric, target) => Promise<string \| null>` | 形态对、**当前可见**且**确实出现过**才返回标签；未知/不可见 → `null`（API 层转同一种 400） |
+| `history` | `({ metric, target, targetLabel, range }) => MetricHistoryView` | 一次 SELECT + 纯函数组装。**不做可见性校验** —— 校验是 `resolveTarget` 的职责，路由层保证先解析后查询 |
+| `catalog` | `(scheduler?) => Promise<MetricCatalogView>` | 目录 + 可用 target + range 表 + 采样状态（target 已过滤） |
+| `storage` | `() => MetricStorageView` | 行数 / 文件占用 / 时间边界 / 保留配置 / 预算 / 最近一次采样摘要。**不含任何 target 名**，所以不需要过滤 |
 
 `MetricsTickResult`：`at`（ISO）、`collected`（本 tick 接受的样本数）、
 `samplesWritten`（= flush 的 samples 之和 + rollup 的 samples 之和）、
 `bucketsFlushed`、`hoursRolledUp`、`pruned`、`gaps`、`errors[]`。
+
+**读路径的可见性（S2 验收驳回修复，P1）** —— 新增的三个私有成员是这条不变量的全部实现：
+
+| 成员 | 签名 | 说明 |
+| --- | --- | --- |
+| `visibleServiceRefs` | `() => Promise<ReadonlySet<string> \| null>` | `registry.list(hostRequest, {}, 'viewer')` → 可见服务的 `sourceRef` 集合。**读失败返回 `null`**（调用方按 fail-closed 处理）。`hostRequest` 与采集用的是同一个 `backgroundHostRequest(config)` |
+| `isHostOwnedTarget` | `(metricKey) => boolean` | `metricByKey(metricKey)?.targetKind` ∈ `{host, disk}` 即为宿主自身。**metric key 不在目录里（契约变更后的历史行）按"非宿主"处理 = fail-closed** |
+| `targetVisible` | `(metricKey, target, visible) => boolean` | 宿主/磁盘恒 `true`；服务/容器类要求 `service:<sourceRef>` / `container:<sourceRef>` 命中**当前**可见集合；`visible === null` 一律 `false` |
+
+三条为什么（照实记录，含代价）：
+
+1. **契约边界：读失败 ≠ 读空**。`visibleServiceRefs` 返回 `null` 而不是空集合，
+   是因为"注册表不可用"与"一个可见服务都没有"必须给出相反的结论
+   （前者 fail-closed 拒绝全部服务类 target，后者本来就该是空的）。
+   把两者都写成 `Set()` 会让"注册表抖动"表现为"服务全被隐藏"。
+2. **fail-closed**：`visible === null` 时**服务/容器类 target 一律不可见**。
+   宁可少列一个也不泄露一个 —— 可见性是 `services.visibility` 这一行 DB 事实，
+   读不到它就没有任何依据把名字发出去。
+3. **刻意不缓存（任何 TTL 都是泄漏窗口）**：`visibleServiceRefs()` **每次都真的查一次注册表**，
+   不复用 `TtlCache`、也不把结果留在成员变量里。理由写在源码注释里：
+   可见性是 DB 事实，加缓存只会把"隐藏"的生效时刻推迟到 TTL 之后，
+   而这段延迟恰恰就是泄漏窗口 —— 用一个可观测的泄漏窗口去省一次列表读，是拿安全换性能。
+   **代价（照实记）**：`GET /api/metrics/catalog` 与每一次针对服务/容器 target 的
+   `GET /api/metrics/history` 都会走一次 `registry.list()`。默认
+   `PORTAL_CACHE_CONTAINERS_TTL_MS = 2000` 时这次读由服务注册表**既有的** TTL 缓存吸收
+   （不产生 Docker 调用，`TtlCache` 的 single-flight 还会把并发读合并成一次）；
+   但该 TTL 允许被设成 **0（= 不缓存）**，那时每次读都会真的跑一遍服务发现
+   （`list` + `inspect` 容器）。这是有意的取舍，不是疏漏。
+4. **两个短路条件**：`availableTargets()` 只在候选里**真的存在非宿主 target**时才查注册表
+   （纯宿主/磁盘的目录完全不触碰服务层，行为与改动前逐字节一致）；
+   `resolveTarget()` 对宿主/磁盘 target 也直接跳到标签查询。
+5. **不可见与"从未出现过"必须是同一个返回值**：`resolveTarget()` 对两者都返回 `null`，
+   路由层据此产出**逐字段一致**的 400（`VALIDATION_FAILED` + `targetPattern`）。
+   没有 404/403，也没有任何区分字段（`reason` / `visibility` / `hidden`）——
+   只要响应里多一个字段，就等于承认"这个 target 存在但你无权看"。
+   `server/tests/metricsVisibility.test.ts` 用"抹平调用者自己传入的 target 串后整段响应体
+   `toBe` 相等"钉住这一点（逐字节，不是逐字段）。
 
 > **"为什么是内存累积 + 分钟落库"**：曲线的最小分辨率就是一分钟，
 > 同一分钟里的所有样本最终只会变成一行。若每 tick 写库，30s 间隔下就是 120 次写事务/小时，
@@ -936,16 +978,54 @@ evaluateHealth(previous, signal, { failThreshold, okThreshold, at }): ServiceHea
 | 成员 | 签名 | 说明 |
 | --- | --- | --- |
 | `tick` | `(now: number) => Promise<HealthTickResult>` | `now` 毫秒或秒都行（经 `toEpochMs`）。返回 `{ at, evaluated, probed, skippedForConcurrency, failures }` |
-| `states` / `state` | `() => ServiceHealthState[]` / `(sourceRef) => ServiceHealthState \| null` | 按 `sourceRef` 稳定排序 / 单个 |
+| `states` / `state` | `() => ServiceHealthState[]` / `(sourceRef) => ServiceHealthState \| null` | 按 `sourceRef` 稳定排序 / 单个。**读路径同样受可见集合约束**：不在最近一次成功读取的可见集合里 → `states()` 过滤掉、`state(ref)` 返回 `null`（不再是"能读到旧状态"） |
 | `probeStats` | `() => HealthProbeStats` | `{ intervalSec, concurrency, inFlight, lastRunAt, probedThisTick, skippedForConcurrency }` |
-| `view` | `() => HealthMonitorView` | `GET /api/health/monitor` 的响应体（比规格的类方法表多一个 `view()`：路由层不该知道标签从哪来，降级原因必须与判定结论出现在同一个响应里） |
+| `view` | `() => HealthMonitorView` | `GET /api/health/monitor` 的响应体（比规格的类方法表多一个 `view()`：路由层不该知道标签从哪来，降级原因必须与判定结论出现在同一个响应里）。`services` 走 `states()`，因此**同样经过可见性过滤** |
 
 一次 `tick` 的顺序：取服务（`registry.list(request, {}, 'viewer')`）→ 按 `sourceRef` 排序 →
-取容器快照 → 决定探测名单 → 探测 → **逐服务评估恰好一次** → 丢弃已消失的服务状态。
+取容器快照 → 决定探测名单 → 探测 → **逐服务评估恰好一次** → **成功读取时**更新可见集合并丢弃已消失的服务状态。
+
+**成功读到空列表必须清理（S2 验收驳回修复，P1）**
+
+| 新增内部成员 | 签名 | 说明 |
+| --- | --- | --- |
+| `ServiceListViewResult` | `{ ok: true; views: ServiceView[] } \| { ok: false; views: [] }`（**未导出**，仅本文件） | 服务列表的读取结果，用 `ok` 判别位承载"读失败"与"成功读到空列表"的区别 |
+| `visibleRefs` | `Set<string> \| null`（私有字段） | 最近一次**成功读取**到的可见服务集合（viewer 视角）。`null` = 还没有成功读过，此时读路径**不做过滤**（无数据可漏）。读失败时保持上一次的集合不变 |
+| `isVisible` | `(sourceRef) => boolean`（私有） | `visibleRefs === null \|\| visibleRefs.has(sourceRef)` |
+
+`loadServices()` 的返回值从 `ServiceView[]` 变成 `ServiceListViewResult`，三条分支：
+
+| 情况 | `ok` | 旧状态与 `labelsByRef`（服务名） | 原因进 `notes` |
+| --- | --- | --- | --- |
+| `list()` 抛错 | `false` | **原样保留**（取数抖动 ≠ 服务消失；清空会抹掉连续失败计数、故障期告警随之消失） | `服务列表不可用：<原因>` |
+| `list()` 正常返回但**响应缺 `items` 数组**（契约破损） | `false` | 原样保留（**不能把响应错误当成用户意图**） | 同上（`服务列表响应缺少 items 数组`） |
+| `list()` 正常返回（**含空 `items`**） | `true` | **按 `tracked` 全清**：`visibleRefs` 更新为新集合；`dropStaleStates()` 把不在集合里的 `statesByRef` **与 `labelsByRef`** 一起删 | 不再出现"服务列表不可用"；`services` 为空时另有 `还没有可监测的服务` |
+
+**为什么 `labelsByRef` 必须一起删**（P1 缺陷的根因）：状态是判定，名字是**服务名**。
+只清 `statesByRef` 会让 `view().services` 变空，但下一次 `tick()` 之前任何读路径都可能
+从 `labelsByRef` 里把名字取出来 —— 而且只清状态时"服务名留在内存里"这件事本身
+在接口上已经不可见，等于把缺陷藏起来。名字与状态同生同灭是这条不变量的一半。
+
+**纵深防御：写路径不出错也要在读路径再拦一次。** 泄漏服务名是 P1 级问题，
+不能只靠 `dropStaleStates()` 一处保证，因此 `states()` / `state()` / `view()` 一律过
+`isVisible()`：集合为空 = 一个都不发。`server/tests/healthMonitor.test.ts` 的新用例
+**故意绕过 `dropStaleStates()` 直接往 `statesByRef` / `labelsByRef` 里塞回一个不可见的
+`docker:ghost`**，断言 `states()` / `state()` / `view()` 都不发出它 —— 这就是"读路径兜底"的
+可区分性证明（只改写路径的修法在这条用例下会红）。
+
+> **语义收紧的连带影响（照实记，未在本轮改动）**：`state(ref)` 对不可见 ref 现在返回 `null`，
+> 而 `MetricsSampler` 的 `verdictOf` 是 `this.deps.health.state(sourceRef)?.verdict ?? 'unknown'`。
+> 于是"服务已不可见但监视器里还留着它的状态"这种情况，采样侧拿到的是 `unknown` →
+> `verdictToRatio('unknown') = null` → **该 tick 不产生样本**（不是写 0）。方向是安全的
+> （宁缺测不伪造 0%），但它把两个模块的可见性口径绑在了一起：监视器"读不到"与
+> "服务被隐藏"在采样侧不再可分辨。`AlertEngine` 的快照用 `health.states()`，
+> 同理 —— 隐藏服务会从告警快照的 `services[]` 里消失，未恢复的 `service_health` 告警
+> 因此**停在未恢复状态**（引擎的既有语义是"目标不在快照里 → 不动，不假恢复"）。
+> 这是可见性收紧的预期代价，已记入 `todo.md`。
 
 | 行为 | 口径与边界 |
 | --- | --- |
-| 服务列表 | `role: 'viewer'` —— **hidden 服务不纳入监控**。hidden 是用户"我不想看到它"的明确表达，后台继续采它的健康指标并把名字写进 `/api/health/monitor` 等于绕过用户的隐藏 |
+| 服务列表 | `role: 'viewer'` —— **hidden 服务不纳入监控**。hidden 是用户"我不想看到它"的明确表达，后台继续采它的健康指标并把名字写进 `/api/health/monitor` 等于绕过用户的隐藏。返回值必须带 `ok` 判别位（**读失败 ≠ 成功读到空**，见下） |
 | 容器维 / docker health 不额外发请求 | 用 `containers.list({ all: true, stats: false })` 的结果，**自建 2s 快照缓存**（`CONTAINER_SNAPSHOT_TTL_MS`）。刻意用**注入时钟**判过期，而不是 `util/cache.ts` 的 `TtlCache`（后者读真实 `Date.now`）—— 否则测试里"推进时钟"对缓存不生效，TTL 行为无法确定性验证 |
 | 容器列表取不到 | 返回 `null` → 容器维与 docker health 都退化为 `unknown`。**不拿过期快照冒充现状**：用几分钟前的状态说"容器还在跑"比承认"不知道"更危险 |
 | HTTP 探测节流 | 每个服务距上次**真的探过**不足 `intervalSec` 就不探。失败也算"探过"（避免打爆故障目标）。`intervalSec = 0` → **完全不探测**（名单为空）但仍评估容器维 |
@@ -954,8 +1034,8 @@ evaluateHealth(previous, signal, { failThreshold, okThreshold, at }): ServiceHea
 | 探测实现 | 生产由 `app.ts` 注入 `(target, options) => runHealthProbe({ target, timeoutMs })` —— SSRF 拒绝清单、3s 超时、16KB 响应体上限全在 `healthProbe.ts` 里，**不要复制一份探测逻辑** |
 | 三维信号组装 | `target === null` → `http = 'unknown'` + detail `未配置健康检查目标，不探测`；本轮探到了 → 按结果 `ok`/`fail`；**被节流（或没排上）→ 沿用上次 http 结论**（`details.http = '尚未探测'` 如果从没探过）。否则"没探测"会被误读成"没信号"，一次 HTTP 失败会在下一 tick 被自己的节流抹平，连续失败计数永远攒不到阈值 |
 | `probedAt` | **只有真的探了才填** —— 它决定 `lastProbeAt`，也就是下一轮的节流基准 |
-| 状态淘汰 | 仅在服务列表**非空**时执行（空列表通常意味着发现失败/Docker 刚重启，此时清空会把所有连续失败计数抹掉，故障期间的告警随之消失）。同时按 `MAX_TRACKED_SERVICES = 512` 淘汰**最久未评估**的条目，保证内存有界 |
-| 视图 notes | **不允许静默为空**：关闭自动探测、服务列表不可用、容器列表不可用、本轮有探测被并发上限推迟、还没有可监测的服务 —— 逐条写进 `notes` |
+| 状态淘汰 | **仅在服务列表读取成功时执行，且空列表也执行**（`if (loaded.ok)`）。成功 + 空 = 用户把服务全隐藏/全删了 → `statesByRef` 与 `labelsByRef` **一起**清空（只清状态会留下服务名，等于继续把 hidden 服务的名字发给 viewer —— 这正是本轮 P1）；读取失败时**完全不碰**既有状态（数据源抖动会把连续失败计数抹掉、故障期间的告警随之消失）。另外按 `MAX_TRACKED_SERVICES = 512` 淘汰**最久未评估**的条目，保证内存有界 |
+| 视图 notes | **不允许静默为空**：关闭自动探测、服务列表不可用、容器列表不可用、本轮有探测被并发上限推迟、还没有可监测的服务 —— 逐条写进 `notes`。**"成功读到空列表"不进 `服务列表不可用`**：清理 ≠ 降级 |
 | 阈值 | `view().thresholds` 恒为 `DEFAULT_FAIL_THRESHOLD` / `DEFAULT_OK_THRESHOLD`（3 / 2）一并透出：没有它前端无法解释"为什么失败 2 次还不告警"。这两个值目前**不是**可配置项 |
 
 > **与规格的一处差异**：规格的 `HealthMonitorDeps.intervalSec` / `concurrency` 写"默认读 config"，
@@ -1153,7 +1233,7 @@ episode 把"一次故障"压成一行，恢复写 `resolved_at`，静默期内�
 | `services.ts` | `registerServiceRoutes` | `/api/services/*`（写操作 handler 内 `assertAdmin`） |
 | `search.ts` | `registerSearchRoutes` `buildSearchHits` `SEARCH_DEFAULT_LIMIT` `SEARCH_MAX_LIMIT` | `GET /api/search` |
 | `users.ts` | `registerUserRoutes` `DEFAULT_AUDIT_LIMIT` | `/api/users/*` |
-| `metrics.ts` | `registerMetricsRoutes` `MetricsRouteDeps` `toSchedulerView` | `/api/metrics/*`（三个只读 GET，viewer） |
+| `metrics.ts` | `registerMetricsRoutes` `MetricsRouteDeps` `toSchedulerView` | `/api/metrics/*`（三个只读 GET，viewer；读路径按当前可见性过滤 —— 见 §2 `sampler.ts`） |
 | `alerts.ts` | `registerAlertRoutes` `AlertRouteDeps` `AlertRoutesContext` `composeAlertSummary` | `/api/alerts/*`（读 viewer，写 handler 内 `assertAdmin`） |
 | `healthMonitor.ts` | `registerHealthMonitorRoutes` `HealthMonitorLike` `HealthMonitorRouteDeps` | `GET /api/health/monitor`（独立前缀，viewer） |
 | `index.ts` | `registerRoutes` `PROTECTED_PREFIXES` `RouteDependencies` `AlertsRouteDeps` | 总装 + 权限模型 |
@@ -1186,15 +1266,15 @@ Sprint 2 新增三个前缀：`/api/metrics`、`/api/alerts`、`/api/health/moni
 
 | 端点 | 角色 | 实现要点 |
 | --- | --- | --- |
-| `GET /api/metrics/catalog` | viewer | `metrics.catalog(toSchedulerView(deps.scheduler))`；未接调度器时 `scheduler: null` |
-| `GET /api/metrics/history` | viewer | `metric`/`target`/`range` 三个查询参数**必填**；未知 metric → 400 且 `details.allowed` 列出全部键；未知 range → 400 且在 `fieldErrors.range` 里列出允许值；未知 target（形态对但没出现过）→ 400 且 `details.targetPattern` 给出形态提示 |
+| `GET /api/metrics/catalog` | viewer | `metrics.catalog(toSchedulerView(deps.scheduler))`（**已 async**）；未接调度器时 `scheduler: null`。`targets` 由采样器按**当前** viewer 可见服务集合过滤：hidden/已删除的服务**既不出现 `target` 也不出现 `targetLabel`**，且 `metrics[].availableTargets` 同步减少（否则前端会显示一个选不中的数量） |
+| `GET /api/metrics/history` | viewer | `metric`/`target`/`range` 三个查询参数**必填**；未知 metric → 400 且 `details.allowed` 列出全部键；未知 range → 400 且在 `fieldErrors.range` 里列出允许值；未知 target（形态对但**没出现过 _或当前不可见_**）→ 400 且 `details.targetPattern` 给出形态提示。**不可见与"从未采集过"走同一条分支、产出逐字段一致的响应**：`resolveTarget` 对前者也返回 `null`，因此隐藏/已删除的目标得到与陌生 target 完全相同的 400 —— **刻意不用 404/403**（那等于承认该目标存在），也没有任何区分字段。宿主/磁盘 target 不查注册表，响应不变 |
 | `GET /api/metrics/storage` | viewer | 行数 / 文件占用 / 保留配置 / 预算 / `lastTick` |
 | `GET /api/alerts/rules` | viewer | **服务层返回裸数组，路由包成 `{ items }`** —— 层次分工，不要把包装混进服务层 |
 | `PATCH /api/alerts/rules/:id` | **admin** | `ctx.users.assertAdmin()`；请求体 zod `.strict()` + `refine(至少一个字段)`；取值域交给 `validateRulePatch`（那里知道 kind） |
 | `GET /api/alerts/events` | viewer | 查询 schema `.strict()`（拼错参数直接 400，不静默忽略）；`state` 默认 `all`、`limit` 默认 50 |
 | `POST /api/alerts/events/:id/ack` | **admin** | 幂等；已恢复的也能确认 |
 | `GET /api/alerts/summary` | viewer | `composeAlertSummary(service.summary(), deps.engine)`：`suppressed` / `evaluatedAt` **优先取引擎的真实值**，不做 `Math.max` 之类的折中（一个数只能有一个来源） |
-| `GET /api/health/monitor` | viewer | 监视器未装配时返回 **503 `UPSTREAM_UNAVAILABLE`**，而不是空列表（空列表会被误读成"全部健康"） |
+| `GET /api/health/monitor` | viewer | 监视器未装配时返回 **503 `UPSTREAM_UNAVAILABLE`**，而不是空列表（空列表会被误读成"全部健康"）。`services` 来自 `monitor.view()`（内部走 `states()`），因此**读路径同样按当前 viewer 可见集合过滤**：不可见的服务不出现在列表里，`label`（服务名）也不会出现。本路由**本轮未改动**（可见性在监视器内部落实） |
 
 **兜底守卫**：`alerts.ts` 与 `healthMonitor.ts` **各自再挂一份** viewer + CSRF 钩子。
 接线是别人的工作，万一 `PROTECTED_PREFIXES` 漏了某条前缀，最坏结果也必须是
@@ -1288,7 +1368,10 @@ registerRoutes(app, ctx, { metrics, scheduler, health, alerts: { alerts, engine:
 | `tests/modules.test.ts` | 配置解析、endpoint 解析、stats 归一化、容器映射、主机上下文、tailnet 映射、nvidia-smi 解析、SSE 帧、工具目录 |
 | `tests/auth.test.ts` | 认证流程、会话与 CSRF、角色与账号管理、接口契约（`app.inject` + 内存库） |
 
-**Sprint 2 新增**（全量时间相关用例都用**注入时钟**，禁止 `await sleep` 等真实时间）：
+**Sprint 2 新增**（全量时间相关用例都用**注入时钟**，禁止 `await sleep` 等真实时间。
+**S2 验收驳回修复后多加一条**：`schedulerIntegration` / `metricsApi` 两条装配线的起点必须是**固定 epoch**
+（`1_700_000_000`）且三个外部数据源必须换成注入夹具 —— 这两点由 `clockBoundary.test.ts` 扫源码钉住，
+因为一旦起点来自 `Date.now()`，"跑测试的真实时刻"就成了输入，同一份代码会在一天里时红时绿）：
 
 | 文件 | 覆盖 |
 | --- | --- |
@@ -1296,11 +1379,13 @@ registerRoutes(app, ctx, { metrics, scheduler, health, alerts: { alerts, engine:
 | `tests/metricsSampler.test.ts` | **一昼夜确定性仿真**（注入时钟，30s 一 tick 跑 30h）：24h 窗口每条序列恰好 1440 条 minute 桶且缺口 0；**721 tick 的 30 天整点仿真**真跑出 720 条 hour 桶（缺分钟的整点标 partial，不靠外推）；**写事务数与 tick 密度无关**（30s 与 5s 两种间隔写事务数完全相同 = **1861**，且整点那一 tick 恰好 2 次批量写 + 1 次清理）；采集中断 → 该段**无行**（gap）而不是 0；单飞 `skipped`；单 tick 耗时上界；重启（新建 sampler 复用同一 db）后历史仍在、小时桶能补 |
 | `tests/metricsHistory.test.ts` | range→resolution 映射（1h/24h 用 minute，7d/30d 用 hour）；percent 与 bytes **不混**；`count: 0` 时 summary 字段是 `null` 而非 0；`missingBuckets` / `partialBuckets` 计算 |
 | `tests/healthState.test.ts` | 26 条：连续 2 次失败仍 `degraded`、第 3 次才 `down`；中间夹一次成功则计数归零（抖动不告警）；恢复需连续 2 次全好；三维独立计数；全 `unknown` → `unknown` 且服务级计数不变；无 `healthTarget` 时 http 维固定 `unknown`；`reasons` 文案含维度与次数；首轮不做恢复去抖；秒制时间戳可识别 |
-| `tests/healthMonitor.test.ts` | 探测节流（间隔内不重复探）；**全局并发上限**（可控 pending Promise 断言在飞数 ≤ concurrency，超出的计入 `skippedForConcurrency` 并留到下一 tick）；`intervalSec = 0` 完全不探测但仍评估容器维；探测失败不清空既有状态；容器列表取不到 → 容器维 `unknown`（不拿过期快照冒充）；视图 notes 不静默为空 |
+| `tests/healthMonitor.test.ts` | 探测节流（间隔内不重复探）；**全局并发上限**（可控 pending Promise 断言在飞数 ≤ concurrency，超出的计入 `skippedForConcurrency` 并留到下一 tick）；`intervalSec = 0` 完全不探测但仍评估容器维；探测失败不清空既有状态；容器列表取不到 → 容器维 `unknown`（不拿过期快照冒充）；视图 notes 不静默为空。**S2 验收驳回修复新增 4 条**（现 21 条）：隐藏最后一个服务后**状态与服务名一起清除**（对 `JSON.stringify(view())` 断言连名字都不出现）；删除全部服务后集合为空且**不算降级**（notes 里没有"服务列表不可用"）；服务列表读取失败时**旧状态与服务名都保留**且 notes 说明原因；**读路径纵深防御**（故意绕过 `dropStaleStates` 直接塞回不可见状态，断言 `states()`/`state()`/`view()` 都不发出它） |
 | `tests/alertEngine.test.ts` | 36 条：四条规则各自的触发/不触发边界（**等于阈值不触发**；`exited` + 退出码 `0`/`null` 不触发、`dead` 触发）；服务连续失败 3 次只产生 1 条 firing、恢复产生 1 条 resolved；抖动在静默期内重开同一行（`reopen_count = 1`，不插新行）；**预置未恢复行时 tick 绝不插新行**；部分唯一索引真的生效；`enabled = 0` 不评估；duration 窗口未满不触发、途中恢复则计时清零；`suppressed` 计数；审计动作名齐全；`createAlertSnapshotSource` 单源失败只降级该部分 |
-| `tests/metricsApi.test.ts` | viewer 可读三个 GET；匿名 401；非法 `range` / 未知 `metric` / 未知 `target` → 400 且 `code = VALIDATION_FAILED`；`storage` 返回大小与保留配置 |
+| `tests/metricsApi.test.ts` | viewer 可读三个 GET；匿名 401；非法 `range` / 未知 `metric` / 未知 `target` → 400 且 `code = VALIDATION_FAILED`；`storage` 返回大小与保留配置。**S2 验收驳回修复后（14 条）改用固定 epoch + 三个注入假数据源**：`vi.setSystemTime(EPOCH * 1000)` 把被测进程的读侧时钟（`history()`/`storage()`/`availableTargets()` 都用它）钉住，`ctx.system.snapshot` / `ctx.containers.list` / `ctx.services.list` 全部换成假夹具；落库序列数是确定值（CPU 首次采样无基线 → live-only，`lastSeenAt === null`），并**显式断言本夹具不跨整点**（`hoursRolledUp === 0`、`bounds.hour` 为 `null`）—— 跨整点由 `schedulerIntegration.test.ts` 专门覆盖 |
+| `tests/metricsVisibility.test.ts`（**新增，13 条**） | 历史指标**读路径的当前可见性**（P1 回归），全走 `buildApp()` + `app.inject()` 的**真实路由 + 真实鉴权 + 真实 SQLite**：夹具是**真的采集**（建手工服务 → `health.tick()` → `metrics.tick()` ×2 落库 → 该服务同时进入 DB 行与内存 `liveTargets`）。断言：隐藏后 catalog 里 `target` 与 `targetLabel` 都不出现、**整个响应体里连服务名都不出现**、`availableTargets` 同步为 0；history 与"从未采集过的 target"**抹平 target 串后整段响应体逐字节相同**（`Object.keys(error)` 也相同），且**不是** 404/403；`admin` 会话同样看不到、同样查不到（**不做角色特例**）；`storage` 响应体不含服务名；宿主指标（`host` / `disk:*`）照常返回（过滤没有误伤）；恢复可见后曲线与隐藏前**逐字段相同**（证明行没被删，只是访问受控）；真删服务后同样查不到（历史行仍在库里）；直接插一行"曾经采过、当前无可见服务"的容器序列（`container:docker:ghost/secret-web`）同样受控 |
+| `tests/clockBoundary.test.ts`（**新增，4 条**） | 把"这两条线只许用固定 epoch"变成**可执行约定**（同 `envBoundary` / `backgroundBoundary` 手法）：扫描 `schedulerIntegration.test.ts` 与 `metricsApi.test.ts` 的源码（去注释后），出现 `Date.now(` / `new Date(` / `performance.now(` 即失败；两条线必须声明同一个 `const EPOCH = 1_700_000_000` 并写明取值"为了确定性、不是为了回避边界"（跨整点由专门用例显式覆盖）；必须把 `ctx.system.snapshot` / `ctx.containers.list` / `ctx.services.list` 三个数据源换成注入夹具。**反向保护**：受约束文件不存在或内容为空时用例必须**失败**，否则一次重命名就能让守卫退化成空断言 |
 | `tests/alertsApi.test.ts` | viewer 读规则/事件 200、**PATCH 与 ack 被 403 拒绝**；admin PATCH 成功并写审计；阈值越界 400；未知 rule/event id → 404；**缺 CSRF → 403**；`GET /api/health/monitor` 的鉴权与形状 |
-| `tests/schedulerIntegration.test.ts` | 装配级（`buildApp` 真实装配，**全程不建立任何 SSE/HTTP 客户端**）：`backgroundJobs` 决定定时器是否启动、`close()` 之后一定停掉；tick 照样把样本写进库且"报告的行数 = 实际行数"；**缺测的分钟没有行**（写 0 会被这条抓住）；重启后历史还在（同一库文件）；`tickOnce` 单飞；**告警端到端**（读数 → 判定 → 落库 → 恢复 → 静默期内重开不新增 → 审计留痕，`evaluated > 0` 是"装配漏接 snapshot"的照妖镜） |
+| `tests/schedulerIntegration.test.ts` | 装配级（`buildApp` 真实装配，**全程不建立任何 SSE/HTTP 客户端**）：`backgroundJobs` 决定定时器是否启动、`close()` 之后一定停掉；tick 照样把样本写进库且"报告的行数 = 实际行数"；**缺测的分钟没有行**（写 0 会被这条抓住）；重启后历史还在（同一库文件）；`tickOnce` 单飞；**告警端到端**（读数 → 判定 → 落库 → 恢复 → 静默期内重开不新增 → 审计留痕，`evaluated > 0` 是"装配漏接 snapshot"的照妖镜）。**S2 验收驳回修复后（7 条）**：起点由固定 `EPOCH` 推出（`BASE = hourStart(EPOCH) + 15min`，**不是** `minuteStart(Date.now()) - 3600`），三个数据源全部换成注入假夹具，序列数因此是确定值（`HOST_SERIES = 5`）—— 断言从 `toBeGreaterThan(0)` 收紧成等号；每个"本该没有 hour 行"的地方都**显式断言 `hoursRolledUp === 0`**；新增**跨整点用例**（22:59:30 → 23:00:30：22:59 落 5 行 minute、22 点滚出 5 行 hour 且 `samples = 1` / `expected = 60` / 加权均值等于唯一读数、总行数 = 5 + 5、缺口 = 5 条 partial + 0 个完全缺测的整分钟、**未结束的 23 点不许提前滚出**、同整点重复 tick 不重复滚） |
 | `tests/backgroundBoundary.test.ts` | 以**源码能力边界**钉住"默认不外发、不自动重启容器"：三个后台模块目录存在且非空（否则守卫退化成空断言）；无 `fetch(` / `node:http(s).request` / `net.connect` / 子进程 / 通知客户端；不得**值导入** `docker/service.js` / `docker/provider.js` / `dockerode`（`import type` 允许）；`healthProbe.ts` 只声明 `GET` 且不带请求体 |
 | `tests/dockerMapper.test.ts`（新增小节） | 「容器退出码（null ≠ 0）」：`exited` + `137` → `137`；`ExitCode = 0` 保留 `0`；`State` 缺失 → `null` 且 `state = 'unknown'`；`ExitCode` 字段缺失 → `null`；运行中的容器是 `0` |
 | `tests/migrationV3.test.ts` / `tests/migrationV4.test.ts`（修改） | 降级夹具补上 v5（`DROP` 三张新表 + 删 `schema_migrations` 的 5）；v4 的"迁移链末端"断言改为与 `Math.max(...MIGRATIONS.map(m => m.version))` 比对，版本号断言改成"1..4 的名字原样保留 + 之后只允许追加更大版本号 + 无重复"；`afterAll` 的临时目录清理容忍失败（Windows 上 WAL 占用会让 `rmSync` 抛 EBUSY 把真正的失败盖住） |

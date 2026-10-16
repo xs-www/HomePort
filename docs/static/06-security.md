@@ -160,8 +160,22 @@ Sprint 2 新增了三条后台任务链（历史采样、健康监测、告警�
 | 匿名 | 三条前缀都在 `PROTECTED_PREFIXES` 里（`requireRole('viewer')` + `createCsrfHook()`），匿名一律 `401`（不是空列表、不是 `404`） | "默认安全"：新增路由即使忘记加守卫，最坏结果是"需要登录"，不会匿名开放 |
 | 兜底守卫 | `api/alerts.ts` 与 `api/healthMonitor.ts` **各自再挂一份** viewer + CSRF 钩子 | 万一 `PROTECTED_PREFIXES` 漏了某条前缀，最坏也是"需要登录 + 缺 CSRF 被拒"，而不是把只读的规则与事件匿名开放出去。重复挂同一钩子是幂等的（只是多校验一次），代价远小于"漏一个前缀就对外裸奔"。有测试独立验证：`/api/alerts-unwired`、`/api/health/monitor-unwired` |
 | 后台采样视角 | 采样 `service.health.up_ratio` 时固定 `role: 'viewer'`；健康监视器取服务列表同样是 viewer 视角 | **hidden 服务不采、不监测**：否则 viewer 可读的历史接口会变成"隐藏服务名"的泄漏通道 —— 用户刻意隐藏的服务的名字不该从曲线或健康列表里冒出来 |
+| **读取侧的可见性强制（S2 验收驳回修复）** | `MetricsSampler.visibleServiceRefs()` 在**每次** catalog / 服务类 history 读时都用同一个 `backgroundHostRequest(config)` 走 `registry.list(..., 'viewer')`；不可见与"从未采集过"返回同一个 `null` → 同一个 400；健康监视器的 `states()` / `state()` / `view()` 也过同一套可见集合 | **只靠采集视角是不够的**：`role: 'viewer'` 只能保证"隐藏之后不再产生新样本"，**隐藏之前**已落库的行与进程内 `liveTargets` 仍在，会被继续列出与查询。读取侧负责把这半条补上（见下方不变量） |
 | 探测复用 | 健康探测复用 S1 的 `runHealthProbe`（GET、不跟随跳转、3s 超时、最多读 16KB、失败不重试） | 不做第二份探测逻辑，SSRF 拒绝清单与请求纪律只维护一处（见上表） |
 | 出站能力 | **零**（见下） | Sprint 2 不做任何外发通知，也不做自动修复 |
+
+**不变量：hidden 服务不得经监控/历史接口泄漏，且不得泄漏其存在性。**
+两个方向都要落实，缺一不可：
+
+| 落实侧 | 位置 | 内容 |
+| --- | --- | --- |
+| **采集侧（既有）** | `MetricsSampler.collect`（`verdictOf` 走 viewer 视角的服务列表）、`HealthMonitor.loadServices`（`registry.list(request, {}, 'viewer')`） | 隐藏之后**不再产生新的样本与判定**，名字不进新行 |
+| **读取侧（本轮新增，P1）** | `MetricsSampler.visibleServiceRefs()` / `isHostOwnedTarget()` / `targetVisible()`；`HealthMonitor.visibleRefs` / `isVisible()` | 已落库历史行与内存状态**按当前可见集合过滤**：catalog 不列、history 查不到、`/api/health/monitor` 不出现；服务名连 `labelsByRef` 一起清 |
+
+读取侧的四条硬性要求（有测试）：**fail-closed**（注册表读失败时服务/容器类 target 一律不可见）、
+**不缓存**（源码注释：任何 TTL 都是泄漏窗口 —— 代价见 `04-api-contract.md` §6.7）、
+**可见性先于存在性查找**（否则"库里曾经有过"就是存在性证据）、
+**不可见与陌生 target 的响应逐字节一致**（没有 404/403，也没有任何区分字段）。
 
 #### `backgroundBoundary.test.ts`：把"没有这种能力"变成可判定的断言
 
@@ -188,7 +202,9 @@ Sprint 2 新增了三条后台任务链（历史采样、健康监测、告警�
    （`server/src/modules/alerts/engine.ts`），**没有任何代码读它来决定发不发**。
 2. **不自动修复**：后台代码拿不到能写 Docker 的连接对象，所以"自动重启容器"这类需求
    不可能被某次重构顺手引进后台 tick —— 要引进必须先改这条测试，等于强制一次显式评审。
-3. **不泄漏隐藏服务**：采样固定 viewer 视角（见上表），历史与健康接口不会报出 hidden 服务。
+3. **不泄漏隐藏服务**：采样与监视器固定 viewer 视角（见上表），**并且读取侧也按当前可见集合过滤**
+   —— 隐藏/删除的服务既不出现在历史与监控接口里，也不因"库里曾经有行"而被查到；
+   不可见与从未出现过的目标返回**逐字节相同**的响应，因此连"它存在但被隐藏"这件事也推断不出来。
 
 ## 4. CSRF
 
@@ -415,9 +431,21 @@ connect-src 'self'; form-action 'self'; frame-ancestors 'none'`。
    （收件人、webhook 目标、凭据存放都属于新增的出站面）。
 10. **历史指标与告警读接口对 viewer 开放且没有单独限流**（S2）：viewer 可以持续拉取宿主 CPU/内存/
     磁盘曲线、服务健康判定与告警历史（含容器与服务名）。这是**有意**的取舍 ——
-    只读视图与容器/系统页同级，且后台采样固定 viewer 视角、hidden 服务不进样本（§3）；
+    只读视图与容器/系统页同级，且后台采样固定 viewer 视角、
+    **历史与健康接口在读取侧也按当前可见集合过滤**（§3 的不变量），hidden 服务不进样本也不进响应；
     但"可读"与"可高频读"是两件事，将来若把门户暴露到不可信网络，
     应在这里加按用户的读限流（现在只有登录接口限流，见 §5）。
+11. **告警读接口是同一类泄漏面上仍未收口的一块**（S2 验收驳回修复的**残留**，本轮**未**修）：
+    `GET /api/alerts/events` / `GET /api/alerts/summary` 返回 `alert_events` 行，
+    而该行的 `target`（`service:<sourceRef>` / `container:<sourceRef>`）与 `target_label`
+    在触发时由 `createAlertSnapshotSource` 填的是**服务展示名与容器名**，落库后**不随可见性变化**。
+    因此：① 隐藏某个服务**之前**已产生的告警事件，viewer 仍能从告警页读到它的名字与 target；
+    ② 隐藏之后 `health.states()` 不再包含该服务，引擎的既有语义是"目标不在快照里 → 不动，不假恢复"，
+    于是该服务的未恢复告警会**停在未恢复状态**（不会自动恢复，也不会再触发）。
+    本轮修的是 `metrics/*` 与 `health/monitor` 两条读路径（用户驳回的三条 P1 之一），
+    告警读路径**未在范围内**；两条后果都已记入 `todo.md`，修法与 metrics 侧同形
+    （读时按当前可见集合过滤 `target` / `target_label`，不可见的行要么隐藏、要么只给聚合计数）。
+    当前缓解：告警默认四条内置规则 `enabled = false`，且告警本身只有站内可见（第 9 条）。
 
 ## 10. 安全检查清单（发布前）
 
@@ -437,5 +465,8 @@ connect-src 'self'; form-action 'self'; frame-ancestors 'none'`。
 - [ ] 需要的账号已绑定两步验证，并且**恢复码已离线保存**（恢复码只显示一次）
 - [ ] 确认后台任务仍然**没有**出站能力：`npm test` 里的 `backgroundBoundary.test.ts` 全绿
       （它同时断言三个后台目录存在且非空 —— 别在重命名模块后把它变成空扫描）
+- [ ] 确认 hidden 服务不泄漏：`metricsVisibility.test.ts`（真实路由 + 真实鉴权）与
+      `healthMonitor.test.ts` 的可见性用例全绿；**新增任何返回 target / 服务名的读接口时，
+      必须照 §3 的不变量先过当前可见集合**，并补一条"不可见与陌生目标的响应一致"的断言
 - [ ] 定期检查审计日志中的 `auth.login_failed`、`auth.totp_failed`、`auth.totp_reset`、
       `alert.rule_updated`、`alert.acknowledged`
