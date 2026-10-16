@@ -771,7 +771,7 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
 | `PATCH /api/alerts/rules/:id` | **admin** + CSRF | 部分更新（只允许 6 个字段） |
 | `GET /api/alerts/events?state=&limit=` | viewer | 事件列表（episode 模型）+ **可见集合内**的全量计数（见下文"读路径的可见性语义"） |
 | `POST /api/alerts/events/:id/ack` | **admin** + CSRF | 确认（幂等；已恢复的也能确认）。响应体本轮未按可见性收口 |
-| `GET /api/alerts/summary` | viewer | 徽标用计数 + `top` + `suppressed` / `evaluatedAt`（前两组按可见性过滤，后两个取引擎真值） |
+| `GET /api/alerts/summary` | viewer | 徽标用计数 + `top` + `suppressed` / `evaluatedAt`（**所有计数含 `suppressed` 都按可见性过滤**；`evaluatedAt` 是引擎 tick 时间，不含目标、无可见性语义） |
 
 权限分两层，缺一不可：路由域在 `api/index.ts` 的 `PROTECTED_PREFIXES` 里统一挂
 `requireRole('viewer')` + CSRF 钩子；**写操作在 handler 内再 `assertAdmin`**。
@@ -787,40 +787,74 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
 `alert.fired` / `alert.reopened` / `alert.resolved`（`modules/alerts/engine.ts`），
 以及接口侧的 `alert.rule_updated` / `alert.acknowledged`。
 
-#### 读路径的可见性语义（同类泄漏第三处，本轮收口）
+#### 读路径的可见性语义（同类泄漏第三处，分两组收口：`871c3dc` + `470ac16`）
 
 > **这条不变量不止管指标**：告警事件行的 `target` / `target_label` / `message` 是**触发时落库的快照**，
 > 不随可见性变化。因此 `GET /api/alerts/events` 与 `GET /api/alerts/summary` 同样遵守上面的口径：
 > **不可枚举、不泄漏存在性、没有 404/403、没有 admin 特例、fail-closed。**
+> （`/rules` 是**配置**类接口，口径不同 —— 见下文"第二组收口"与"口径边界"。）
 
 | 规则 | 具体表现 |
 | --- | --- |
-| 读取侧强制（本轮） | 每个 `/events`、`/summary` 请求先取一次当前 viewer 可见服务集合（共享 `modules/visibility/serviceVisibility.ts` 的 `loadVisibleServiceRefs`，与 `/api/metrics/*` 是**同一个函数**、同一个 `backgroundHostRequest(config)`），再由服务层在 **SQL 层**过滤。`api/alerts.ts` **刻意不实例化 `MetricsSampler`**（避免运行时耦合） |
+| 读取侧强制（第一组） | 每个 `/events`、`/summary` 请求先取一次当前 viewer 可见服务集合（共享 `modules/visibility/serviceVisibility.ts` 的 `loadVisibleServiceRefs`，与 `/api/metrics/*` 是**同一个函数**、同一个 `backgroundHostRequest(config)`），再由服务层在 **SQL 层**过滤。`api/alerts.ts` **刻意不实例化 `MetricsSampler`**（避免运行时耦合）。**第二组另加**：`/rules` 只在 **viewer** 侧取（admin 不查注册表），`suppressed` 与 `rule.target` 用的是**同一份**可见集合 |
 | 不可枚举 | `items` 不含不可见事件；`target` / `targetLabel`（服务名、容器名）连同 `message` 一起消失 |
 | 计数同步下降 | `total` / `counts`（`open`·`resolved`·`unacknowledged`）/ `bySeverity` / `top` **全部**只统计可见集合 —— **计数本身就是存在性证据**（"未恢复从 3 掉到 2"等于告诉 viewer 少了一条什么） |
 | 先过滤再分页 | `limit` 作用在可见集合上：首页不会被不可见事件占位，不出现"看得见的事件反而翻不到" |
 | 不泄漏存在性 | 隐藏服务的事件与"**从未有可见服务**"的事件（如 `service:manual:<uuid>`）表现完全相同（都只是不出现），响应里没有任何区分字段 |
 | 没有 404 / 403 | 读接口不因"你看不到某条事件"报错，只按可见集合少返回几行 |
-| 不做角色特例 | admin 与 viewer 拿到同一套可见集合（与 §6.7 一致）：admin 打这两个接口也看不到 hidden 服务的事件；要"看全部"走管理接口（`PATCH /api/services/:id` 改可见性） |
+| 不做角色特例 | admin 与 viewer 拿到同一套可见集合（与 §6.7 一致）：admin 打这两个接口也看不到 hidden 服务的事件；要"看全部"走管理接口（`PATCH /api/services/:id` 改可见性）。**注意范围**：这条只管**事件 / 快照类**读；**配置类**的 `GET /api/alerts/rules` 自第二组收口起**区分角色**（viewer 遮蔽 `rule.target`、admin 保留真值）—— 两套口径不要互相套用 |
 | 宿主类不受影响 | `host` / `disk:<label>` 不属于任何服务 → 恒可见，字段与改动前逐字一致 |
 | fail-closed | 可见集合不可得（注册表读失败 / 装配缺 `config`·`services`）→ **服务与容器类事件一律不可见**（不是"过滤不了就不过滤"），宿主类事件照常；读接口**不因此变 5xx**（少显示几条 ≠ 整个告警页打不开） |
 | 隐藏 ≠ 删数据 | 库里的事件行**没被删、`resolved_at` 没被改**；恢复可见后同一事件（同 id / target / `firedAt`）原样回来 |
 | 引擎语义不变 | 隐藏服务**不会**假恢复（"目标不在快照里 → 不动"是引擎既有语义）："库里仍未恢复、viewer 看不见"是有意的组合语义。运维含义是：**读响应里的未恢复列表不等于库里的未恢复故障全集**，排查要走管理侧 |
 
-**本轮未收口 / 待裁定（照实记）**：
+##### 第二组收口（提交 `470ac16`）：`suppressed` 按 target 求和 + `rule.target` 仅对 viewer 遮蔽
+
+第一组（`871c3dc`）把 `/events` 与 `/summary` 的**事件快照与计数**在 **SQL 层**过滤（先过滤再 `LIMIT`）。
+第二组关掉同一类泄漏的另外两处 —— 它们的载体不是事件行（一个是**数字**、一个是**规则配置行**），
+所以第一组的写法套不上，**口径也不能互相套用**：
+
+| 位置 | 收口前 | 收口后（本轮） |
+| --- | --- | --- |
+| `GET /api/alerts/summary` 的 `suppressed` | **引擎全局总数**：隐藏 / 已删除的服务每被压掉一次都让它涨 —— **数字本身就是存在性证据**（"有个你看不见的东西在反复失败"） | 引擎改为按 target **记账**（`AlertTickResult.suppressedByTarget` 必填 / `AlertEngine.suppressedByTarget()`），读路径用 `sumSuppressedVisible()` 按**当前**可见性求和：宿主自有（`host` / `disk:<label>`）恒计入，`service:` / `container:` 必须命中可见集合，可见集合不可得（`null`）→ **只计宿主自有（fail-closed）** |
+| `GET /api/alerts/rules` 的 `rule.target` | 原样回显**隐藏 / 已删除服务**的名字（`service:<ref>` / `container:<ref>`），viewer 读一次规则列表就能把看不见的服务**枚举**出来 | **仅对 viewer 遮蔽成 `null`**；**admin 保留真值**。理由：规则是 admin 自己写的**配置**（不是触发快照），对**作者本人**遮蔽保护不了任何东西，只会让 `web/src/components/AlertRuleForm.tsx:163` 把空 target 渲染成"· 适用于全部目标"**对 admin 说假话**；该端点本就是 admin 可 PATCH / viewer 只读，角色分支与端点语义一致 |
+
+**口径边界（代码注释已写明；两处不要互相套用）**：**事件 / 快照类**接口（`/events`、`/summary`、
+`/api/metrics/*`）返回的是"触发时落库的快照"，对谁都只给当前可见的那几条 ⇒ **不分角色**；
+**配置类**接口（`/rules`）返回的是 admin 自己写的配置 ⇒ **区分角色**（只在 viewer 侧遮蔽）。
+两条口径不同是**有意的**，不是漂移。
+
+**实现口径（照实记）**：`AlertsService.rules(visible, options)` 的 `options.maskServiceTargets`
+**必填、无默认值** —— "给谁看"是裁定，默认值等于让某个调用方默认走某种口径，
+而那正是"悄悄多显示一个服务"或"悄悄对 admin 说假话"的来源。**admin 分支不查注册表**
+（传 `visible = null` 且根本不读它），免得白付一次 `registry.list`、还因注册表偶发不可用
+记一条与他无关的 warn。遮蔽成 `null`（契约里既有的"未限定目标"取值）而**不引入第三种状态**：
+`service:<hidden>` 之类等于直接承认"这里有一个你看不到的目标存在"。
+`PATCH /rules/:id` 的响应**不遮蔽**（写路径，回显的是调用方自己刚提交的配置）。
+
+**仍然未收口 / 待裁定（照实记）**：
 
 | 位置 | 为什么留着 |
 | --- | --- |
-| `GET /api/alerts/rules` 的 `rule.target` | 它是**管理员自己写的规则配置**（`PATCH /rules/:id` 的入参、按 kind 校验过前缀），不是触发快照；按可见性抹成 `null` 会让 viewer 看到一份与实际规则不一致的配置 |
-| `POST /api/alerts/events/:id/ack` 的**响应体** | admin 写路径，入参是调用方手上的随机 UUID 事件 ID；要拿到隐藏服务事件的 ID 得先有别的泄漏渠道。本轮收口范围是**读**响应 |
+| `POST /api/alerts/events/:id/ack` 的**响应体** | admin 写路径，入参是调用方手上的随机 UUID 事件 ID；要拿到隐藏服务事件的 ID 得先有别的泄漏渠道。收口范围是**读**响应 |
 
-**残留观察（照实记；截至归档提交 `871c3dc` 未处理）**：`summary` 的 `suppressed` / `evaluatedAt` 来自引擎，
-**不参与可见性过滤** —— 它们是"引擎这一轮干了什么"的进程级度量，不是"有多少条事件"。
-因此"本轮压掉了 N 次触发"这个数字仍是全量的：它不指向任何服务、不含任何名字，
-但严格说仍是一条**极弱**的旁路信号（可用性优先级：让"没有告警"可解释 ＞ 该信号的理论信息量）。
+**已知残留（照实记；本轮不修，代码注释已互相引用标注）**：`alerts/service.ts` 里同一件事
+（"这个 target 算不算宿主自有"）有**两种形态、方向相反**的判据 —— SQL 形态 `HOST_OWNED_EVENT_SQL`
+是**黑名单**（"不是 `service:` / `container:` 前缀就算宿主"），内存判据 `isHostOwnedAlertTarget`
+是**白名单**（"就是 `host` 或 `disk:` 才算宿主自有"）。于是空串 / 未知前缀（`weird:secret`）
+这类**手工脏行**：在事件列表里被**当宿主放出**，在 `suppressed` 计数与 `/rules` 的 target 上却被
+**fail-closed 剔出 / 遮蔽**。两者都保守，但方向相反 ⇒ 同一批脏行在这几处的表现可能不一致。
+要统一得先裁定"未知前缀到底算不算一个目标"。**本轮不改引擎判定**：`suppressed` 的计数与判定分支
+一行未动，episode / 静默期 / `reopen_count` / duration 门控 / "目标不在快照 → 不假恢复" 均未触碰。
+
+**顺带清理（同一提交）**：`AlertEngine.suppressedTotal()` 全仓零调用方 ⇒ **已删除**；
+`AlertsService.recordTick(result)` 原先要求 `suppressed: number` 却完全忽略它（只传总数会**静默丢计数**）
+⇒ 改为要求 `suppressedByTarget` 明细，误导签名现在**编译期**就被挡下。
 
 **代价（同 §6.7）**：可见性不做任何缓存；`summary` 徽标每 60s 轮询会各多一次 `registry.list`
 （内部走服务注册表既有的发现 / 容器 TTL 缓存，并发读由 single-flight 合并）。
+**第二组新增的代价**：**viewer** 每次 `GET /api/alerts/rules` 同样多一次 `registry.list`；
+**admin 侧不查注册表**（那条路径不读 `visible`），因此不付这份代价。
 
 ### `GET /api/alerts/rules`
 
@@ -843,10 +877,17 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
 每条规则**恰好 13 个字段**，且**不含 `createdAt`**（它是内部列，不进 HTTP 契约）。
 `kind` ∈ `disk_percent` / `memory_percent` / `container_exit` / `service_health`；`severity` ∈ `warning` / `critical`。
 
-> **`target` 不做可见性过滤（本轮未收口，见 §6.9 开头）**：它是管理员自己写的规则配置
-> （`PATCH /rules/:id` 的入参、按 kind 校验过前缀），不是"发现出来的服务名"。
-> 按可见性抹成 `null` 会让 viewer 看到一份与实际规则不一致的配置 ——
-> "这条规则到底盯的是什么"会说不清。这是**刻意的边界**，不是漏改。
+> **`target` 的可见性口径（已裁定并落地，提交 `470ac16`；见 §6.9 开头）**：
+> **仅对 viewer 遮蔽成 `null`，admin 保留真值**。它确实是管理员自己写的规则配置
+> （`PATCH /rules/:id` 的入参、按 kind 校验过前缀），但里面写的是服务的**稳定身份**
+> （`service:<ref>` / `container:<ref>`）—— 只按库里的行返回，viewer 靠规则列表就能把隐藏
+> 或已删除的服务**枚举**出来，与事件快照是同一个泄漏面，只是载体从事件行换成规则行。
+> 反向的顾虑（"遮蔽会让 viewer 看到与实际规则不一致的配置"）只在 **admin** 身上成立，
+> 而 admin 本就可 PATCH 这个端点、也可经 `includeHidden` 管理接口看到隐藏服务 ——
+> 对**作者本人**遮蔽保护不了任何东西，只会让 `AlertRuleForm.tsx:163` 把空 target 渲染成
+> "· 适用于全部目标"**对 admin 说假话**。宿主类 target（`disk:<标签>` / `host`）与 `null`
+> 在两种角色下都原样返回；响应形状（**13 个字段**）未变，遮蔽是**读时求值**（没动库里的配置，
+> 恢复可见后原样回来）。
 
 四条内置规则（`BUILTIN_ALERT_RULES`，`server/src/modules/alerts/rules.ts`；`target` 均为 `null`、
 `notifyRecovery` 均为 `true`、`builtin` 均为 `true`、**默认 `enabled` 均为 `false`**）：
@@ -946,8 +987,8 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
 - **幂等**：重复确认不改时间、不再写审计 —— 事先的"确认"没有新的信息量，
   若每次都刷新 `acknowledged_at`，"谁在什么时候先看到的"这个信息就丢了。
 - 审计：`alert.acknowledged`，`target = alert_event:<id>`。
-- **响应体本轮未按可见性过滤（未收口，待裁定）**：这是 admin 写路径，入参是调用方手上的随机 UUID
-  事件 ID，收口范围是读响应（`/events`、`/summary`）。见 §6.9 开头"本轮未收口 / 待裁定"。
+- **响应体仍未按可见性过滤（未收口，照实保留）**：这是 admin 写路径，入参是调用方手上的随机 UUID
+  事件 ID，收口范围是读响应（`/events`、`/summary`、`/rules`）。见 §6.9 开头"仍然未收口 / 待裁定"。
 - 错误：`404 NOT_FOUND`（未知事件 ID）。
 
 ### `GET /api/alerts/summary`
@@ -969,18 +1010,28 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
   （那会让每次轮询多传几 KB）。排序：`critical` 优先 → `fired_at` 倒序。
 - `bySeverity` 只统计**未恢复**且**可见**的事件；`warning` 桶的口径是 `severity <> 'critical'`
   （非 critical 全归 warning），因此 `bySeverity.warning + bySeverity.critical = open`。
-- `open` / `unacknowledged` / `bySeverity` / `top` **全部按当前可见性过滤**（与 `/events` 同一套口径）：
-  隐藏服务的事件不计入任何一个数字，`top` 里也不会出现它的 `targetLabel`。
-- `suppressed` / `evaluatedAt` 仍**优先取引擎的真实值**、**不参与可见性过滤**（它们是引擎的进程级度量，
-  不是事件计数）—— 残留观察见 §6.9 开头。
+- `open` / `unacknowledged` / `bySeverity` / `top` / **`suppressed`** 全部按当前可见性过滤
+  （与 `/events` 同一套口径）：隐藏服务的事件不计入任何一个数字，`top` 里也不会出现它的 `targetLabel`。
+- `suppressed` **按 target 明细 + 当前可见性求和**（第二组收口，提交 `470ac16`）：宿主自有
+  （`host` / `disk:<label>`）恒计入，`service:` / `container:` 必须命中可见集合，可见集合不可得（`null`）
+  → **只计宿主自有（fail-closed）**。理由与"四个计数一起过滤"完全相同：
+  **数字的涨落本身也是存在性证据**（"有个你看不见的东西在反复失败"）。
+  一个**总数**没有归因，也就没法过滤 —— 所以引擎与服务层各自只保留按 target 的明细，读路径现算。
 - `evaluatedAt` 是**上次告警引擎 tick 的时间**，引擎还没 tick 过时为 `null`
-  （不是"现在"—— 它表示这份结论有多新）。
+  （不是"现在"—— 它表示这份结论有多新）。它不指向任何目标，因此**没有可见性语义**，
+  两种角色拿到同一个值。
 - `suppressed` 是"自进程启动以来，因同一 `(rule, target)` **已有未恢复行**而未产生新通知的触发次数"（累计值）。
   **它只在那个时刻加 1**：静默期内条件再次成立是**重开**旧行，计进引擎 tick 结果的 `reopened`，
-  **不算 `suppressed`**。它的唯一来源是引擎的 `suppressedTotal()`，由 `composeAlertSummary()`
-  覆盖进响应；装配方没接引擎时退回服务层记录的值（装配期没人调 `recordTick` 时就是 `0` / `null`）
+  **不算 `suppressed`**。它的唯一来源是引擎的**按 target 明细** `AlertEngine.suppressedByTarget()`
+  （`suppressedTotal()` **已删除** —— 全仓零调用方，且一个没有归因的数字没法按可见性过滤），
+  由 `composeAlertSummary(summary, engine, visible)` 用 `sumSuppressedVisible()` 求和后覆盖进响应；
+  装配方没接引擎时退回服务层自己按 target 记的那份账（同样是明细 + 按可见性求和；
+  装配期没人调 `recordTick` 时就是 `0` / `null`）
   —— **不做 `Math.max` 之类的"折中"，一个数只能有一个来源**。
   这个字段存在的唯一理由：让"没有告警"这件事可解释 —— 是被静默压掉了，还是条件根本没成立。
+- `AlertsService.recordTick(result)` 现在**只收** `{ at, suppressedByTarget }`，**刻意不收** `suppressed`
+  总数：收一个不参与记账的数，只会让调用方以为"传总数也行"，而那正是**静默丢计数**
+  （数字看着在动，viewer 的 `suppressed` 却纹丝不动）。只想记评估时间、不涉及计数时用 `recordEvaluatedAt()`。
 
 ---
 
@@ -1166,14 +1217,17 @@ handler 内再 `requireAuth` 兜一层（纵深防御：万一将来有人漏掉
 
 接口的任何变动必须同步更新本文件，并在 [09-changelog.md](./09-changelog.md) 记录。
 
-- **告警读接口可见性收口（同类泄漏第三处）**：**无新增接口、无新增错误码、无字段改名**。
-  语义收紧：`GET /api/alerts/events` 的 `items` / `total` / `counts` 与 `GET /api/alerts/summary` 的
-  `open` / `unacknowledged` / `bySeverity` / `top` 一律只统计**当前可见**服务的事件
-  （共享 `modules/visibility/serviceVisibility.ts`，与 `/api/metrics/*` 同一口径、**无 admin 特例**、
-  读不到可见集合时 **fail-closed**）；`limit` 由"先截断"改为作用在过滤之后。
+- **告警读接口可见性收口（同类泄漏第三处，两组）**：**无新增接口、无新增错误码、无字段改名**。
+  ①第一组（`871c3dc`）：`GET /api/alerts/events` 的 `items` / `total` / `counts` 与
+  `GET /api/alerts/summary` 的 `open` / `unacknowledged` / `bySeverity` / `top` 一律只统计
+  **当前可见**服务的事件（共享 `modules/visibility/serviceVisibility.ts`，与 `/api/metrics/*`
+  同一口径、**无 admin 特例**、读不到可见集合时 **fail-closed**）；`limit` 由"先截断"改为作用在过滤之后。
   宿主类（`host` / `disk:*`）事件不变；隐藏不是删数据（恢复可见后原样回来）。
-  **仍保留、待裁定**：`GET /api/alerts/rules` 的 `rule.target` 与 `POST /api/alerts/events/:id/ack`
-  的响应体**不**按可见性过滤。详见 §6.9。
+  ②第二组（`470ac16`）：`summary.suppressed` 改为**按 target 明细 + 当前可见性求和**
+  （宿主自有恒计入、服务类需命中可见集合、可见集合不可得 → 只计宿主自有，fail-closed）；
+  `GET /api/alerts/rules` 的 `rule.target` **仅对 viewer 遮蔽成 `null`**、**admin 保留真值**
+  —— **配置类接口区分角色，事件 / 快照类接口不分角色**，两套口径不要互相套用。
+  **仍然未收口**：`POST /api/alerts/events/:id/ack` 的响应体**不**按可见性过滤。详见 §6.9。
 
 - **S2-01…S2-04（历史指标、健康监测、告警）**：新增 **9 个接口**，契约见 §6.7 / §6.8 / §6.9 ——
   `GET /api/metrics/catalog`、`GET /api/metrics/history`、`GET /api/metrics/storage`、

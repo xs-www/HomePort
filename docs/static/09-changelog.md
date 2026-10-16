@@ -2984,6 +2984,8 @@ S2-01 指标存储（后台单例降采样）、S2-02 历史图表、S2-03 健�
 4. **`duration` 门控计时在内存。** 重启后重新计时（宁晚一轮，不误报）；抖动会立刻清零，不累积。
 5. **`suppressed` 与 `reopened` 分开计。** `suppressed` 只在"未恢复行已存在"时计数，
    静默期内重新触发算 `reopened`（`reopen_count+1`，清空确认）；唯一来源是引擎的 `suppressedTotal()`。
+   **后续更正（第二组收口，提交 `470ac16`）**：`suppressedTotal()` **已删除**，唯一来源改为
+   引擎的**按 target 明细** `suppressedByTarget()`（读路径按当前可见性求和）—— 见本文件末条。
 6. **"后台模块无出站能力"做成可执行约束。** `backgroundBoundary.test.ts` 扫描源码断言无
    `fetch`/`http.request`/`net.connect`/`child_process`/通知库/直连 docker.sock，
    且探测只发 GET 无请求体；并断言目标目录存在且非空（防止约束退化成永不触发的空扫描）。
@@ -3387,6 +3389,147 @@ npx vitest run tests/alertsApi.test.ts tests/alertsVisibility.test.ts tests/aler
    （容器列表不看服务可见性）。因此容器类指标的隐藏**完全靠读取侧兜住** ——
    那句不精确的表述会把"读取侧强制"误说成可选增强。已在 `04-api-contract.md` §6.7 与
    `06-security.md` §3 写明纠正。
+
+## [2026-10-16] 修复：告警读路径可见性收口（第二组）—— `suppressed` 按 target 记账 + `/rules` 的 `target` 仅对 viewer 遮蔽
+
+> 代码改动已在提交 **`470ac16`**（本条目只补文档；上一组是 `871c3dc` + 文档归档 `4181f5f`）。
+
+### 背景与目标
+
+第一组收口的是 `/api/alerts/events` 与 `/summary` 的**事件行快照与四个计数**（SQL 层过滤，
+先过滤再 `LIMIT`）。复审时发现同一类泄漏还剩两处，**载体不同** —— 一处在**数字**里，
+一处在**规则配置行**里，所以第一组的写法套不上：
+
+- `summary.suppressed` 原本是引擎的**全局总数**：隐藏 / 已删除的服务每次被压掉都让它涨 ——
+  **数字本身就是存在性证据**（"有个你看不见的东西在反复失败"）；而一个**没有归因的总数**
+  也根本没法按可见性过滤。
+- `GET /api/alerts/rules` 的 `rule.target` 会回显隐藏 / 已删除服务的名字
+  （`service:<ref>` / `container:<ref>`），而 viewer 可读该接口 —— 读一次规则列表就能把
+  看不见的服务**枚举**出来。
+- 顺带发现两处半成品痕迹：`AlertEngine.suppressedTotal()` 全仓零调用方；
+  `AlertsService.recordTick` 的签名要求 `suppressed: number` 却**完全忽略**它
+  （只传总数会**静默丢计数**）。
+
+### 裁定（owner）
+
+**`rule.target` 仅对 viewer 遮蔽成 `null`，admin 保留真值。**
+理由：规则是 admin 自己写的**配置**（不是触发快照），对**作者本人**遮蔽保护不了任何东西，
+只会让 `web/src/components/AlertRuleForm.tsx:163` 把空 target 渲染成"· 适用于全部目标"
+**对 admin 说假话**；该端点本就是 admin 可 PATCH / viewer 只读，角色分支与端点语义一致。
+配套写进代码注释的**口径边界**：**事件 / 快照类**接口（`/events`、`/summary`、`/api/metrics/*`）
+**不分角色**；**配置类**接口（`/rules`）**区分角色** —— 两套口径不要互相套用。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 修改 | `server/src/modules/alerts/engine.ts` | `suppressedTotalValue: number` → `suppressedByTargetValue: Map<string, number>`；`suppressedTotal()` **删除**，新增 `suppressedByTarget(): ReadonlyMap<string, number>`（返回新 Map）；私有 `bumpSuppressed(target, thisTick)` 同时累计总数、按 target 的累计明细与**本轮**明细。**判定语义一行未动** |
+| 修改 | `server/src/modules/alerts/types.ts` | `AlertTickResult` 新增**必填** `suppressedByTarget: Record<string, number>`（键 = target 原文，如 `disk:<标签>` / `host` / `service:<ref>`） |
+| 修改 | `server/src/modules/alerts/service.ts` | 新增 `isHostOwnedAlertTarget` / `isAlertTargetVisible` / `maskRuleTarget` / `AlertRuleReadOptions` / `sumSuppressedVisible`；`rules()` → `rules(visible, options)`（`maskServiceTargets` **必填无默认值**）；`summary()` 的 `suppressed` 改为按明细求和；`suppressedTotal: number` → `suppressedByTarget: Map`；`recordTick` 改为只收 `{ at, suppressedByTarget }`；`HOST_OWNED_EVENT_SQL` 的旧注释按实现更正并标注已知残留 |
+| 修改 | `server/src/api/alerts.ts` | 引擎依赖改为具名 `AlertSummaryEngine`（`lastTickAt` + `suppressedByTarget`）；`composeAlertSummary(summary, engine, visible)` 新增第三参数；`/rules` 加**角色分支**（viewer 遮蔽 / admin 真值且**不查注册表**）；文件头写明两条口径的边界 |
+| 修改 | `server/tests/alertsVisibility.test.ts` | **15 → 27 条**（新增 12 条：`suppressed` 6 条 + `rule.target` 5 条 + 1 条纯函数边界）；原"admin 与 viewer 同一口径"两条按裁定**反向为真值断言** |
+| 修改 | `server/tests/{alertEngine,alertsApi,metricsSampler}.test.ts` | 只改夹具 / 桩（`rules()` 两个入参、`composeAlertSummary` 第三参数、`AlertTickResult` 补必填字段），**未削弱或删除任何既有断言** |
+| 修改 | `docs/static/{03,04,06,09}.md`、`todo.md`、`IMPLEMENTATION_REPORT_S2.md` | 本次归档 |
+
+### 逐项明细
+
+#### 1. `summary.suppressed`：从"全局总数"到"按 target 记账 + 按可见性求和"
+
+- `AlertEngine`：`suppressedByTargetValue` 是 `Map<target, count>`；`bumpSuppressed()` 在
+  "已有未恢复 episode"的两条分支（`openEpisodes.has(key)`，以及 `recordTrigger` 既非 opened
+  也非 reopened）里被调用。`tick()` 的结果新增**本轮**明细 `suppressedByTarget`。
+  **计数与判定分支一行未动**：episode / 静默期 / `reopen_count` / duration 门控 /
+  "目标不在快照 → 不假恢复"全部未触碰。
+- `AlertsService`：同样只留明细；`summary()` 里 `suppressed: sumSuppressedVisible(this.suppressedByTarget, visible)`。
+- `sumSuppressedVisible(byTarget, visible)`：宿主自有（`host` / `disk:<label>`）恒计入；
+  `service:` / `container:` 必须命中可见集合；`visible === null` → **只计宿主自有（fail-closed）**；
+  非有限值与非正值**直接跳过**（宁可少报，也不让脏数据把数字撑起来）。
+- `composeAlertSummary(summary, engine, visible)`：装了引擎就用引擎的**明细**求和覆盖
+  （一个数只能有一个来源，仍不做 `Math.max` 折中）；没接引擎时原样返回服务层那份（同口径）。
+- **`recordTick` 的新签名**：`(result: { at: string; suppressedByTarget: Record<string, number> })`。
+  **刻意不收 `suppressed` 总数** —— 收一个不参与记账的数，只会让调用方以为"传总数也行"，
+  而那正是**静默丢计数**（数字看着在动，viewer 的 `suppressed` 却纹丝不动）；
+  误导签名现在**编译期**就被挡下。只想记评估时间时用 `recordEvaluatedAt()`。
+
+#### 2. `GET /api/alerts/rules` 的 `rule.target`：仅对 viewer 遮蔽
+
+- `isHostOwnedAlertTarget(target)`（**白名单**：`host` / `disk:`）与
+  `isAlertTargetVisible(target, visible)`（宿主自有放行；服务类须命中可见集合；
+  空串 / 未知前缀 / `visible === null` → **不允许**）构成读路径的**唯一内存判据**
+  （`suppressed` 求和与 `rule.target` 遮蔽共用）。
+- `maskRuleTarget(target, visible)`：不可见 → `null`（本就是 `null` 的原样返回）。
+  遮蔽成 `null` 而**不引入第三种状态**（`service:<hidden>` 等于直接承认"这里有一个你看不到的目标存在"）。
+- `rules(visible, options)` 的 `AlertRuleReadOptions.maskServiceTargets` **必填、无默认值**：
+  "给谁看"是裁定，默认值正是"悄悄多显示一个服务"或"悄悄对 admin 说假话"的来源。
+  **admin 分支不读 `visible`**，路由层因此**不为 admin 查注册表**
+  （免得白付一次 `registry.list`、还因注册表偶发不可用记一条与他无关的 warn）。
+- `PATCH /rules/:id` 的响应**不遮蔽**：写路径回显的是调用方自己刚提交的配置
+  （把"你刚写的 target"变成 `null` 只会让人以为没保存上），且要求 admin + CSRF。
+- 响应形状未变（仍是**13 个字段**、`target` 仍是 `string | null`）；遮蔽是**读时求值**，
+  库里 `alert_rules.target` 逐字未动（恢复可见后原样回来）。
+- **viewer 侧注册表读失败 → fail-closed**（服务类 target 一律 `null`、宿主类照常）；
+  **admin 侧不受影响** —— 那不是 fail-open，而是那条路径压根不读可见集合。
+
+#### 3. 死代码清理与注释更正
+
+- `AlertEngine.suppressedTotal()` **删除**：全仓零调用方，且"一个没有归因的总数"正是本轮要修掉的东西 ——
+  留着它等于给下一个调用点留一个绕过可见性过滤的入口。`AlertTickResult.suppressed`（总数）仍在
+  （tick 结果形状与调度器日志要用），但**不再进读响应**。
+- `HOST_OWNED_EVENT_SQL` 的旧注释曾写它与内存判据"同一个方向"，与实现相反 ⇒ 按实修正，
+  并在两处互相引用标注**已知残留**（见下）。
+
+### 判别力
+
+| 实验 | 结果 |
+| --- | --- |
+| 角色分支**恒遮蔽**（admin 也遮蔽） | `/rules` 3 例红（`expected null to be 'service:manual:…'`） |
+| 角色分支**恒放行**（viewer 也不遮蔽） | 同 3 例红（反向） |
+| 还原 | 绿 |
+
+**照实记**：以上为修复方实测，本次归档**未复跑**。**`suppressed` 侧没有做"取消可见性求和"
+的突变实验** —— 它的判别力由**非零夹具**承担（用例先自检 `suppressed === 2` 且
+`suppressedByTarget` 归因为 `host 1 + 目标服务 1`，否则"按可见性求和"测到的只是 `0`），
+这不等于一次变异实验，不要当成同等强度的证据。
+
+### 验证方式
+
+```
+npx vitest run --root server        # 本次归档独立复跑（2026-10-16）：
+# → Test Files 34 passed (34)；Tests 643 passed (643)
+#   （上一组归档时是 34 文件 / 631 例；本轮 +12 例 = alertsVisibility 15 → 27）
+# 另外三条同轮被改夹具的文件：alertsApi 27 / alertEngine 36 / metricsSampler 10，均全绿
+
+# 来自提交信息 `470ac16`（本次归档未复跑）：typecheck exit 0；web 10 文件 / 172 例全绿；
+#   build exit 0；E2E 12 passed（含"告警页 viewer 只读（带有效 CSRF 的写请求也被拒）"）
+```
+
+### 已知限制 / 后续
+
+1. **仍然未收口 / 待裁定**：`POST /api/alerts/events/:id/ack` 的**响应体** —— admin 写路径，
+   入参是随机 UUID 的事件 ID（要拿到隐藏服务事件的 ID 得先有别的泄漏渠道）。
+   收口范围是**读**响应。
+2. **已知残留（本轮不修，成因与影响照实记）**：`alerts/service.ts` 里"这个 target 算不算宿主自有"
+   有**两种形态、方向相反**的判据 —— SQL 的 `HOST_OWNED_EVENT_SQL` 是**黑名单**
+   （"不是服务类前缀就算宿主"），内存的 `isHostOwnedAlertTarget` 是**白名单**
+   （"就是 `host` 或 `disk:` 才算"）。空串 / 未知前缀（`weird:secret`）这类**手工脏行**
+   因此**在事件列表里被当宿主放出，在 `suppressed` 计数与 `rule.target` 上却被 fail-closed
+   剔出 / 遮蔽**。两者都保守，但方向相反 ⇒ 同一批脏行在这几处的表现可能不一致；
+   要统一得先裁定"未知前缀到底算不算一个目标"。
+3. **`evaluatedAt` 仍不做可见性过滤**：它不指向任何目标，没有可见性语义 —— 这不是残留，是设计。
+4. **前端未改**：`AlertRuleForm.tsx` 的"· 适用于全部目标"文案**现在对 admin 不再说谎**
+   （admin 拿到真值），因此本轮不需要改 `web/**`；但若将来出现"admin 也遮蔽"的复用点，
+   该文案会**再次说谎** —— 已记入 `todo.md`。
+5. **`README.md` 的测试规模数字仍过期**（未随两组收口更新：仍写着 server 31 文件 / 594 例，
+   实际 34 / 643），已记入 `todo.md`；本次归档范围不含 `README.md`。
+6. **归档核对时发现的运维副作用（本轮收口带来的，照实记）**：`suppressed` 收口后，
+   **按 target 的全量明细没有任何对外通道** —— `GET /api/alerts/summary` 只给按可见性求和后的数字，
+   调度器日志只记 `at` / 耗时 / `error`（`toSchedulerView` 不暴露 `alerts`），
+   全量明细只存在于进程内（`scheduler.lastSummary()?.alerts.suppressedByTarget`，目前只有测试读它）。
+   后果：**对"被隐藏 / 已删除的服务是否一直在被压掉"这件事，界面上看不出来**，
+   要判断得先恢复它的可见性再看数字变化。这是安全优先的必然代价（数字就是存在性证据），
+   但它是**有意的行为变化**，运维文档已按实写明；若将来需要"给 admin 一个全量视图"，
+   应新开一个**管理侧**（`includeHidden` 口径）的读接口，**不要**把 `/summary` 改成区分角色
+   —— 那会与"事件 / 快照类不分角色"的口径打架。
 
 
 

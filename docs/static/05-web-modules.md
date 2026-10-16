@@ -218,6 +218,9 @@ class ApiError extends Error {
   `unacknowledged === 0` 时**不渲染**徽标（一个恒亮的 "0" 只会变成噪音）。
 - `title` 里额外报 `suppressed`（命中静默期被压掉的触发次数）：
   "没有告警"到底是被压了还是条件没成立，靠它区分。
+  **口径**：这个数是 `GET /api/alerts/summary` 返回的**按当前可见服务集合求和**的累计值
+  （隐藏 / 已删除服务的贡献不计入；`/summary` 不分角色，admin 与 viewer 同口径）——
+  前端只是原样展示，不要在前端再解释成"全量"。
 - 测试：`web/tests/alertsPage.test.tsx`（"徽标数字来自 `unacknowledged`（不是 `open`）"、
   "未确认计数为 0 时不渲染徽标（即使还有未恢复事件）"）。
 

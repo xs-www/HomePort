@@ -682,7 +682,13 @@ docker exec -e NODE_PATH=/app/node_modules homeport-portal node -e "const D=requ
 - 状态变化全部进审计，动作名：`alert.rule_updated` / `alert.fired` / `alert.reopened` /
   `alert.resolved` / `alert.acknowledged`（不含任何凭据）。
 - "没有告警"有两种可能，必须分清：条件没成立，还是**被静默压掉了**。后者计入 `suppressed`，
-  在 `GET /api/alerts/summary` 与日志里可见。
+  在 `GET /api/alerts/summary` 里可见。
+  **口径（第二组收口，提交 `470ac16`）**：`summary` 里的 `suppressed` 按**当前可见服务集合**求和，
+  隐藏 / 已删除服务的贡献**不计入**（`/summary` 不分角色，admin 与 viewer 同口径）。
+  **运维含义（照实记）**：接口与日志都**不再**给出全量数字 —— 按 target 的全量明细只存在于进程内
+  （`scheduler.lastSummary()?.alerts.suppressedByTarget`，目前只有测试读它），
+  调度器日志只记 `at` / 耗时 / `error`。因此"被隐藏的服务是不是一直在被压掉"**在界面上看不出来**，
+  要判断得先恢复它的可见性再看数字变化。
 
 **回滚**（v5 也是纯追加，回滚安全）：
 

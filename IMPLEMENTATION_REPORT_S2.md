@@ -22,6 +22,7 @@ Sprint 2 解决两个具体缺口：**只有瞬时值、看不到历史**，以�
 | 附 | **规格勘误**：§1.1 我写的"每小时只 2 次批量写"是错的（真实 61 次/小时），已改正并换成机器可证判据 | `docs/sprint2-implementation-spec.md` | ✅ |
 | 附 | **验收驳回后修复三个 P1**（隐藏服务经监控/历史接口泄漏 ×2、服务端测试依赖墙钟）：可见性在**读取侧**也被强制、`state(ref)` 对不可见 ref 返回 `null`、两条装配线改用固定 epoch + 假数据源。见 §2.8 | `health/monitor.ts`、`metrics/sampler.ts`、`api/metrics.ts`、3 个测试文件 + 2 个新测试文件 | ✅ |
 | 附 | **归档自查发现的同类第三处：告警读接口**（`/api/alerts/events`、`/summary` 泄漏触发时快照与计数）→ 已收口；抽出共享 `modules/visibility/serviceVisibility.ts`，metrics 与 alerts 调同一组函数，过滤落在 SQL 层。见 §2.8 第 4 条 | `modules/visibility/serviceVisibility.ts`、`alerts/service.ts`、`api/alerts.ts`、1 个新测试文件 | ✅ |
+| 附 | **复审驳回的第二组**（同一类泄漏的另外两处，载体不同：**计数面**与**配置面**）：`summary.suppressed` 从"引擎全局总数"改为**按 target 明细 + 当前可见性求和**（宿主自有恒计入 / 服务类须命中可见集合 / 可见集合不可得 → 只计宿主自有）；`GET /api/alerts/rules` 的 `rule.target` **仅对 viewer 遮蔽成 `null`、admin 保留真值**（裁定）。顺带删除零调用方的 `AlertEngine.suppressedTotal()`、把 `recordTick` 的误导签名改成只收明细。见 §2.8 第 5 条 | `alerts/engine.ts`、`alerts/types.ts`、`alerts/service.ts`、`api/alerts.ts`、`tests/alertsVisibility.test.ts` | ✅ |
 
 **没有新增任何依赖**（后端未引入通知/HTTP 客户端库，前端未引入图表库 —— 折线图是手写 SVG）。
 
@@ -139,7 +140,7 @@ Sprint 2 解决两个具体缺口：**只有瞬时值、看不到历史**，以�
 重启最多丢 59 分钟、1h 视图在整点前恒为空 —— 与"24h 每分钟 1 条""重启后历史保留"直接冲突。
 重启数据损失上界因此是 **1 个采样间隔**。
 
-### 2.8 验收驳回后的修复：三个 P1（+ 归档自查发现的同类第三处）
+### 2.8 验收驳回后的修复：三个 P1（+ 归档自查发现的同类第三处 + 复审驳回的第二组）
 
 Sprint 2 提交后，用户**手工复现真实场景**驳回了三个 P1。三条同属一类：
 **"看得见什么"只做了一半就被当成做完了** —— 采集侧固定 viewer 视角看着安全，
@@ -266,14 +267,14 @@ Sprint 2 提交后，用户**手工复现真实场景**驳回了三个 P1。三�
   **归档时独立复跑**：`alertsApi` 27 + `alertsVisibility` 15 + `alertEngine` 36
   = **3 文件 / 78 例全绿**（2026-10-16 23:34）；修复方另称 server 全量 **34 文件 / 631 例**全绿
   （本次归档**未复跑**）。
-- **未收口 / 待裁定（照实记，不要写成已修）**：
-  ① `GET /api/alerts/rules` 的 `rule.target` —— 是**管理员自己写的规则配置**（不是触发快照），
-  按可见性抹成 `null` 会让 viewer 看到一份与实际规则不一致的配置；
-  ② `POST /api/alerts/events/:id/ack` 的**响应体** —— admin 写路径，入参是随机 UUID 的事件 ID。
-  另有一条**残留观察**：`summary` 的 `suppressed` / `evaluatedAt` 取自引擎、**不参与可见性过滤**
-  （"本轮压掉 N 次触发"仍是全量数字：不含名字、不指向具体服务，但严格说是极弱旁路信号）。
+- **当时留下的未收口 / 待裁定（照实记）**：① `GET /api/alerts/rules` 的 `rule.target`；
+  ② `POST /api/alerts/events/:id/ack` 的**响应体**（admin 写路径，入参是随机 UUID 的事件 ID）；
+  另有一条**残留观察**：`summary` 的 `suppressed` / `evaluatedAt` 取自引擎、不参与可见性过滤。
+  **这三条里已有两条在第二组（`470ac16`）落地**（见下一条与 §2.8 第 5 条）：
+  `rule.target` 已裁定为"仅 viewer 遮蔽、admin 真值"，`suppressed` 已改为按可见性求和；
+  **只剩 ack 响应体未收口**。`evaluatedAt` 保留"不做可见性过滤"——它不指向任何目标，是设计不是残留。
 - **被本轮更正的三处既有表述**：①本文档 §7-9 与 §8 原来把告警读接口列为"仍未收口"，
-  现已改写为"读响应已收口 + 两处待裁定"；②§7-11 原来写"`visibleServiceRefs()` 的
+  现已改写为"读响应已收口 + 未收口项逐条点名"；②§7-11 原来写"`visibleServiceRefs()` 的
   fail-closed 分支没有单测"，现在**已有覆盖**（告警真实路由的必抛桩用例 + 共享函数的
   纯函数边界用例），但**metrics 路由级**仍没有专门断言 —— 照实记；
   ③**归档核对代码时发现的一处既有口径不精确**（不是代码缺陷）：文档原写
@@ -281,6 +282,56 @@ Sprint 2 提交后，用户**手工复现真实场景**驳回了三个 P1。三�
   `container.*` 序列仍按 `containers.list()` 照采（容器列表不看服务可见性），
   容器类指标的隐藏**完全靠读取侧兜住**。已在 `04-api-contract.md` §6.7 / §6.9 与
   `06-security.md` §3 就地澄清。
+
+#### 第二组：计数面 `summary.suppressed` 与配置面 `rule.target`（复审驳回，提交 `470ac16`）
+
+- **现象**：第一组收口后复审又发现**同一类泄漏的另外两处**，载体不同 ——
+  ① `GET /api/alerts/summary` 的 `suppressed` 是引擎的**全局总数**：隐藏 / 已删除的服务每次
+  被压掉都让它涨，**数字本身就是存在性证据**（"有个你看不见的东西在反复失败"）；
+  ② `GET /api/alerts/rules` 的 `rule.target` 原样回显隐藏 / 已删除服务的名字
+  （`service:<ref>` / `container:<ref>`），而 viewer 可读该接口 ⇒ **读一次规则列表就能枚举**。
+- **根因**：与第一组同源（读路径没有按可见性收口），但**载体不是事件行** ——
+  一个是**汇总数字**，一个是**规则配置行**。第一组"在 SQL 层过滤事件行"的写法套不上，
+  两处的口径也不能互相套用。
+- **裁定（owner）**：`rule.target` **仅对 viewer 遮蔽成 `null`，admin 保留真值**。理由：规则是
+  admin 自己写的**配置**（不是触发快照），对**作者本人**遮蔽保护不了任何东西，只会让
+  `web/src/components/AlertRuleForm.tsx:163` 把空 target 渲染成"· 适用于全部目标"**对 admin 说假话**；
+  该端点本就是 admin 可 PATCH / viewer 只读，角色分支与端点语义一致。配套口径边界（写进源码注释）：
+  **事件 / 快照类**接口（`/events`、`/summary`、`/api/metrics/*`）**不分角色**；
+  **配置类**接口（`/rules`）**区分角色**。
+- **修法**：
+  1. **`suppressed` 改为按 target 记账 + 按可见性求和**：引擎只增加**记账**
+     （`AlertTickResult.suppressedByTarget` 必填 / `AlertEngine.suppressedByTarget()`），
+     读路径用 `sumSuppressedVisible()` 现算（宿主自有恒计入、`service:` / `container:` 须命中
+     可见集合、`visible === null` → 只计宿主自有，fail-closed）；`composeAlertSummary(summary, engine, visible)`
+     新增第三参数。**判定语义一行未动**：`suppressed` 计数与判定分支、episode / 静默期 /
+     `reopen_count` / duration 门控 / "目标不在快照 → 不假恢复" 全部未触碰。
+  2. **`rule.target` 只对 viewer 遮蔽**：新增 `isHostOwnedAlertTarget` / `isAlertTargetVisible` /
+     `maskRuleTarget` / `AlertRuleReadOptions`；`rules()` → `rules(visible, options)`，
+     `maskServiceTargets` **必填、无默认值**（"给谁看"是裁定，默认值正是"悄悄多显示"或
+     "悄悄对 admin 说假话"的来源）；**admin 分支不读 `visible`**，路由层因此**不为 admin 查注册表**。
+     `PATCH /rules/:id` 的写响应**不遮蔽**。响应形状（13 字段）未变，遮蔽是读时求值（库里配置未改）。
+  3. **顺带清理**：`AlertEngine.suppressedTotal()` 全仓零调用方 ⇒ **删除**；
+     `recordTick` 原先要求 `suppressed: number` 却完全忽略它（只传总数会**静默丢计数**）
+     ⇒ 改为只收 `suppressedByTarget` 明细，误导签名现在**编译期**就被挡下。
+- **判别力（修复方实测，本次归档未复跑）**：角色分支**恒遮蔽** → `/rules` 3 例红
+  （`expected null to be 'service:manual:…'`）；**恒放行** → 同 3 例红（反向）；还原 → 绿。
+  **照实记**：`suppressed` 侧**没有**做"取消可见性求和"的突变实验，它的判别力由**非零夹具**承担
+  （用例先自检 `suppressed === 2` 且 `suppressedByTarget` 归因为 `host 1 + 目标服务 1`，
+  否则"按可见性求和"测到的只是 `0`）—— 这不等于一次变异实验。
+- **验证证据**：`alertsVisibility.test.ts` **15 → 27 条**（新增 12：`suppressed` 6 + `rule.target` 5
+  + 1 条纯函数边界；改夹具的 `alertEngine` / `alertsApi` / `metricsSampler` **未削弱任何既有断言**）。
+  **本次归档独立复跑**：`npx vitest run --root server` → **34 文件 / 643 例全绿**
+  （上一组归档时是 631 例）。
+- **已知残留（本轮不修，源码注释已互相引用标注）**：`alerts/service.ts` 里"这个 target 算不算
+  宿主自有"有**两种形态、方向相反**的判据 —— SQL 的 `HOST_OWNED_EVENT_SQL` 是**黑名单**
+  （"不是服务类前缀就算宿主"），内存的 `isHostOwnedAlertTarget` 是**白名单**（"就是 `host` 或
+  `disk:` 才算"）。空串 / 未知前缀（`weird:secret`）这类**手工脏行**因此**在事件列表里被当宿主
+  放出，在 `suppressed` 计数与 `rule.target` 上却被 fail-closed 剔出 / 遮蔽**；两者都保守但方向相反，
+  同一批脏行在这几处可能不一致。要统一得先裁定"未知前缀到底算不算一个目标"。
+- **仍然未收口 / 待裁定**：`POST /api/alerts/events/:id/ack` 的**响应体**（admin 写路径，
+  入参是随机 UUID 的事件 ID）。另：`evaluatedAt` 仍不做可见性过滤 —— 它不指向任何目标，
+  **没有可见性语义，这是设计不是残留**。
 
 ---
 
@@ -348,8 +399,10 @@ WAL 模式下必须用 `VACUUM INTO` 做一致性导出，或停容器后整卷�
 > **同类第三处的收口不在这张表里**：它**没有新增接口、没有新增错误码、没有字段改名**，
 > 只收紧 `GET /api/alerts/events` 与 `GET /api/alerts/summary` 的**语义**
 > （只统计当前可见集合，`limit` 改为作用在过滤之后）—— 见 §2.8 第 4 条与
-> `04-api-contract.md` §6.9。`GET /api/alerts/rules` 的 `rule.target` 与
-> `POST /api/alerts/events/:id/ack` 的响应体仍是**待裁定**的例外。
+> `04-api-contract.md` §6.9。
+> **第二组（复审驳回）同样没有新增接口 / 错误码 / 字段名**：`summary.suppressed` 改为按可见性求和，
+> `GET /api/alerts/rules` 的 `rule.target` 在 **viewer** 侧遮蔽成 `null`（admin 保留真值）——
+> 见 §2.8 第 5 条。**仍然待裁定的例外只剩一处**：`POST /api/alerts/events/:id/ack` 的响应体。
 
 ### 4.3 后台模块的"无出站能力"是**可执行约束**
 
@@ -432,6 +485,19 @@ npx vitest run tests/alertsApi.test.ts tests/alertsVisibility.test.ts \
 # 全库 npm test（34 文件 / 631 用例）与 typecheck/build/E2E 来自提交信息 `871c3dc`，本次未复跑
 ```
 
+**第二组（复审驳回）后的新增证据（本次归档独立复跑，2026-10-16）**：
+
+```
+npx vitest run --root server
+# → Test Files 34 passed (34)；Tests 643 passed (643)
+#   上一组归档时是 631 例，本轮 +12（alertsVisibility 15 → 27）
+#   同轮改过夹具的三条：alertsApi 27 / alertEngine 36 / metricsSampler 10，均全绿
+# 判别力（修复方实测，本次归档未复跑）：角色分支恒遮蔽 → /rules 3 例红；恒放行 → 同 3 例红
+# 照实记：suppressed 侧没有做"取消可见性求和"的突变实验，其判别力由非零夹具承担
+# 来自提交信息 `470ac16`（本次归档未复跑）：typecheck exit 0；web 172 例全绿；build exit 0；
+#   E2E 12 passed（含"告警页 viewer 只读（带有效 CSRF 的写请求也被拒）"）
+```
+
 E2E 新增覆盖：历史页导航 + 空历史**不画 0 线** + 存储/保留配置真的通到接口 +
 四条内置规则默认关闭（用同源 API 断言真实值，不信界面渲染）+ 告警页 viewer 只读
 （带**有效 CSRF** 的写请求仍被 403 拒，证明是角色鉴权而非缺 CSRF）。
@@ -459,7 +525,8 @@ E2E 新增覆盖：历史页导航 + 空历史**不画 0 线** + 存储/保留�
 | 隐藏服务仍出现在 `GET /api/health/monitor`（含服务名） | ✅ 已修：成功读到空列表也全清（状态 + `labelsByRef`），读路径再拦一道；`healthMonitor.test.ts` +4 条，含"绕过 reconcile"的可区分性用例 |
 | 隐藏服务仍可经 `/api/metrics/catalog` 与 `/history` 枚举/查询 | ✅ 已修：读路径按**当前** viewer 可见集合过滤，不可见与"从未采集过"返回**逐字节一致**的 400（无 404/403）；`metricsVisibility.test.ts` 13 条 |
 | 两条服务端测试依赖墙钟（必然/可能横跨整点） | ✅ 已修：固定 epoch + 三个注入假夹具 + 显式 `hoursRolledUp === 0` + **新增跨整点用例** + `clockBoundary.test.ts` 守卫；5 文件 59 用例全绿 |
-| **同类第三处（归档自查，非用户驳回）**：隐藏服务的事件名与未恢复**计数**仍出现在 `/api/alerts/events`、`/api/alerts/summary` | ✅ 已收口：共享 `modules/visibility/serviceVisibility.ts` + SQL 层过滤（`items` 先过滤再 `LIMIT`，四项计数同口径）+ fail-closed + admin 无特例；`alertsVisibility.test.ts` 15 条（3 文件 78 例全绿）。**两处待裁定**：`rule.target` 与 ack 响应体（见 §2.8 第 4 条） |
+| **同类第三处（归档自查，非用户驳回）**：隐藏服务的事件名与未恢复**计数**仍出现在 `/api/alerts/events`、`/api/alerts/summary` | ✅ 已收口：共享 `modules/visibility/serviceVisibility.ts` + SQL 层过滤（`items` 先过滤再 `LIMIT`，四项计数同口径）+ fail-closed + admin 无特例；`alertsVisibility.test.ts` 15 条（3 文件 78 例全绿）。**仍待裁定**：ack 响应体（见 §2.8 第 4 条） |
+| **同类第三处第二组（复审驳回）**：`summary.suppressed` 是全量总数（隐藏服务的贡献留在数字里）；`GET /api/alerts/rules` 的 `rule.target` 回显隐藏 / 已删除服务的名字 | ✅ 已收口 / 已裁定：`suppressed` 按 target 明细 + 当前可见性求和（fail-closed，引擎判定语义未动）；`rule.target` **仅 viewer 遮蔽成 `null`、admin 保留真值**（配置类区分角色，事件/快照类不分角色）；`alertsVisibility.test.ts` 增至 27 条（server 全量 34 文件 / 643 例全绿，本次归档复跑）。**仍待裁定**：ack 响应体；**已知残留**：宿主自有判据的 SQL 黑名单 vs 内存白名单方向相反（见 §2.8 第 5 条与 §7-13） |
 
 ---
 
@@ -489,17 +556,19 @@ E2E 新增覆盖：历史页导航 + 空历史**不画 0 线** + 存储/保留�
    **但该 TTL 允许设为 0（不缓存）**，那时每个 `/api/metrics/catalog` 与每个服务类
    `/api/metrics/history` 都会真的跑一遍服务发现。这是**有意的**安全优先取舍；
    若将来要优化，**不能**用"给可见性加 TTL"的办法（那等于把泄漏窗口换回来）。
-9. **告警读接口的可见性泄漏已收口，但两处刻意留着待裁定**：`/api/alerts/events` 与 `/summary`
+9. **告警读接口的可见性泄漏已分两组收口；只剩一处待裁定**：`/api/alerts/events` 与 `/summary`
    原先直接返回 `alert_events` 行 —— 其 `target` / `target_label` 是**触发时**写进库的，
    不随可见性变化 → 隐藏前产生的告警仍会带出服务名，计数本身也是存在性证据。
-   现已按当前可见集合在 SQL 层过滤（共享 `modules/visibility/serviceVisibility.ts`，
-   fail-closed，admin 无特例）。**待裁定**：① `GET /api/alerts/rules` 的 `rule.target`
-   （管理员自写的配置，抹成 null 会让配置自相矛盾）；② `POST /api/alerts/events/:id/ack`
-   的响应体（admin 写路径）。**残留观察**：`summary.suppressed` / `evaluatedAt` 取自引擎、
-   不做可见性过滤。**未修的后果（保留）**：隐藏后 `health.states()` 不再包含该服务，
-   引擎"目标不在快照里 → 不动，不假恢复"让它的未恢复告警**停在未恢复状态**
-   —— 读侧看不见 ≠ 引擎认为已恢复（改这条要先裁定产品语义）。
-   详见 `06-security.md` §9-11 与 `04-api-contract.md` §6.9。
+   第一组已按当前可见集合在 SQL 层过滤（共享 `modules/visibility/serviceVisibility.ts`，
+   fail-closed，admin 无特例）。第二组（`470ac16`）关掉**同源但载体不同**的两处：
+   `summary.suppressed` 改为**按 target 明细 + 当前可见性求和**；`rule.target` **仅对 viewer
+   遮蔽成 `null`、admin 保留真值**（**裁定**：规则是 admin 自己写的配置，对作者本人遮蔽保护不了
+   任何东西，只会让 `AlertRuleForm.tsx:163` 说假话；配置类接口区分角色，事件 / 快照类不分角色）。
+   **仍待裁定**：`POST /api/alerts/events/:id/ack` 的响应体（admin 写路径）。
+   `evaluatedAt` 不做可见性过滤 —— 它不指向任何目标，**这是设计不是残留**。
+   **未修的后果（保留）**：隐藏后 `health.states()` 不再包含该服务，引擎"目标不在快照里 → 不动，
+   不假恢复"让它的未恢复告警**停在未恢复状态** —— 读侧看不见 ≠ 引擎认为已恢复
+   （改这条要先裁定产品语义）。详见 `06-security.md` §9-11 与 `04-api-contract.md` §6.9。
 10. **`state(ref)` 语义收紧把两个模块的口径绑在一起**：`MetricsSampler.verdictOf` 走
     `health.state(ref)?.verdict ?? 'unknown'`，因此"不可见"在采样侧表现为 `unknown` → 该 tick
     不产生样本（方向安全，宁缺测不写 0）；`AlertEngine` 快照用 `health.states()` →
@@ -511,9 +580,29 @@ E2E 新增覆盖：历史页导航 + 空历史**不画 0 线** + 存储/保留�
     这条断言本身仍未单独写）。上一轮"完全没有单测"的表述已过时。
 12. **台账未同步**：`docs/sprint2-implementation-spec.md` §3.1 仍写着
     `availableTargets / resolveTarget / catalog` 的**同步**签名（实现已改 async 并多一层可见性校验），
-    也**没有** `AlertsService.events(query, visible)` / `summary(visible)` 的必填可见性参数；
-    冻结规格未改。`README.md` 的测试规模数字仍是 Sprint 2 提交时的值
-    （两轮累计 **+3 文件 / +36 用例**：13 + 4 + 4 + 15）。均已记入 `todo.md`。
+    也**没有** `AlertsService.events(query, visible)` / `summary(visible)` 的必填可见性参数，
+    以及第二组新增的 `rules(visible, options)`（`maskServiceTargets` 必填无默认值）与
+    `AlertSummaryEngine.suppressedByTarget()` / `composeAlertSummary(…, visible)`；冻结规格未改。
+    `README.md` 的测试规模数字仍是 Sprint 2 提交时的值（31 文件 / 594 例 / 766 例），
+    实际已是 **server 34 文件 / 643 例 + web 172 例**。**照实记一处对不上**：既有文档的用例增量分解
+    （13 + 4 + 4 + 15 + 12 = 48）比实测增量（+49）**少 1**，明细以各文件实测为准。均已记入 `todo.md`。
+13. **告警侧"宿主自有 target"的两种判据方向相反（本轮不修，照实记）**：`alerts/service.ts` 里
+    SQL 形态 `HOST_OWNED_EVENT_SQL` 是**黑名单**（"不是 `service:` / `container:` 前缀就算宿主"），
+    内存判据 `isHostOwnedAlertTarget` 是**白名单**（"就是 `host` 或 `disk:` 才算"）。
+    于是空串 / 未知前缀（`weird:secret`）这类**手工脏行**在**事件列表里被当宿主放出**，
+    却在 `suppressed` 计数与 `rule.target` 上被 **fail-closed 剔出 / 遮蔽**。
+    两者都保守但方向相反 ⇒ 同一批脏行在这几处的表现可能不一致；
+    要统一得先裁定"未知前缀到底算不算一个目标"（源码注释已互相引用标注）。
+    影响面有限：脏行要么来自手工改库，要么来自将来新增的 target 前缀。
+14. **`suppressed` 收口的运维副作用（有意的行为变化，归档核对代码时发现，照实记）**：
+    收口后**按 target 的全量明细没有任何对外通道** —— `GET /api/alerts/summary` 只给按可见性求和后的
+    数字，调度器日志只记 `at` / 耗时 / `error`（`toSchedulerView` 不暴露 `alerts`），
+    全量明细只存在于进程内（`scheduler.lastSummary()?.alerts.suppressedByTarget`，目前只有测试读它）。
+    后果：**"被隐藏 / 已删除的服务是否一直在被压掉"在界面上看不出来**，要判断得先恢复它的可见性
+    再看数字变化（"没有告警"的两种解释在隐藏服务上暂时分不开）。
+    取舍：数字本身是存在性证据，安全优先；若将来要给 admin 一个全量视图，
+    **应新开管理侧（`includeHidden` 口径）的读接口**，不要给 `/summary` 加角色分支
+    （那会与"事件 / 快照类不分角色"的口径打架）。已写入 `08-operations.md` 与 `09-changelog.md`。
 
 ---
 
@@ -531,11 +620,20 @@ E2E 新增覆盖：历史页导航 + 空历史**不画 0 线** + 存储/保留�
   本轮把"引擎不做任何出站调用"变成可执行约束，Sprint 3 加渠道时应**新增独立的通知模块**，
   而不是把 `fetch` 塞进引擎（届时 `backgroundBoundary.test.ts` 的白名单要同步扩，
   并在报告里说明扩了什么、为什么）。
-- **验收驳回修复及后续自查留下的未做项**（逐条见 §7-8…12）：
-  ① **告警读接口的两处待裁定**：`GET /api/alerts/rules` 的 `rule.target`、
-  `POST /api/alerts/events/:id/ack` 的响应体（以及 `summary.suppressed` 不做可见性过滤这条
-  残留观察）；读响应本身已收口。要动它们**必须先裁定产品语义**，不是一次过滤能解决的；
-  ② `metrics` 路由级的 fail-closed 专门断言仍未写（共享实现已被证明，见 §7-11）；
-  ③ 回填 `docs/sprint2-implementation-spec.md` §3.1 的签名清单（已改 async、
-  告警服务方法新增必填可见性参数）与 `README.md` 的测试规模数字（两轮累计 +3 文件 / +36 用例）。
+- **验收驳回修复及后续自查留下的未做项**（逐条见 §7-8…14）：
+  ① **告警读接口仍未收口的一处**：`POST /api/alerts/events/:id/ack` 的响应体
+  （`GET /api/alerts/rules` 的 `rule.target` 与 `summary.suppressed` 已在第二组裁定并落地，
+  `evaluatedAt` 无可见性语义是设计）；要动 ack 响应体**必须先裁定产品语义**，
+  不是一次过滤能解决的；
+  ② **告警侧"宿主自有"判据方向相反的残留**（SQL 黑名单 vs 内存白名单，见 §7-13）：
+  要修得先裁定"未知前缀算不算一个目标"；本轮只在源码注释里互相引用标注；
+  ③ **`suppressed` 侧缺一次突变实验**：本轮的判别力实验只覆盖角色分支（`/rules` 3 例红），
+  `suppressed` 靠非零夹具自检，**不等于**变异实验（见 §2.8 第 5 条）；
+  ④ `metrics` 路由级的 fail-closed 专门断言仍未写（共享实现已被证明，见 §7-11）；
+  ⑤ 回填 `docs/sprint2-implementation-spec.md` §3.1 的签名清单（已改 async、告警服务方法
+  新增必填可见性参数、`rules(visible, options)` 与 `composeAlertSummary(…, visible)`）
+  与 `README.md` 的测试规模数字（实际 server 34 文件 / 643 例 + web 172 例；
+  既有增量分解比实测少 1，见 §7-12）；
+  ⑥ **`suppressed` 全量明细没有对外通道**（§7-14）：若需要"给 admin 全量视图"，
+  应新开管理侧（`includeHidden` 口径）读接口，而不是给 `/summary` 加角色分支。
   以上均已写入 `todo.md` 的「Sprint 2 验收驳回修复及后续收口的未做项与残留风险」。
