@@ -14,9 +14,11 @@ import { Icon } from './components/ui.js';
 import { AppShell } from './layout/AppShell.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { AdminServicesPage } from './pages/AdminServicesPage.js';
+import { AlertsPage } from './pages/AlertsPage.js';
 import { ContainerDetailPage } from './pages/ContainerDetailPage.js';
 import { ContainersPage } from './pages/ContainersPage.js';
 import { DevicesPage } from './pages/DevicesPage.js';
+import { HistoryPage } from './pages/HistoryPage.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { NotFoundPage } from './pages/NotFoundPage.js';
 import { OverviewPage } from './pages/OverviewPage.js';
@@ -160,6 +162,24 @@ function AppRoutes(): ReactNode {
         element={
           <Protected>
             <ToolsPage />
+          </Protected>
+        }
+      />
+      {/* 历史趋势（Sprint 2 · S2-02）：viewer 可读的只读页面 */}
+      <Route
+        path="/history"
+        element={
+          <Protected>
+            <HistoryPage />
+          </Protected>
+        }
+      />
+      {/* 告警（Sprint 2 · S2-04）：viewer 看事件与规则，写入口只在页面内对 admin 渲染 */}
+      <Route
+        path="/alerts"
+        element={
+          <Protected>
+            <AlertsPage />
           </Protected>
         }
       />

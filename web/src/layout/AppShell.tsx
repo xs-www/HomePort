@@ -8,6 +8,7 @@ import { NavLink, useLocation } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider.js';
 import { CommandPaletteProvider } from '../components/CommandPalette.js';
 import { Icon } from '../components/ui.js';
+import { useAlertSummary } from '../hooks/useAlertSummary.js';
 
 interface NavItem {
   to: string;
@@ -23,6 +24,10 @@ interface NavItem {
  *
  * Sprint 1 起 `/` 是**服务墙**，原首页迁到 `/overview`；
  * 服务配置可写，因此 `/admin/services`（服务管理）是第二个 adminOnly 条目。
+ *
+ * Sprint 2 追加 `历史`（`/history`）与 `告警`（`/alerts`）—— 两者都是**只读**页面，
+ * 因此**对 viewer 也可见**（不像"账号管理"那样带 adminOnly）。
+ * `告警` 额外带"未确认计数"徽标（计数为 0 时不显示）。
  */
 const NAV_ITEMS: NavItem[] = [
   { to: '/', label: '服务', icon: 'server', end: true },
@@ -30,6 +35,8 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/containers', label: '容器', icon: 'container' },
   { to: '/devices', label: 'tailnet 设备', icon: 'devices' },
   { to: '/system', label: '系统指标', icon: 'system' },
+  { to: '/history', label: '历史', icon: 'system' },
+  { to: '/alerts', label: '告警', icon: 'warning' },
   { to: '/tools', label: '工具入口', icon: 'tools' },
   { to: '/admin/services', label: '服务管理', icon: 'dashboard', adminOnly: true, end: true },
   { to: '/admin', label: '账号管理', icon: 'admin', adminOnly: true, end: true },
@@ -55,6 +62,10 @@ export function AppShell({ children, topbarExtra, title }: AppShellProps): React
 
   const items = NAV_ITEMS.filter((item) => !item.adminOnly || user?.role === 'admin');
   const activeLabel = items.find((item) => item.to === location.pathname)?.label ?? title ?? '门户';
+
+  // 未确认告警计数（只在已登录时请求）；0 不显示徽标 —— 一个恒亮的 "0" 只会变成噪音
+  const alertSummary = useAlertSummary({ enabled: user !== null });
+  const unacknowledged = alertSummary.unacknowledged;
 
   const theme = preferences?.theme ?? 'dark';
   const cycleTheme = (): void => {
@@ -88,21 +99,40 @@ export function AppShell({ children, topbarExtra, title }: AppShellProps): React
           {/* 导航 */}
           <nav className="scroll-thin flex-1 space-y-1 overflow-y-auto px-3 py-2">
             {items.map((item) => (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                end={item.to === '/' || item.end === true}
-                className={({ isActive }) =>
-                  `flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ${
-                    isActive
-                      ? 'bg-sky-500/12 font-medium text-sky-600 ring-1 ring-sky-500/25 dark:text-sky-300'
-                      : 'text-slate-600 hover:bg-slate-100 dark:text-ink-300 dark:hover:bg-white/6'
-                  }`
-                }
-              >
-                <Icon name={item.icon} className="size-4" />
-                <span className="truncate">{item.label}</span>
-              </NavLink>
+              <div key={item.to} className="relative">
+                <NavLink
+                  to={item.to}
+                  end={item.to === '/' || item.end === true}
+                  className={({ isActive }) =>
+                    `flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ${
+                      isActive
+                        ? 'bg-sky-500/12 font-medium text-sky-600 ring-1 ring-sky-500/25 dark:text-sky-300'
+                        : 'text-slate-600 hover:bg-slate-100 dark:text-ink-300 dark:hover:bg-white/6'
+                    }`
+                  }
+                >
+                  <Icon name={item.icon} className="size-4" />
+                  <span className="truncate">{item.label}</span>
+                </NavLink>
+                {/*
+                  徽标放在 NavLink **外面**（pointer-events-none 保证点击穿透）：
+                  放进去会把链接的可访问名变成"告警 3"，
+                  既有测试与 E2E 都按 `getByRole('link', { name: '告警' })` 找它。
+                */}
+                {item.to === '/alerts' && unacknowledged > 0 ? (
+                  <span
+                    data-testid="nav-alert-badge"
+                    title={
+                      alertSummary.suppressed > 0
+                        ? `${unacknowledged} 条未确认告警；另有 ${alertSummary.suppressed} 次触发因静默期被压制`
+                        : `${unacknowledged} 条未确认告警`
+                    }
+                    className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 rounded-full bg-rose-500/12 px-1.5 py-0.5 text-[10px] font-semibold text-rose-600 ring-1 ring-rose-500/25 dark:text-rose-300"
+                  >
+                    {unacknowledged}
+                  </span>
+                ) : null}
+              </div>
             ))}
           </nav>
 

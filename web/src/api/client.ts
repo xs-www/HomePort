@@ -14,6 +14,16 @@
  */
 
 import type {
+  AlertEventQueryState,
+  AlertEventView,
+  AlertEventsResponse,
+  AlertRuleListResponse,
+  AlertRulePatch,
+  AlertRuleView,
+  AlertSummaryView,
+} from './alerts.js';
+import type { MetricHistoryView, MetricRange } from './metrics.js';
+import type {
   AuditListResponse,
   ContainerDetailResponse,
   ContainerListResponse,
@@ -556,6 +566,64 @@ export class ApiClient {
       body: token ? { token } : {},
       timeoutMs: SLOW_TIMEOUT_MS,
     });
+  }
+
+  // ------------------------------------------------------------ 历史指标（Sprint 2 · S2-02）
+
+  /**
+   * 历史曲线（viewer 可读）。
+   *
+   * `metric` / `target` / `range` 三者共同确定一条曲线，缺一不可；
+   * 服务端按 range 选择 resolution（`1h/24h` → minute，`7d/30d` → hour）。
+   * 历史查询是纯 SELECT，走默认超时即可（不共用慢接口的 45s）。
+   */
+  metricsHistory(params: { metric: string; target: string; range: MetricRange }): Promise<MetricHistoryView> {
+    return this.request<MetricHistoryView>('/metrics/history', {
+      query: { metric: params.metric, target: params.target, range: params.range },
+    });
+  }
+
+  // ------------------------------------------------------------ 告警（Sprint 2 · S2-04）
+
+  /**
+   * 规则列表（viewer 可读）。
+   *
+   * 响应形状 `{ items: AlertRuleView[] }` 由 §7 补冻结（与 `/api/services`、
+   * `/api/alerts/events` 的列表端点一致）。这里直接用冻结类型取字段，
+   * **不做**宽容解析：少包一层 `items` 是契约违约，应该在页面上明确暴露出来。
+   */
+  alertRules(): Promise<AlertRuleListResponse> {
+    return this.request<AlertRuleListResponse>('/alerts/rules');
+  }
+
+  /** 部分更新规则（**admin**；变更类请求自动带 `X-CSRF-Token`）。 */
+  updateAlertRule(id: string, patch: AlertRulePatch): Promise<AlertRuleView> {
+    return this.request<AlertRuleView>(`/alerts/rules/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: patch,
+    });
+  }
+
+  /** 事件列表（viewer 可读）；`state` 默认 `all`，`limit` 由服务端夹到 1..200。 */
+  alertEvents(params: { state?: AlertEventQueryState; limit?: number } = {}): Promise<AlertEventsResponse> {
+    return this.request<AlertEventsResponse>('/alerts/events', {
+      query: { state: params.state, limit: params.limit },
+    });
+  }
+
+  /** 确认事件（**admin**）：已恢复的事件也能确认；`resolved_at` 与确认是两件事。 */
+  acknowledgeAlertEvent(id: string): Promise<AlertEventView> {
+    return this.request<AlertEventView>(`/alerts/events/${encodeURIComponent(id)}/ack`, { method: 'POST' });
+  }
+
+  /**
+   * 徽标计数（viewer 可读）。
+   *
+   * §7 补冻结为**聚合对象本身**（不是列表）：`{ open, unacknowledged, suppressed,
+   * bySeverity, top, evaluatedAt }`。同样按冻结类型直接取字段，不做归一化兜底。
+   */
+  alertSummary(): Promise<AlertSummaryView> {
+    return this.request<AlertSummaryView>('/alerts/summary');
   }
 }
 
