@@ -289,9 +289,9 @@
       （默认 CSP 是 `img-src 'self' data:`）。**不为了图标放宽默认 CSP** —— 管理页已提示这一点
 - [ ] Gitea `/git/` 与 `family-nas` 8443 `/calendar` 的验收用例在 NAS 上复核
       （开发机上没有这两个容器；夹具测试 `servicesDiscovery.test.ts` 已覆盖该拓扑）
-- [ ] **服务墙未在真实手机视口做 E2E**：卡片网格是 1/2/3 列响应式（Tailwind 断点），
-      单测与桌面 E2E 都不覆盖窄屏下的折行、长服务名截断与命令面板在小屏的可用性。
-      建议加一条 `devices['iPhone 13']` 的 Playwright 用例
+- [x] **服务墙移动视口 E2E（Sprint 1 验收缺口，已补）**：`e2e/smoke.spec.ts` 末尾新增
+      390×844 视口用例，断言网格单列、卡片不溢出视口、页面无横向滚动、命令面板不溢出且可用。
+      仍未覆盖的是"超长服务名截断"的视觉细节（要做需要视觉回归工具，暂不引入）
 - [ ] `mapper.mapServeRoutes` 仍按 `containers.find(...)` **取第一个匹配容器**（端口冲突时），
       既有契约未改；服务层已加"归属唯一性守卫"（`countHostPortClaimants`）兜住它。
       彻底修法是让 mapper 在冲突时返回 `null`，但那会改动既有 HTTP 契约字段，需单独评估

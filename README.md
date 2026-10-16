@@ -86,7 +86,7 @@ npm run dev:web
 
 # 测试与类型检查
 npm test                      # 一次跑 server 与 web 两个工作区的单测（Vitest）
-                              # 当前规模：server 15 文件 / 333 用例，web 4 文件 / 106 用例
+                              # 当前规模：server 21 文件 / 430 用例，web 8 文件 / 141 用例
 npm run typecheck             # server + web 两个工作区
 npm run test:e2e              # Playwright 冒烟（默认端口 8988，先跑完整生产构建；
                               # 换端口：PORTAL_E2E_PORT=9001 npm run test:e2e）

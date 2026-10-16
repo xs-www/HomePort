@@ -2797,5 +2797,143 @@ node _homeport-backups/real-discovery.mjs   # buildApp() + 真实登录 + app.in
   `05-web-modules.md`（页面与组件契约）、`06-security.md`（SSRF 与图标 CSP）、
   `07-data-model.md`（迁移 v4 逐列）、`08-operations.md`（§7.1 升级回滚、§10 备份修正）。
 
+---
+
+## [2026-10-16] 修复：Sprint 1 验收驳回的三个发现层缺陷（多副本 / 冲突路由 / 重复 serve）
+
+### 背景与目标
+
+第一轮验收的自动化门禁全绿（单测 565 例、E2E 9 例、类型检查、生产构建、Compose 解析），
+但**手工复现真实场景**时驳回了两个 P1。复核后发现三个缺陷同源：
+
+> **"归属与身份的聚合"没做到底** —— 内存里的规划看着对，一旦真的落库（唯一约束）
+> 或生成视图（视图阶段重新推断归属）就露出来。
+
+这是 S1-01（稳定身份）与 S1-02（归属与去重）的核心契约问题，不是边角。
+更值得记的是：**旧用例把错误行为锁死了** —— 有一条用例断言"副本服务有 2 份绑定"，
+所以单测全绿却挡不住线上直接失败。这一轮的每条回归用例都验证过
+"在修复前的代码上必然失败"。
+
+### 变更概览
+
+| 文件 | 类型 | 改了什么 |
+| --- | --- | --- |
+| `server/src/modules/services/registry.ts` | 修改 | 副本按 `ref` 合并（代表容器优先"在运行"的）；抽出共享判定 `countHostPortClaimants` / `isServeRouteAttributable`；`serveRoutesForService` 空过滤时复用同一判定；收尾统一归一化 `(kind, ref)` 唯一 |
+| `server/src/modules/services/service.ts` | 修改 | `serveRoutesForService` 调用处补传 `containers: live.items`（判定归属唯一性必需） |
+| `server/tests/servicesDiscovery.test.ts` | 修改 | 重写"副本合并"用例的断言（2 份 → 1 份，并说明为什么）；新增副本落库、代表容器选择、冲突路由的视图层、重复 serve 路由共 4 条；3 处 `serveRoutesForService` 调用补 `containers` |
+| `server/tests/servicesApi.test.ts` | 修改 | 假数据源改为可替换拓扑（`liveTopology` + `withTopology()` + 清理），新增 2 条端到端 P1 回归（多副本落库 / 冲突路由不被认领） |
+| `web/src/pages/ServicesPage.tsx` | 修改 | 服务卡片网格加 `data-testid="service-grid"`（移动视口 E2E 的稳定锚点） |
+| `e2e/smoke.spec.ts` | 修改 | 新增 390×844 移动视口用例（单列轨道、卡片不溢出、无横向滚动、命令面板不溢出） |
+| `README.md` | 修改 | 测试规模 333/106 → 430/141 |
+| `todo.md` | 修改 | 移动视口 E2E 待办改为已完成（并说明仍未覆盖"超长名截断"的视觉细节） |
+| `docs/static/03-server-modules.md` | 修改 | `registry.ts` 行补两个新导出与两条不变量说明 |
+| `IMPLEMENTATION_REPORT_S1.md` | 修改 | 新增 §2.10（本轮修复全过程与可区分性证据）、§7 风险 9/10、§6 数字更新 |
+
+### 逐项明细
+
+#### 修复 1（P1）：多副本服务让整个发现事务失败
+
+- **现象**：`docker compose up --scale web=2` 之类产生两个共享 `sourceRef` 的副本容器时，
+  `POST /api/services/discover` / `GET /api/services` 报
+  `UNIQUE constraint failed: service_bindings.service_id, service_bindings.kind, service_bindings.ref`，
+  发现事务整体回滚 —— 用户看到的是"服务墙挂了"，而不是"多一张卡片"。
+- **根因**：`planDiscovery` 的容器循环里，绑定去重条件写成
+  `item.ref === binding.ref && item.containerId === binding.containerId`。
+  副本共享 `ref`（这正是稳定身份的设计）但容器 ID 必然不同 → 条件恒真 → 两份同 `ref` 绑定。
+  而 `service_bindings` 的唯一约束是 `(service_id, kind, ref)`。
+- **修法**：
+  1. 副本合并只按 `ref` 去重，**一份绑定**；代表容器**优先取正在运行的那个**
+     （`containerAvailabilityRank`：`running` < `restarting`/`created`/`paused` < 其它）——
+     代表恰好是停掉的副本时，界面会显示"容器未运行"，让人去重启一个本来没事的服务；
+  2. `planDiscovery` **收尾统一归一化**"每个服务里每个 `(kind, ref)` 只有一份绑定"。
+     为什么收敛到一个出口：任何一处漏去重都会让**整个**发现事务回滚，
+     而同类的"多推一份"在 serve 路径上也存在（见修复 3）。把不变量放一处，
+     以后新增绑定来源不会再踩。
+
+#### 修复 2（P1）：端口冲突的 serve 路由在视图阶段又被挂回第一个容器
+
+- **现象**：`/conflict` 既是独立 serve 服务，又出现在 `docker:app-a` 的候选入口里
+  （`serviceBindingRefs: ["docker:app-a"]` + 该路由被 `routesReattached`）。
+  用户点到的是别人家的服务 —— 正是"多容器端口冲突不猜"要防的事。
+- **根因**：发现阶段（`planDiscovery`）已经正确地否决了 mapper 的 owner，
+  但**视图阶段**的 `serveRoutesForService()` 又凭原始 `route.containerId/containerName`
+  认领回来，而那两个字段来自 `mapServeRoutes` 的 `containers.find(...)`
+  —— **端口冲突时取第一个匹配**。
+- **修法**：把"能不能归属"抽成共享纯函数
+  `isServeRouteAttributable(route, containers)`（`countHostPortClaimants(...) === 1` 才可信），
+  **发现阶段与视图阶段用同一个判定**。显式写在 `service.bindingRefs` 里的稳定 ref 不受影响
+  —— 那是发现阶段确认过的结果，也是独立 serve 服务能显示自己入口的唯一依据
+  （若把它也一并否决，独立服务会连自己的入口都没有）。
+- `serveRoutesForService()` 因此多一个必填参数 `containers: readonly ContainerSummary[]`
+  （内部签名，不是 HTTP 契约；唯一调用方 `service.ts` 已同步）。
+
+#### 修复 3（同类）：重复的 serve 路由也会撞唯一约束
+
+- `owner.bindings.push(binding)` 与独立 serve 服务的 `existing.bindings.push(binding)`
+  **都没有按 ref 去重**：同一 `host/port/path` 出现两次（CLI 输出重复、或两条配置归一后相同）
+  就会产生两份同 `ref` 的 serve 绑定。行为与 P1-1 完全同类。
+- 由修复 1 的收尾归一化统一兜住；用例"重复的 serve 路由合并成一份绑定"锁住它。
+
+#### 测试：为什么这轮能挡住，上一轮没挡住
+
+- **旧用例锁死了错误行为**：`servicesDiscovery.test.ts` 原文断言
+  `expect(web[0]?.bindings).toHaveLength(2)`（"副本容器合并成一个服务"，注释写着"只保留一份绑定记录"
+  但断言是 2）。已重写为 1，并把"为什么必须是 1"写进注释 —— 这条断言本身就是契约的一部分。
+- **新增 7 条回归**（server 单测 +2、API 端到端 +2、其余 3 条含在 discovery 文件里，见上表）。
+- **每条都验证过可区分性**：用 `git stash push -- registry.ts service.ts` 退回修复前，
+  5 条回归全部失败（`500 UNIQUE constraint failed`、
+  `docker:app-a 不该认领冲突路由: expected [...] to not include '…/conflict'`、
+  `expected [ { kind: 'serve', …(13) }, …(1) ] to have a length of 1 but got 2` 等），
+  `git stash pop` 后全绿。
+- **API 级用例的可重跑性**：新增 `liveTopology`（假数据源在**读取时**取当前拓扑）
+  与 `withTopology()`（用完恢复 + 删掉这次临时拓扑新引入的服务 + 重新发现真实拓扑）。
+  否则本文件所有用例共享一个内存库，临时拓扑会把后续用例的列表污染掉。
+
+#### 非阻断缺口（一并补掉）
+
+- `README.md` 的测试规模长期停在旧值（server 15 文件 / 333 用例、web 4 文件 / 106 用例），
+  已更新为**当前实测值**：server 21 文件 / 430 用例、web 8 文件 / 141 用例。
+- **移动端排版从未实测**（计划 §4 的验收项之一）：卡片是 Tailwind 断点驱动的
+  （`grid sm:grid-cols-2 xl:grid-cols-3`），而 jsdom 不做布局、`getComputedStyle` 拿不到真实轨道数，
+  所以必须有真浏览器用例。新增 `e2e/smoke.spec.ts` 的 390×844 视口用例：
+  断言网格**单列**、首张卡片在视口内、`documentElement.scrollWidth - innerWidth <= 1`
+  （无横向滚动）、命令面板不溢出且输入框可用。为此给网格加了 `data-testid="service-grid"`
+  作为稳定锚点（按 Tailwind 类名选元素会在改样式时假失败）。
+
+### 配置 / 接口 / 数据模型影响
+
+- **环境变量**：无。
+- **HTTP 契约**：无变化（这轮修的全是内部归属判定与绑定聚合）。
+- **数据模型**：无迁移。**约束语义变得更加重要**：`service_bindings` 的
+  `UNIQUE(service_id, kind, ref)` 是这轮修复的"裁判"，文档里已把它写成不变量而非实现细节。
+- **内部签名**：`serveRoutesForService()` 新增必填参数 `containers`；
+  新增导出 `countHostPortClaimants()`、`isServeRouteAttributable()`（见 `03-server-modules.md`）。
+
+### 验证方式
+
+```
+npm run typecheck                      # exit 0（server + web）
+npx vitest run --root server           # 21 文件 / 430 用例全绿
+npx vitest run --root web              # 8 文件 / 141 用例全绿
+npm run build                          # exit 0
+npm run test:e2e                       # 10 用例通过（含移动视口用例）
+# 可区分性：临时回退源码后，5 条回归用例全部失败（见"测试"小节）
+git stash push -- server/src/modules/services/registry.ts server/src/modules/services/service.ts
+git stash pop
+```
+
+### 已知限制 / 后续
+
+1. **多副本只保留"代表容器"的一份绑定**：唯一约束决定了副本无法一行一个地存。
+   现状是一个服务 + 一份绑定（优先正在运行的副本），服务的"容器运行"维度反映代表容器。
+   代价：详情页看不到"另一个副本也在跑"。要列全需加列（如 `replicas` JSON）
+   或给绑定 `ref` 加副本序号 —— 属 Sprint 2 的取舍，已写入 `IMPLEMENTATION_REPORT_S1.md` §7-9。
+2. **`mapper.mapServeRoutes` 仍按 `containers.find(...)` 取第一个匹配**：既有 HTTP 契约未改，
+   服务层已在**发现 + 视图**两处兜住。彻底修法是让 mapper 在冲突时返回 `null`，
+   会改动既有字段语义，需单独评估（`todo.md` 已记）。
+3. **移动视口的"超长服务名截断"等视觉细节仍未覆盖**：需要视觉回归工具（截图比对），
+   本轮只断言了布局与溢出这类可精确判定的性质，暂不引入视觉回归依赖。
+4. **未做**：`/dsh` 这类"目标不是容器"的 serve 路由在真实 NAS 上的呈现仍待 NAS 实机复核（同 Sprint 1 条目）。
+
 
 

@@ -187,6 +187,57 @@ await discardProbeBody(response, HEALTH_PROBE_MAX_BODY_BYTES);
 被删掉的一张表的分隔行（会导致该表不渲染）与缺失的 `DISCOVERY_CACHE_TTL_FALLBACK_MS`
 兜底值、以及 `#service-health-target` 这条契约缺失的测试覆盖。
 
+### 2.10 验收驳回后的修复（第一轮验收发现的三个发现层缺陷）
+
+第一轮验收（565 例单测 + 9 例 E2E 全绿）在**手工复现真实场景**时驳回了两个 P1。
+三个缺陷同源：**"归属与身份的聚合"没做到底** —— 内存里的规划看着对，
+一旦真的落库（唯一约束）或生成视图（视图阶段重新推断归属）就露出来。
+都是 S1-01/S1-02 的核心契约问题，不是边角。
+
+**P1-1 多副本服务让整个发现事务失败。** 同一 Compose 服务的副本共享 `sourceRef`
+（这正是稳定身份的设计），但绑定去重的条件写成了
+`ref === binding.ref && item.containerId === binding.containerId` —— 副本之间容器 ID
+必然不同，等于**没去重**，两行同 `ref` 直接撞 `service_bindings` 的
+`UNIQUE(service_id, kind, ref)`，发现事务回滚，`/api/services` 报错
+（用户用两个 `demo/web` 副本复现）。更糟的是旧用例把错误行为**锁死了**：
+它断言副本服务有 2 份绑定，所以单测全绿。
+
+修法（两处）：
+- 副本合并时按 `ref` 去重，只留**一份**绑定，代表容器优先取**正在运行**的那个
+  （拿一个恰好停掉的副本当代表，会让人去重启一个本来没事的服务）；
+- `planDiscovery` **收尾统一归一化**"每个服务每个 `(kind, ref)` 只有一份绑定" ——
+  同一路由重复出现（serve 路径重复解析）也会多推一份，把不变量收敛到一个出口，
+  以后新增绑定来源不会再踩同一个坑。
+
+**P1-2 端口冲突的 serve 路由在视图阶段又被挂回第一个容器。** 发现阶段已经正确地
+否决了 mapper 的 owner，但 `serveRoutesForService()` 生成视图时**又**凭原始
+`route.containerId/containerName` 把路由认领回来（那正是 mapper 猜的第一个匹配），
+于是同一条路由既是独立服务、又出现在 `app-a` 的候选入口里。
+修法：把"能不能归属"抽成共享判定 `isServeRouteAttributable()`（唯一占用该宿主端口才可信），
+**发现阶段与视图阶段用同一个**；显式写在 `bindingRefs` 里的稳定 ref 不受影响
+（那是发现阶段确认过的结果，也是独立 serve 服务显示自己入口的唯一依据）。
+
+**附带同类修复**：重复的 serve 路由（同一 host/port/path）也会产生两份同 `ref` 绑定，
+同样会撞唯一约束 —— 由上面的归一化统一兜住。
+
+**回归测试（都验证过"在修复前的代码上必然失败"）**：
+
+| 用例 | 位置 | 修复前 |
+| --- | --- | --- |
+| 多副本合并成一个服务，发现落库不撞唯一约束 | `servicesApi.test.ts`（真实路由 + 真实 SQLite） | 500 `UNIQUE constraint failed` |
+| 端口冲突：路由不被挂回第一个容器 | 同上 | `docker:app-a` 认领了冲突路由 |
+| 冲突路由在视图阶段也不许被挂回容器 | `servicesDiscovery.test.ts`（`serveRoutesForService` 单测） | 返回了 1 条而不是 0 条 |
+| 副本容器只留一份绑定 | 同上 | 2 份 |
+| 重复 serve 路由合并成一份绑定 | 同上 | 2 份 |
+
+验证方式：`git stash push -- registry.ts service.ts` 回到修复前跑这些用例（全部失败），
+再 `git stash pop` 跑全量（全绿）。API 级用例还带了 `withTopology()` 夹具
+（临时替换假数据源并清理新增服务），因此用例之间互不影响、可单独重跑。
+
+**同时补掉的两个非阻断缺口**：README 的测试规模从 333/106 更新为 **430/141**；
+新增**移动视口 E2E**（390×844，断言网格单列、卡片不溢出、页面无横向滚动、命令面板不溢出），
+关闭计划 §4 里"移动端"那条一直没有实测的验收项。
+
 ## 3. 数据库迁移 v4（升级前必读）
 
 ```sql
@@ -271,9 +322,9 @@ Tailscale Serve 配置（443 `/`、8443 `/calendar`、8443 `/git/`）**不需要
 | --- | --- | --- |
 | 类型检查 | `npm run typecheck` | ✅ exit 0（server + web 两个 workspace，含全部测试文件） |
 | 构建 | `npm run build`（server tsc + web vite） | ✅ exit 0（73 模块，`index-*.js` 429.01 kB / gzip 128.65 kB） |
-| 单测 + 集成（server） | `npx vitest run --root server` | ✅ 21 文件 / 424 用例通过（新增 5 文件 85 例；既有 16 文件全绿） |
+| 单测 + 集成（server） | `npx vitest run --root server` | ✅ 21 文件 / 430 用例通过（新增 5 文件 91 例；既有 16 文件全绿） |
 | 单测（web） | `npx vitest run --root web` | ✅ 8 文件 / 141 用例通过（既有 4 文件 106 例无回归，无 act 警告） |
-| E2E（Playwright） | `npm run test:e2e` | ✅ 9 用例通过（22.8s，无残留进程） |
+| E2E（Playwright） | `npm run test:e2e` | ✅ 10 用例通过（含 390×844 移动视口排版用例，25.8s） |
 | 真实库迁移演练 | `node _homeport-backups/migrate-rehearsal.mjs <v2 库> <v3 库>` | ✅ 全部通过（见 §3） |
 | 实机发现验证 | `node _homeport-backups/real-discovery.mjs`（真实 Docker + `tailscale serve` CLI） | ✅ 全部通过（见下） |
 | 解析性能 | `servicesDiscovery.test.ts` 的 100 服务用例 | ✅ 总耗时 < 150ms（阈值） |
@@ -328,6 +379,15 @@ Tailscale Serve 配置（443 `/`、8443 `/calendar`、8443 `/git/`）**不需要
 7. **首页路径变更**：书签指向 `/` 的用户会看到服务墙（见 §4.3）。
 8. **两个内联弹窗未迁移到新的 `Modal`**（`SecurityTab` / `UsersTab`）：无功能问题，
    仅为无障碍与去重收益，已记入技术债。
+9. **多副本服务只保留"代表容器"的一份绑定**（第一轮验收修复后的现状）：
+   `service_bindings` 的唯一约束是 `(service_id, kind, ref)`，而副本共享 `sourceRef`，
+   因此副本不可能一行一个地存。现在是一个服务 + 一份绑定（优先正在运行的副本），
+   服务的"容器运行"维度反映的正是这个代表容器。代价：详情页看不到"另一个副本也在跑"。
+   要列出全部副本需要加列（如 `replicas` JSON）或给绑定 ref 加副本序号 —— 属 Sprint 2 取舍。
+10. **`mapper.mapServeRoutes` 仍按 `containers.find(...)` 取第一个匹配**（既有 HTTP 契约未改）：
+   服务层已在**发现与视图两处**用 `isServeRouteAttributable` 兜住，因此不会再出现
+   "冲突路由被认领"。彻底修法是让 mapper 在冲突时返回 `null`，但那会改动既有字段语义，
+   需单独评估（已记入 `todo.md`）。
 
 ---
 
