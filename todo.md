@@ -123,9 +123,9 @@
       tailscaled 走 named pipe，REST API 也不提供 serve 配置）。
       可选方案：让 TsController 暴露本地 HTTP 接口，门户作为 host-agent 读取。
       `ServeRoutesProvider` 是注入式接口，换实现即可，无需改容器模块
-- [x] **arm64（NAS）镜像构建实测**：`docker buildx build --platform linux/arm64` 通过
-      （2026-10-16）。`better-sqlite3` 在本机 QEMU 下从源码编译成功（约 77s），
-      web/server 构建与镜像导出均正常。同时已加入 CI 在 GitHub runner 上产出 arm64 镜像
+- [x] **多架构镜像构建实测**：本机 `docker buildx build --platform linux/arm64` 通过
+      （2026-10-16），`better-sqlite3` 在 QEMU 下从源码编译成功（约 77s）；
+      CI 当前按 `linux/amd64,linux/arm64` 产出多架构 manifest list
 - [ ] **Windows 宿主真实硬件指标**：容器化部署只能看到 WSL2 虚拟机资源。
       可选方案：
       1. 补充「原生运行」的部署文档与一键启动脚本（推荐，实测可行）
@@ -170,7 +170,7 @@
 - [ ] 支持 PostgreSQL（当前 SQLite 足够，仅在多实例部署时才有必要）
 - [ ] **补 `LICENSE` 文件**：`package.json` 已声明 `"license": "MIT"`，但没有 LICENSE 文件，
       默认等于"保留所有权利"，与声明不一致（公开仓库尤其明显）
-- [x] CI：GitHub Actions 构建 arm64 镜像并推送 GHCR（`ghcr.io/xs-www/homeport`）
+- [x] CI：GitHub Actions 构建多架构（amd64 + arm64）镜像并推送 GHCR（`ghcr.io/xs-www/homeport`）
 
 ## 技术债
 
@@ -197,6 +197,16 @@
 | GPU | RTX 4060 Laptop 8G。**容器化下不可读**（容器内无 `/usr/lib/wsl/lib`）；原生运行可读 |
 | Node | v22.23.2 |
 | 平台 | Windows 11，宿主 20 线程 / 31.63 GB；容器内只可见 WSL2 的 4 线程 / 3.9 GB |
+
+目标部署机（NAS）实测结果：
+
+| 项目 | 值 |
+| --- | --- |
+| 设备 | 绿联 DX4600 Pro，Tailscale 名 `family-nas` / `100.103.230.37` |
+| **CPU 架构** | **x86-64（amd64）** —— 不是 arm64。选镜像时务必确认，单架构镜像选错会 `exec format error` |
+| 系统 | Linux 6.18.15，Tailscale 1.104.1 |
+| 网络 | tailnet 直连（ping 约 294ms）；22 与 443 开放，**2375/2376 未开放**（Docker API 未对外暴露） |
+| 部署状态 | 尚未部署（需 SSH 访问方式；本机当前无 ssh config） |
 
 部署状态（2026-10-16，改名迁移后已实测）：
 

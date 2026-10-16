@@ -31,6 +31,8 @@ on:
       - 'LICENSE'
       - '.gitignore'
       - '.gitattributes'
+      # compose 文件不影响镜像内容（Dockerfile 不会 COPY 它们）
+      - 'docker-compose*.yml'
   # 允许在 Actions 页面手动触发（换架构/临时出图时不必空提交）
   workflow_dispatch:
 

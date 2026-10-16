@@ -19,8 +19,9 @@ docker compose logs homeport | Select-String 初始化令牌  # Windows
 
 ### 1.1 用预构建镜像（免本机编译）
 
-CI 在 GitHub runner 上构建 **linux/arm64** 镜像并推送到 GHCR。架构受限或不想在
-NAS 上跑编译时，直接拉镜像即可：
+CI 在 GitHub runner 上构建 **多架构**（`linux/amd64` + `linux/arm64`）镜像并推送到 GHCR，
+产出 manifest list，拉取时由 Docker 自动挑选匹配本机架构的那一份。
+架构受限或不想在 NAS 上跑编译时，直接拉镜像即可：
 
 ```bash
 # 公开镜像，无需登录
@@ -28,6 +29,9 @@ docker pull ghcr.io/xs-www/homeport:latest
 
 # 用具体版本（回滚比 latest 可靠）
 docker pull ghcr.io/xs-www/homeport:sha-85159b8
+
+# 确认拿到的是哪个架构
+docker image inspect ghcr.io/xs-www/homeport:latest --format '{{.Os}}/{{.Architecture}}'
 ```
 
 改用镜像时，`docker-compose.yml` 把 `build:` 段去掉/注释，改成：
@@ -45,10 +49,11 @@ docker pull ghcr.io/xs-www/homeport:sha-85159b8
 | `sha-<短哈希>` | 每次提交，适合精确回滚 |
 | `v1.2.3` / `1.2` | 推了 `v*` tag 时（semver） |
 
-- **只构建 arm64**。需要 amd64 或多架构：改 `.github/workflows/docker-publish.yml`
-  的 `PLATFORMS`（多架构写 `linux/amd64,linux/arm64`），再手动触发一次 workflow。
+- **构建哪些架构**由 `.github/workflows/docker-publish.yml` 的 `PLATFORMS` 单点控制，
+  当前为 `linux/amd64,linux/arm64`。只想出单架构（更快）可写 `linux/amd64`。
 - 镜像**不含** provenance / SBOM attestation —— 这类 manifest 会让较老的 Docker
   （如 NAS 上的 20.10）报 `no match for platform in manifest`，故有意关闭。
+  **多架构 manifest list 本身没问题，但必须同时关掉 attestation**，否则较老 Docker 依然挑不中平台。
 - 拉取后 `docker compose up -d` 即可，数据库迁移照常在启动时自动执行。
 
 ## 2. 指标取数边界（重要，先看这个）
@@ -154,9 +159,63 @@ npm start
 实测结果：20 线程、31.63 GB 内存（与任务管理器一致）、`nvidia-smi` 可读。
 此时磁盘指标无挂载概念，需用 `PORTAL_DISK_MOUNTS` 指向本地盘符（如 `C:=C:\`）。
 
-### 3.2 NAS（Synology / QNAP / TrueNAS）
+### 3.2 NAS（Synology / QNAP / TrueNAS / 绿联 UGOS）
 
-`.env`：
+NAS 上**推荐直接用预构建镜像**，不在 NAS 上编译（见 §1.1）。
+仓库提供了现成的部署文件 `docker-compose.nas.yml`：
+
+```bash
+# 1) 先在 NAS 上跑发现脚本，拿到四项关键值（见下）
+# 2) 按发现结果改 docker-compose.nas.yml 里标注 TODO 的地方
+# 3) 启动
+docker compose -f docker-compose.nas.yml up -d
+
+# 4) 取首启令牌
+docker compose -f docker-compose.nas.yml logs homeport | grep 初始化令牌
+```
+
+#### 部署前必须确认的四项
+
+NAS 的路径与权限差异很大（尤其是绿联 UGOS、群晖套件），**不要照抄路径**，先跑：
+
+```bash
+# ① CPU 架构：决定拉哪一份镜像（多架构会自动选，单架构选错会 exec format error）
+uname -m                       # x86_64 → amd64 ；aarch64 → arm64
+
+# ② docker 组 ID：容器内访问 docker.sock 报 EACCES 时要用它
+getent group docker || stat -c '%g' /var/run/docker.sock
+
+# ③ 存储卷实际路径：填进 PORTAL_DISK_MOUNTS 与 compose 的 volumes
+df -h | grep -Ev 'tmpfs|overlay|udev'
+
+# ④ tailscale 安装位置（只用 CLI 模式时才需要；API 模式可跳过）
+which tailscale; readlink -f "$(which tailscale)"; ls -l /var/run/tailscale/
+```
+
+拿到结果后按需修改的对应关系：
+
+| 发现结果 | 改哪里 |
+| --- | --- |
+| `uname -m` | 无需改（多架构 manifest 自动匹配） |
+| docker 组 ID | `DOCKER_GID=xxx`（写在 `.env` 或直接改 compose 的 `group_add`） |
+| 存储卷路径 | `PORTAL_DISK_MOUNTS` 与 compose `volumes` 的磁盘挂载 |
+| tailscale 路径 | 仅 CLI 模式：compose 里被注释的两行 tailscale 挂载 |
+
+#### tailnet 数据源：优先 API 模式
+
+NAS 上 Tailscale 多为套件/系统包安装，二进制与 sock 的路径、权限各不相同，
+**挂载常常失败**。最省事的做法是用 API 模式，只填一个只读 Token，
+不需要挂任何 tailscale 文件：
+
+```dotenv
+PORTAL_TAILSCALE_MODE=api
+PORTAL_TAILSCALE_API_TOKEN=tskey-api-xxxxxxxx
+```
+
+Token 在 https://login.tailscale.com/admin/settings/keys 生成（选 access token，
+不是 auth key），保存后可在「账号管理 → 系统设置」里点「测试连接」验证。
+
+#### 传统 `.env` 写法（用仓库根 compose 时）
 
 ```dotenv
 DOCKER_ENDPOINT=unix:///var/run/docker.sock
@@ -164,16 +223,22 @@ DOCKER_SOCKET=/var/run/docker.sock
 DOCKER_GID=998
 PORTAL_HOST_PROC=/host/proc
 PORTAL_DISK_MOUNTS=/volume1=/host/volume1,/volume2=/host/volume2
-PORTAL_TAILSCALE_MODE=cli
-PORTAL_TAILSCALE_BIN=/usr/local/bin/tailscale
+PORTAL_TAILSCALE_MODE=api
+PORTAL_TAILSCALE_API_TOKEN=tskey-api-xxxxxxxx
 ```
 
 **群晖注意**：默认没有 `/usr/bin/tailscale`（Tailscale 以套件形式安装，路径多为
-`/var/packages/Tailscale/target/bin/tailscale`）。挂载时用实际路径，
-或直接用 API 模式避开挂载。
+`/var/packages/Tailscale/target/bin/tailscale`）。要用 CLI 模式就用实际路径挂载，
+否则用 API 模式避开。
 
-**arm64 NAS**：镜像用 `node:22-alpine`，`better-sqlite3` 在 builder 阶段编译，
-支持 arm64。首次构建会比 amd64 慢（QEMU 模拟或原生编译）。
+**绿联 DX4600 Pro 注意**：该机型是 **x86-64（amd64）**，不是 arm64 ——
+用多架构镜像没问题，但若手工指定单架构镜像务必选 amd64。
+
+**性能**：NAS 上建议把 `PORTAL_METRICS_INTERVAL_MS` 调到 10000 降低采样压力（见 §8）。
+
+> **先确认 NAS 的 CPU 架构再选镜像**：`uname -m` 返回 `x86_64` 就是 amd64，
+> 返回 `aarch64` 才是 arm64。多架构 manifest 会自动选对，但**单架构镜像选错会以
+> `exec format error` 失败**。
 
 ## 4. GPU 挂载
 

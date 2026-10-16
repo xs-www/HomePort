@@ -37,7 +37,7 @@ docker compose logs homeport | Select-String 初始化令牌    # Windows
 首次打开会引导你创建管理员账号（需要上面那个令牌）。令牌也可从
 容器内 `/data/setup-token.txt` 读取。
 
-> **不想在本机编译？** CI 已构建好 arm64 镜像，可直接拉取：
+> **不想在本机编译？** CI 已构建好多架构镜像（amd64 + arm64），可直接拉取：
 > ```bash
 > docker pull ghcr.io/xs-www/homeport:latest
 > ```
@@ -317,6 +317,6 @@ Linux/NAS 上该域名才会解析。
 2. Windows 上 tailnet 查询需用 API 模式（容器内无法执行 Windows 可执行文件）。
 3. 未做 TOTP 二次验证，未设置 CSP/HSTS 等安全响应头。
 4. 不提供容器写操作（有意的产品边界）。
-5. arm64（NAS）镜像构建尚未实测。
+5. NAS 侧部署尚未实测（镜像已多架构构建并验证可拉取可运行）。
 
 详见 [todo.md](todo.md)。

@@ -1,0 +1,115 @@
+# ==============================================================================
+# HomePort — NAS 部署文件（直接用 GHCR 预构建镜像，不在 NAS 上编译）
+#
+#   docker compose -f docker-compose.nas.yml up -d
+#
+# 与仓库根的 docker-compose.yml 的区别：
+#   - 用 image: 而非 build:，NAS 上不需要 Node/编译工具链
+#   - 面向 Linux 宿主：挂 /proc 与磁盘拿**真实** CPU/内存/磁盘（Windows 容器化拿不到）
+#   - tailnet 默认走 API 模式，**无需**在容器里挂 tailscale 二进制
+#
+# 部署前请先在 NAS 上跑一次发现脚本（见 docs/static/08-operations.md §10），
+# 确认架构、socket 路径、docker 组 ID、磁盘路径四项，再改下面标注 TODO 的地方。
+# ==============================================================================
+
+services:
+  homeport:
+    image: ghcr.io/xs-www/homeport:latest
+    container_name: homeport-portal
+    restart: unless-stopped
+
+    ports:
+      # 建议只经 tailnet 访问：把左侧改成 NAS 的 tailnet IP（如 100.103.230.37:8899:8899）。
+      # 写 0.0.0.0 会让同局域网的设备也能访问。
+      - "${PORTAL_BIND_ADDR:-0.0.0.0}:${PORTAL_HOST_PORT:-8899}:8899"
+
+    environment:
+      NODE_ENV: production
+      PORTAL_PORT: "8899"
+      PORTAL_HOST: "0.0.0.0"
+      PORTAL_DATA_DIR: /data
+      TZ: "${TZ:-Asia/Shanghai}"
+
+      # ---- Docker 数据源（只读）：门户外挂 docker.sock 后即可列出 NAS 上的容器
+      DOCKER_ENDPOINT: "unix:///var/run/docker.sock"
+
+      # ---- tailnet 数据源
+      # API 模式：只需一个只读 Token，**不必**挂 tailscale 二进制与 socket，
+      # 在 NAS 上最省事（Tailscale 套件的路径/权限差异都不必操心）。
+      # Token 获取：https://login.tailscale.com/admin/settings/keys → Generate access token
+      PORTAL_TAILSCALE_MODE: "${PORTAL_TAILSCALE_MODE:-api}"
+      PORTAL_TAILSCALE_API_TOKEN: "${PORTAL_TAILSCALE_API_TOKEN:-}"
+      # 若改用 CLI 模式，把上面两行换成：
+      #   PORTAL_TAILSCALE_MODE: cli
+      #   PORTAL_TAILSCALE_BIN: /usr/local/bin/tailscale
+      #   PORTAL_TAILSCALE_SOCKET: /var/run/tailscale/tailscaled.sock
+      # 并启用文件末尾 volumes 里被注释的 tailscale 挂载（路径按实际安装位置改）。
+
+      # ---- 宿主 /proc：Linux 宿主上这是拿到**真实** CPU/内存的关键
+      PORTAL_HOST_PROC: "/host/proc"
+
+      # ---- 磁盘：格式 宿主路径=容器内路径[|标签|statfs 路径]
+      # TODO 改成 NAS 实际存储路径（发现脚本里的 df -h 会告诉你）
+      PORTAL_DISK_MOUNTS: "${PORTAL_DISK_MOUNTS:-/volume1=/host/volume1}"
+
+      # ---- 工具探测（容器内 localhost 指向容器自身，靠兜底链找到宿主服务）
+      PORTAL_TOOLS_EXTRA: "${PORTAL_TOOLS_EXTRA:-}"
+      PORTAL_TOOLS_PROBE_TTL_MS: "10000"
+
+      # ---- 指标与缓存
+      PORTAL_METRICS_INTERVAL_MS: "3000"
+      PORTAL_SESSION_TTL_HOURS: "12"
+      PORTAL_LOG_LEVEL: "info"
+
+      # 首启令牌：留空则自动生成并写入 /data/setup-token.txt，同时打印到日志
+      PORTAL_SETUP_TOKEN: "${PORTAL_SETUP_TOKEN:-}"
+
+    volumes:
+      # 门户数据（SQLite + 首启令牌）—— 必须持久化
+      - homeport-data:/data
+
+      # Docker 引擎。:ro 只是挂载属性，**不代表**只读 API 权限：
+      # 挂了 socket 就等于给出宿主 root 等价能力，门户自身刻意只做只读展示。
+      # 想进一步收敛可用 docker-socket-proxy 只放行 GET（见 06-security.md）。
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+      # Linux 宿主的 /proc（真实 CPU/内存）
+      - /proc:/host/proc:ro
+
+      # TODO 与 PORTAL_DISK_MOUNTS 保持一致；NAS 通常有多个存储卷
+      - /volume1:/host/volume1:ro
+
+      # ---- CLI 模式才需要（API 模式下保持注释）----
+      # TODO 路径按 NAS 实际安装位置改；发现脚本里的 which/readlink 会给出来
+      # - /usr/bin/tailscale:/usr/local/bin/tailscale:ro
+      # - /var/run/tailscale:/var/run/tailscale:ro
+
+    # NAS 上 docker 组 ID 常见为 0/998/100。若启动后容器日志报 EACCES
+    # （无法访问 docker.sock），用发现脚本查到实际 GID 后填这里。
+    group_add:
+      - "${DOCKER_GID:-0}"
+
+    # 让容器内 host.docker.internal 指向宿主，供工具可用性探测兜底
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8899/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  homeport-data:
+    name: homeport-data

@@ -1130,4 +1130,108 @@ curl -s http://127.0.0.1:18899/api/health
 4. `.dockerignore` 排除了 `docs/`，若日后 Dockerfile 需要把文档打进镜像，需同步调整。
 5. GHCR 包的标签列表接口需鉴权，故标签核对以本地 `docker pull` 结果为准。
 
+---
+
+## [2026-10-16] 改为多架构构建 + NAS 部署就绪
+
+### 背景：一次架构误判的纠正
+
+上一条记录里"目标架构"被定为 `linux/arm64`（基于当时用户的选择）。随后用户指出：
+**目标 NAS 是绿联 DX4600 Pro，CPU 为 x86-64**，因此 arm64-only 镜像无法在 NAS 上原生运行
+（会以 `exec format error` 失败）。
+
+结论：原有判断确实有缺陷，改为同时构建 `linux/amd64` 与 `linux/arm64`，
+产出 manifest list，让 x86 主机与 ARM 设备拉同一标签各取所需架构。
+
+> **教训**：NAS 的 CPU 架构不能凭"NAS 常见是 arm64"的印象推断 ——
+> 群晖/绿联等中高端机型多为 x86-64。部署前应实测 `uname -m` 确认。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 修改 | `.github/workflows/docker-publish.yml` | `PLATFORMS` → `linux/amd64,linux/arm64`；`paths-ignore` 增加 compose |
+| 新增 | `docker-compose.nas.yml` | NAS 专用部署文件（用镜像、API 模式、Linux 宿主挂载） |
+| 修改 | `docs/static/08-operations.md` | §1.1 改多架构说明；§3.2 重写为完整的 NAS 部署流程 |
+| 修改 | `README.md` | 镜像说明改多架构；已知限制同步 |
+| 修改 | `todo.md` | 环境备忘新增「目标部署机（NAS）」表；多架构实测项 |
+
+### 逐项明细
+
+#### 修改：`.github/workflows/docker-publish.yml`
+
+- `PLATFORMS: linux/arm64` → `linux/amd64,linux/arm64`。
+- 注释补充关键约束：**多架构 manifest list 本身对老 Docker 没问题，但必须同时保持
+  `provenance: false` / `sbom: false`**，否则 attestation manifest 依旧会让较老的
+  Docker（如 NAS 上的 20.10）挑不中平台。这个组合陷阱容易只改一半。
+- `paths-ignore` 增加 `docker-compose*.yml` —— Dockerfile 不会 `COPY` compose 文件，
+  改它们不该触发一次约 10 分钟的多架构重建。
+
+#### 新增：`docker-compose.nas.yml`
+
+面向 NAS 的独立部署文件，与仓库根 `docker-compose.yml` 的差异：
+
+- `image: ghcr.io/xs-www/homeport:latest` 而非 `build:` —— NAS 上不需要 Node 与编译工具链。
+- 面向 Linux 宿主：挂 `/proc`（真实 CPU/内存）、挂磁盘卷。
+- **tailnet 默认 API 模式**：只需一个只读 Token，不必挂 tailscale 二进制与 socket。
+  NAS 上 Tailscale 多为套件/系统包安装，路径与权限差异大，挂载常失败。
+- 所有需要按 NAS 实际情况修改的地方都标了 `TODO`。
+
+#### 修改：`docs/static/08-operations.md`
+
+- §1.1 从"只构建 arm64"改为多架构说明，补充 `docker image inspect` 确认架构的命令，
+  以及"多架构必须同时关 attestation"的约束。
+- §3.2 由一小段 `.env` 示例重写为完整 NAS 部署流程，新增：
+  - **部署前必须确认的四项**（`uname -m` / docker GID / `df -h` 存储卷 / tailscale 路径）
+    及"发现结果 → 改哪里"的对应表 —— 绿联 UGOS、群晖套件的路径差异无法凭空假定。
+  - tailnet **优先 API 模式**的理由与配置。
+  - 绿联 DX4600 Pro 是 amd64 的明确提示。
+  - 保留传统 `.env` 写法供使用根 compose 的场景。
+
+### 配置/接口/数据模型影响
+
+- 应用侧（环境变量、HTTP 接口、DB）**无变化**。
+- CI 产物由单架构镜像变为 manifest list：`latest` 等标签现在指向 index，
+  内含 `linux/amd64` 与 `linux/arm64` 两个 manifest。
+- 新增 `docker-compose.nas.yml`（不影响本机 `docker compose up` 的行为）。
+
+### 验证方式
+
+```bash
+# 1) 多架构构建
+git push origin master                      # run #3
+# → completed / success，全部步骤通过
+
+# 2) manifest list 是否真的含两个平台
+docker buildx imagetools inspect ghcr.io/xs-www/homeport:latest
+# → MediaType: application/vnd.oci.image.index.v1+json
+#   Platform: linux/amd64
+#   Platform: linux/arm64          ✅ 两份都在
+
+# 3) 本机（amd64）拉取是否自动选对架构
+docker pull ghcr.io/xs-www/homeport:latest
+docker image inspect ghcr.io/xs-www/homeport:latest --format '{{.Os}}/{{.Architecture}} {{.Size}}'
+# → linux/amd64 288235170        ✅ 自动匹配，不再需要 QEMU 模拟
+
+# 4) amd64 产物冒烟（与 NAS 将要运行的是同一架构产物）
+docker run -d --name homeport-amd64-smoke -p 18899:8899 ghcr.io/xs-www/homeport:latest
+docker ps --filter name=homeport-amd64-smoke
+# → Up (healthy)
+curl -s http://127.0.0.1:18899/api/health      # → status:ok
+(Invoke-WebRequest http://127.0.0.1:18899/).Content
+# → <title>HomePort · Tailnet 门户</title>   ✅
+```
+
+### 已知限制 / 后续
+
+1. **NAS 实际部署仍未执行（阻塞于访问方式）**：本机无 ssh config，NAS 的
+   2375/2376 未开放，因此无法取得 NAS 的 shell 或 Docker API。
+   已交付 `docker-compose.nas.yml` 与四步发现脚本，具备执行条件即可落地。
+2. `docker-compose.nas.yml` 里的默认路径（`/volume1`、tailscale 路径）是**占位值**，
+   必须按发现脚本的实际结果修改；绿联 UGOS 的卷路径可能与群晖不同。
+3. 多架构构建耗时明显上升（QEMU 下 arm64 需重编 `better-sqlite3`），
+   仅需单架构时应临时把 `PLATFORMS` 收窄。
+4. 仍然只构建镜像、不跑测试（`typecheck` / `test` 未纳入 CI）。
+
+
 
