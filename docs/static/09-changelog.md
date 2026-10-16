@@ -1977,5 +1977,825 @@ npx vitest run --root server         # 339 passed
    `MANAGED_ENV` + 保存/恢复）。它们验的正是"环境变量层"，保留这种写法；后续可改用
    `loadConfig({ envVars })` 注入，进一步减少对全局状态的依赖。
 
+---
+
+## [2026-10-16] Sprint 1：服务注册表 + 服务墙 + `Ctrl/Cmd+K` 聚合搜索（S1-01…S1-05）
+
+### 背景与目标
+
+首页此前"看不懂"：门户把**容器**当成入口单位展示，于是"家庭日历"是一个容器 + 一条
+`127.0.0.1:36065` 的端口 + 三条 `tailscale serve` 路径，用户得自己拼出"到底该点哪个"。
+Sprint 1 在容器之上引入**服务**这一层：把容器与 serve 路由归纳成用户认得的东西，
+每个服务给**唯一首选入口**，但**永远保留全部候选**（含不可达），并让"为什么不可达"可解释。
+
+设计契约冻结在 `docs/sprint1-implementation-spec.md`（字段名与行为不改，发现契约有问题先改契约），
+索引级实施/升级/验收说明在 `IMPLEMENTATION_REPORT_S1.md`。本条是**逐文件逐符号**的归档：
+仓库其它静态文档已在本轮同步（`01` 架构分层、`03` 模块函数表、`04` §6.5/§6.6、
+`05` 首页/详情/管理页与组件、`06` SSRF 与图标 CSP、`07` 迁移 v4 三表、`08` §7.1/§10），
+这里只**引用**不重复抄录。本轮**没有新增任何运行时依赖**（未引图标库 / react-query /
+headlessui，后端未加新包）。
+
+三条贯穿全 Sprint 的纪律（后面每个文件都在服务这三条）：
+
+1. **身份稳定**：服务身份 = `source_type + source_ref`，`source_ref` 里**没有容器 ID**。
+   容器重建换 ID 后仍命中同一行 `services`，用户改过的名称/图标/排序/收藏/首选入口全部保留。
+2. **自动发现不得覆盖用户配置**：这是 **SQL 结构保证**，不是"开发者记得别覆盖"的纪律
+   （见下文 `upsertDiscovered()` 的 `CASE WHEN user_edited = 0`）。
+3. **状态诚实**：容器运行 / 入口可达 / 健康检查是**三个独立维度**，永远不合并成"服务挂了"；
+   首选入口只从**可达**候选里取，一个都没有就 `entry: null` 并给出原因 —— 界面宁可不给链接，
+   也不给一个点了打不开的死链。
+
+### 变更概览
+
+| 类型 | 文件 | 说明 |
+| --- | --- | --- |
+| 新增 | `IMPLEMENTATION_REPORT_S1.md` | 索引级实施报告：交付概览、升级/回滚、真实库演练与实机验收记录（升级前必读） |
+| 新增 | `docs/sprint1-implementation-spec.md` | Sprint 1 冻结设计契约（数据模型/发现规则/入口优先级/状态语义/API/UI/测试要求） |
+| 修改 | `server/src/db/database.ts` | 迁移 **v4 `services_registry`**：纯追加 `services` / `service_bindings` / `service_preferences` 三表 + 三个索引 |
+| 新增 | `server/src/db/services.ts` | `ServicesRepository`（服务注册表仓储）+ `slugify`；用户字段保护全在这里 |
+| 修改 | `server/src/db/types.ts` | 新增 `ServiceRow` / `ServiceBindingRow` / `ServicePreferenceRow` 与 `Service` / `ServiceBinding` 及映射函数 |
+| 新增 | `server/src/modules/services/types.ts` | 服务注册表 **HTTP 契约类型**（`ServiceView` / `ServiceListResponse` / `ServiceDetailResponse` / 搜索与健康响应） |
+| 新增 | `server/src/modules/services/registry.ts` | S1-01/S1-02/S1-05 的**纯逻辑**：稳定身份、发现规划、入口优先级与去重、三维状态 |
+| 新增 | `server/src/modules/services/service.ts` | `ServiceRegistryService` 编排（发现落库、列表/详情视图、写操作校验与审计、健康探测）+ 可单测辅助函数 |
+| 新增 | `server/src/modules/services/healthProbe.ts` | 健康探测的 SSRF 拒绝清单、URL 校验与请求纪律（`validateHealthTarget` / `runHealthProbe`） |
+| 新增 | `server/src/api/services.ts` | `registerServiceRoutes`：`/api/services/*`，写操作 handler 内 `assertAdmin` |
+| 新增 | `server/src/api/search.ts` | `registerSearchRoutes` + 纯函数 `buildSearchHits`；`GET /api/search` 四类聚合、按角色过滤 |
+| 修改 | `server/src/http/schemas.ts` | 新增 7 个 `.strict()` zod schema（服务查询/创建/更新/删除/排序/健康、搜索查询） |
+| 修改 | `server/src/api/index.ts` | `PROTECTED_PREFIXES` 增加 `/api/services` 与 `/api/search`（前缀守卫 = 登录 + CSRF） |
+| 修改 | `server/src/api/context.ts` | `RouteContext` 增加 `services: ServiceRegistryService` |
+| 修改 | `server/src/app.ts` | 装配 `ServicesRepository` 与 `ServiceRegistryService`（**构造期不拉数据**） |
+| 新增 | `server/tests/support/serviceFixtures.ts` | 真实拓扑夹具（`realTopology()` / `makeContainer` / `makeServeRoute` / `makePort` …），`servicesDiscovery.test.ts` 的地基 |
+| 新增 | `server/tests/servicesDiscovery.test.ts` | 22 用例：稳定身份、serve 归属、入口优先级与去重、三维状态、构造时机、100 服务性能 |
+| 新增 | `server/tests/servicesApi.test.ts` | 22 用例：鉴权/CSRF、校验与危险 URL、hidden 过滤、reorder、DELETE 三种语义、健康探测 |
+| 新增 | `server/tests/servicesHealthProbe.test.ts` | 17 用例：拒绝清单、注入 fetch 的请求纪律（不跟随跳转/超时/零请求）、探测目标优先级 |
+| 新增 | `server/tests/servicesSearch.test.ts` | 12 用例：分组顺序与命中优先级、limit 上限、角色过滤、绝不索引设置/用户/审计 |
+| 新增 | `server/tests/migrationV4.test.ts` | 9 用例：v3→v4 无损、幂等、发现后服务行与用户覆盖保留、空发现不删行 |
+| 修改 | `server/tests/migrationV3.test.ts` | 回落脚本同时抹掉 v4 三表并删 `version IN (3,4)`；断言改为"迁移链末端"而非硬编码 3 |
+| 修改 | `e2e/smoke.spec.ts` | 登录落点断言从总览改为服务墙、总览用例改走 `/overview`；末尾追加 2 条 Sprint 1 用例 |
+| 修改 | `web/src/App.tsx` | 路由：`/` = 服务墙、新增 `/overview`（总览原样迁移）、`/services/:id`、`/admin/services`（adminOnly） |
+| 修改 | `web/src/layout/AppShell.tsx` | 侧栏新增「服务」「服务管理」两项；挂 `CommandPaletteProvider`；`end` 精确高亮 |
+| 修改 | `web/src/api/client.ts` | 新增 9 个方法：`services` / `service` / `createService` / `updateService` / `deleteService` / `reorderServices` / `discoverServices` / `probeServiceHealth` / `search` |
+| 修改 | `web/src/api/types.ts` | 服务与搜索契约类型的**逐字段镜像**（含 `ServiceListParams` / `ServiceCreateRequest` / `ServiceUpdateRequest` / `ServiceReorderRequest`） |
+| 修改 | `web/src/components/ui.tsx` | `Icon` 新增 `dashboard` 与 `server` 两个内联图形（侧栏用） |
+| 新增 | `web/src/components/Modal.tsx` | 可复用模态框：焦点陷阱、`initialFocusRef`、关闭后归还焦点、Esc/遮罩关闭 |
+| 新增 | `web/src/components/ServiceIcon.tsx` | 图标白名单 + `https://` 图片渲染 + 未知键兜底 |
+| 新增 | `web/src/components/UrlCandidateList.tsx` | 候选入口列表（卡片抽屉与详情页共用），不可达项照列并标注 |
+| 新增 | `web/src/components/ServiceCard.tsx` | 服务卡片 + `ServiceStatusBadges`（三个独立状态点）+ `describeSourceType` |
+| 新增 | `web/src/components/ServiceForm.tsx` | 新建/编辑表单（E2E 依赖的稳定 `#service-*` id、危险 URL 前端拦截、后端 `fieldErrors` 回填） |
+| 新增 | `web/src/components/CommandPalette.tsx` | `Ctrl/Cmd+K` 命令面板（Provider / 面板 / hook），150ms 防抖 + 递增序号竞态保护 |
+| 新增 | `web/src/pages/ServicesPage.tsx` | 首页服务墙 + 导出纯函数 `buildServiceGroups` / `discoveryMessages` |
+| 新增 | `web/src/pages/ServiceDetailPage.tsx` | `/services/:id`：三个状态点、`status.reasons` 逐条、全部候选、诊断信息 |
+| 新增 | `web/src/pages/AdminServicesPage.tsx` | `/admin/services`：排序/收藏/可见性/编辑/新建/删除与隐藏/重置为自动/重新发现/健康探测 |
+| 新增 | `web/tests/serviceTestUtils.ts` | web 单测夹具：fetch 桩（`stubFetch` / `callsTo`）、会话桩、`serviceView` / `listResponse` 等 |
+| 新增 | `web/tests/services.test.tsx` | 12 用例：卡片与分组、降级提示与空态、viewer 无管理入口、详情页 404 不白屏 |
+| 新增 | `web/tests/adminServices.test.tsx` | 6 用例：管理页按钮契约与可见名、排序 payload、重新发现、编辑 Modal 固定 id、可见性/收藏、重置为自动的二次确认 |
+| 修改 | `docs/static/09-changelog.md` | **本条归档自身**（只追加，未改动任何历史条目） |
+| 新增 | `web/tests/serviceForm.test.tsx` | 9 用例：label/id 契约、危险 scheme 拦截、提交体逐字段符合契约、400 fieldErrors 呈现 |
+| 新增 | `web/tests/commandPalette.test.tsx` | 8 用例：Ctrl/Meta+K、Esc 归还焦点、防抖请求、aria-selected、四类 Enter 行为 |
+| 修改 | `docs/static/01-architecture.md` | 服务层在数据流中的位置（事实层 / 注册表层 / 派生层）与 F0 能力 |
+| 修改 | `docs/static/02-configuration.md` | 明确本轮**无新增环境变量** |
+| 修改 | `docs/static/03-server-modules.md` | 服务注册表模块与 `ServicesRepository` 的方法签名表 |
+| 修改 | `docs/static/04-api-contract.md` | 新增 §6.5 服务注册表、§6.6 聚合搜索、入口与状态语义表、鉴权矩阵 |
+| 修改 | `docs/static/05-web-modules.md` | 首页/详情页/管理页职责与组件导出表（`data-status`、稳定 id 等契约） |
+| 修改 | `docs/static/06-security.md` | 出站探测授权边界（SSRF）与残余风险、外部图标 CSP 说明 |
+| 修改 | `docs/static/07-data-model.md` | 迁移 v4 三张表逐列说明与"什么不落库"的理由 |
+| 修改 | `docs/static/08-operations.md` | §7.1 升级/回滚步骤；**§10 备份改为方案 A（`VACUUM INTO`）+ 方案 B（停容器整卷打包）** |
+| 修改 | `README.md` | 能力表新增 F0 服务墙；"只读设计"补充唯一例外（服务配置只写门户自己的库） |
+| 修改 | `todo.md` | F0 勾选项（含 WAL 备份修正）+ 三条技术债（Modal 迁移、图标 CSP、NAS 复核） |
+
+> 上表 53 行覆盖 `git status --porcelain` 的**全部 50 个条目**（含本条归档自身
+> `docs/static/09-changelog.md`），所以行数比条目数多 3：`server/src/modules/services/`
+> 是**一个**目录条目，这里展开为 4 行（`types.ts` / `registry.ts` / `service.ts` / `healthProbe.ts`）；
+> 另一个目录条目 `server/tests/support/` 只有 1 个文件（`serviceFixtures.ts`），一行即可；
+> 其余条目一行一个。合计 53 个文件 = 53 行。
+
+### 逐项明细
+
+#### 新增：`server/src/modules/services/types.ts`（HTTP 契约）
+
+- `ServiceEntryView` — `{ kind: EntryKind; label: string; url: string; rank: number; accessible: boolean; detail: string | null }`。
+  单个入口候选；`accessible=false` 的条目**仍然返回**（诊断要靠它）。
+- `ServiceStatusView` — `{ container: ContainerState | null; reachable: boolean | null; health: ServiceHealth; reasons: string[] }`。
+  三个维度分开；`container=null` 表示无容器绑定的纯 serve/手工服务，`reachable=null` 表示**数据源不可用（不确定 ≠ 不可达）**。
+- `ServiceContainerRef` — `{ id; name; state; image }`，只描述"当前关联的那个容器"，不参与身份。
+- `ServiceView` — 服务墙/详情共用的主体：数据库长期事实（`id`/`slug`/`displayName`/`sourceType`/`sourceRef`/
+  `visibility`/`sortOrder`/`favorite`/`userEdited`/`healthTarget`/`healthPath`/时间戳）+ 用户配置
+  （`preferredUrl`）+ 实时派生（`entry`/`entries`/`entryCount`/`status`/`container`）。
+- `ServiceDiscoveryState` — `{ dockerAvailable; serveAvailable; serveDetail; discoveredAt; notes[] }`；
+  **降级必须透出**，界面不许"静默为空"。
+- `ServiceListResponse` — `{ items; total; categories; discovery; generatedAt }`。
+- `ServiceDiagnostics` — `{ containerPorts[]; serveRoutes[]; notes[] }`，详情页"为什么是这个结论"的原始事实。
+- `ServiceDetailResponse` — `{ service; candidates（全部候选含不可达）; diagnostics }`。
+- `ServiceSearchKind` / `ServiceSearchHit` / `ServiceSearchResponse` — 搜索契约（`kind` 四类、
+  `url` 可为 null：设备没有可点击入口）。
+- `ServiceHealthView` / `ServiceHealthResponse` — `{ state: 'ok' | 'fail'; statusCode; durationMs; detail; at }`。
+- `ServiceDeleteResponse` — `{ ok: true; mode: 'deleted' | 'hidden' | 'reset'; service: ServiceView | null }`。
+- 文件头写明**改字段必须同步三处**：本文件、`docs/static/04-api-contract.md`、`web/src/api/types.ts`
+  （前端逐字段镜像，不做运行时转换）。
+
+#### 修改：`server/src/db/database.ts`（迁移 v4）
+
+- 新增迁移项 `{ version: 4, name: 'services_registry', up }`，追加在 `MIGRATIONS` 末尾（append-only，无 `down`）。
+- **纯追加**：只 `CREATE TABLE` / `CREATE INDEX`，既有表（`users`/`sessions`/`preferences`/`settings`/
+  `audit_log`/TOTP 两张表）**一列未改**，升级不改写任何既有行。
+- `services`：`id TEXT PRIMARY KEY`、`slug TEXT NOT NULL UNIQUE`、`display_name`、`description`、`icon`、
+  `category`、`preferred_url`、`source_type`、`source_ref`、`binding_refs TEXT NOT NULL DEFAULT '[]'`、
+  `visibility TEXT NOT NULL DEFAULT 'visible'`、`sort_order INTEGER NOT NULL DEFAULT 100`、
+  `favorite INTEGER NOT NULL DEFAULT 0`、`health_target`、`health_path`、
+  `user_edited INTEGER NOT NULL DEFAULT 0`、`created_at`/`updated_at`/`updated_by`，
+  以及 **`UNIQUE (source_type, source_ref)`** —— 稳定身份在 schema 层就被钉住。
+- `service_bindings`：自增主键，`service_id ... REFERENCES services(id) ON DELETE CASCADE`，
+  `kind`（`container`/`serve`）、`ref`、`container_id`、`container_name`、`compose_project`、`compose_service`、
+  `scheme`/`host`/`port`/`path`/`url`、`reachability`、`accessible`、`rank`、时间戳，
+  **`UNIQUE (service_id, kind, ref)`**；索引 `idx_service_bindings_service`。
+- `service_preferences`：`key TEXT PRIMARY KEY` / `value TEXT NOT NULL` / `updated_at TEXT NOT NULL`
+  （统一 TEXT，避免"加一项偏好就迁移一次"）。
+- 索引：`idx_service_bindings_service`、**`idx_services_sort(visibility, sort_order, display_name)`**
+  （服务墙的主查询形状）、`idx_services_source(source_type, source_ref)`。
+- 文件内注释写明"候选入口、可达性、运行态、健康结果一律实时计算不落库"，以及
+  `service_bindings` 只是"上一次发现结果的快照，可丢可重算"。
+
+#### 新增：`server/src/db/services.ts`（S1-01 仓储）
+
+只做存取：**不知道 Docker、不知道 serve、不知道入口优先级**，因此能被迁移测试与 API 测试单独驱动。
+
+- `slugify(value: string): string` — 小写、非字母数字转 `-`、折叠、去首尾、截断 60 字符；
+  中文会被剥空，**由调用方兜底**（`slugBaseFor` 用 `sourceRef` 保证不空）。
+- `NewServiceInput` / `DiscoveryUpdateInput` / `UserFieldPatch` / `BindingInput` —
+  三类写入输入显式分开：`DiscoveryUpdateInput` **在类型里就没有用户字段**
+  （`preferredUrl`/`visibility`/`sortOrder`/`favorite`/`health_*` 根本不存在），
+  这是"发现不可能改用户配置"的第一层保证。
+- `class ServicesRepository`
+  - `listAll(): Service[]` — `ORDER BY sort_order ASC, display_name ASC`。
+  - `findById(id)` / `findBySource(sourceType, sourceRef)` / `findBySlug(slug)` — 后两者分别是稳定身份查重与 slug 冲突检测。
+  - `listBindings(serviceIds?: readonly string[]): ServiceBinding[]` — **单条 SQL** 取回绑定
+    （`WHERE service_id IN (...)`），避免 100 个服务时 N+1；传空数组直接返回 `[]` 而不发 SQL。
+  - `uniqueSlug(base: string): string` — 规范化后冲突则追加 `-2`、`-3`…（上限 500 次，兜底加时间戳）；
+    空基名回退 `'service'`。
+  - `insert(input: NewServiceInput): Service` — 写入后**读回**，读不回来直接抛错
+    （宁可立刻失败，也不要返回一个"看起来成功"的幽灵行）。
+  - `upsertDiscovered(id, input: DiscoveryUpdateInput): void` — **S1-01 的核心**：
+    `SET display_name = CASE WHEN user_edited = 0 THEN ? ELSE display_name END`，
+    `description`/`icon`/`category` 同理；`binding_refs` 始终更新（它是发现结果的映射，不是用户字段）。
+    **SQL 里根本没有写 `preferred_url`/`visibility`/`sort_order`/`favorite`/`health_*` 的赋值** ——
+    想误覆盖也写不出来。
+  - `updateUserFields(id, patch: UserFieldPatch, updatedBy): Service | null` — **唯一**能改展示属性的入口；
+    动态拼 `SET`，**必然追加 `user_edited = 1`**；空 patch 直接返回当前行（不发无意义的 UPDATE）。
+  - `clearUserOverrides(id): Service | null` — 管理员显式"重置为自动"：`user_edited = 0`，
+    清 `description`/`icon`/`category`/`preferred_url`/`health_*`，`favorite = 0`、`sort_order = 100`；
+    **刻意保留 `display_name`**（等下一次发现按 `user_edited = 0` 覆盖，避免出现空名卡片）。
+  - `setVisibility(id, visibility, updatedBy)` — 走 `updateUserFields`，因此隐藏动作同样置 `user_edited = 1`
+    （"用户决定隐藏"必须活过下一次发现）。
+  - `reorder(entries, updatedBy): void` — 单事务批量 UPDATE，**同时置 `user_edited = 1`**
+    （排序是用户决定，自动发现不许覆盖）。
+  - `delete(id): void` — 事务内**先显式删绑定再删服务**：虽然 `ON DELETE CASCADE` 够用，
+    但显式删一次不依赖 `foreign_keys` pragma 的开启状态。
+  - `replaceBindings(serviceId, bindings): void` — 单事务 `DELETE` + 批量 `INSERT`，整体替换快照
+    （快照永不越攒越脏）。
+  - `getPreference(key)` / `setPreference(key, value)` — `ON CONFLICT(key) DO UPDATE` 的 KV 单例偏好。
+  - `count(): number` — 计数（测试与摘要用）。
+
+#### 修改：`server/src/db/types.ts`
+
+- 新增 `ServiceSourceType = 'docker' | 'serve' | 'manual'`、`ServiceVisibility = 'visible' | 'hidden'`、
+  `ServiceBindingKind = 'container' | 'serve'`。
+- 新增 `ServiceRow` / `ServiceBindingRow` / `ServicePreferenceRow`（**snake_case，与列一一对应**）
+  与 `Service` / `ServiceBinding`（camelCase，业务层用），两者之间只经过映射函数，不做隐式转换。
+- 新增 `normalizeSourceType(value)` / `normalizeVisibility(value)`（非法值回退默认，
+  避免旧库里的意外字符串把类型污染到业务层）、`parseBindingRefs(raw)`（JSON 列解析，
+  **坏 JSON 退回 `[]` 而不是抛**，防止一行脏数据让整个服务墙 500）。
+- 新增 `mapServiceRow` / `mapServiceBindingRow` — 行 → 领域对象，`favorite`/`accessible`/`userEdited`
+  在这里从 INTEGER 转 boolean。
+
+#### 新增：`server/src/modules/services/registry.ts`（S1-02 纯逻辑核心）
+
+**不认识数据库、不发任何请求**，因此可以用真实拓扑做夹具逐条断言（不起 Docker、不起 HTTP）。
+
+- `type EntryKind = 'user' | 'serve' | 'tailnet' | 'lan' | 'localhost'`。
+- `ENTRY_RANK: Record<EntryKind, number>` — `user: 0`、`serve: 1`、`tailnet: 2`、`lan: 3`、`localhost: 4`。
+  这就是验收"日历首选 `/calendar`（rank 1）而不是 `:36065`（rank 3）"的全部依据。
+- `ENTRY_LABEL` — UI 文案：用户指定 / Serve HTTPS / Tailnet / 局域网 / 仅本机。
+- `interface ServiceEntry` — `{ kind; label; url; rank; accessible; detail }`；`localhost` 恒 `accessible=false`。
+- `BUILTIN_ICONS`（26 个键，`as const`）、`type BuiltinIcon`、`isBuiltinIcon(value): value is BuiltinIcon`、
+  `FALLBACK_ICON = 'container'`。前端 `ServiceIcon` 必须与这张白名单保持一致（未知键不出现空白方块）。
+- `normalizeContainerName(name): string` — 小写 + 剥副本后缀 `([-_]\d+)+$`（`sisi-calendar-1` → `sisi-calendar`）。
+- `containerServiceRef({ name, composeProject?, composeService? }): string` — 有 Compose 服务名时
+  `docker:<项目>/<服务>`（无项目名则 `docker:<服务>`），否则 `docker:<规范化容器名>`。
+  **任何分支都不含容器 ID**，这是"容器重建配置不丢"的唯一实现方式。
+- `serveServiceRef({ host, port, path }): string` — `serve:<host 小写去尾点>:<port><规范化路径>`。
+- `normalizePath(path): string` — 空 → `/`；补前导 `/`；去尾斜杠（根路径保留）。
+- `Presentation` + 私有的 `PRESENTATION_RULES`（顺序即优先级，命中即停）+
+  `defaultPresentation({ name, image? }): Presentation` — 按容器名/镜像派生"初值"
+  （日历→家庭日历/家庭/calendar、gitea|git→Gitea、homeport|portal→HomePort、cs22→CS22……）；
+  只作初值，用户改过后永不再生效。`humanizeName(name)` 剥后缀、分隔符转空格、短词大写。
+- `DEFAULT_CATEGORY = '未分类'`。
+- `DiscoveredBinding` / `DiscoveredService` / `DiscoveryInput` / `DiscoveryPlan` — 发现的中间数据形状。
+- `planDiscovery(input: DiscoveryInput): DiscoveryPlan` — 发现规划（纯函数，落库与否交给调用方）：
+  1. 每个容器按 `containerServiceRef` 归并；同 `sourceRef` 的**副本容器合并成一个服务**
+     （同一 `ref + containerId` 只保留一份绑定，避免重复卡片）；容器绑定的
+     `accessible` 只认 `tailnet`/`lan`，`rank` 由可达性映射。
+  2. serve 路由复用 `mapServeRoutes` 已算好的 `containerName/containerId` 归属（**不重复实现匹配**）；
+     serve 绑定 `accessible` 恒 `true`、`rank = ENTRY_RANK.serve`。
+  3. 归属不到唯一容器 → **不猜**：作为独立 serve 服务列出，并在 `notes` 里写明
+     "未归属到唯一容器（可能是多容器端口冲突，或该目标不是容器）"；同一 serve 只解释一次。
+  4. 独立 serve 服务的展示名：根路径用主机名首段，否则用路径末段（带 `serve` 提示）。
+  5. `dockerAvailable === false` / `serveAvailable === false` 各自写入一条面向人的 `notes`
+     （后者带上 `serveDetail`），并把可用性原样透传到 `DiscoveryPlan`。
+- `normalizeUrl(raw, hostContext?): string` — **只用于去重与比较**，不用于展示：host 小写去尾点去方括号、
+  默认端口省略（https:443 / http:80）、路径去尾斜杠、丢弃 query/hash；
+  **`0.0.0.0` / `::` / 空主机 → host 上下文的主机名**（对应"同一容器的 `::` 与 `0.0.0.0` 映射不得重复"）；
+  解析失败时返回 trim 后的小写原值，保证"同一个坏 URL"仍能相互去重。
+- `normalizeHost(host, hostContext?): string` — 通配/空主机统一成 `hostContext.primaryHost`，没有则 `localhost`。
+- `isLocalhostUrl(url): boolean` — 复用 `util/net.ts` 的 `isLoopbackHost`（`127.0.0.1` / `localhost` / `::1`）。
+- `buildServiceEntries(input): ServiceEntry[]` — 候选入口全集：
+  `preferredUrl` → `user`（管理员显式保存并验证过，**按定义视为可达**，由健康检查负责证伪）；
+  绑定的 serve 路由 → `serve`（detail 写 `serve → <proxy>`）；
+  容器端口 → `tailnet`/`lan`/`localhost`；`hostPort === null` 跳过；
+  mapper 对 localhost-only 端口刻意不给 url，这里补 `http://localhost:<port>/` 以便诊断与"仅本机"提示
+  （注释写明这是**有意为之**：不是给可点击主入口，而是让用户看到"它只在本机"）；
+  不可达且非 localhost-only 的端口不产出候选。最后交给 `dedupeEntries`。
+- `dedupeEntries(entries, hostContext?): ServiceEntry[]` — **两个去重键**：
+  ① 规范化完整 URL（同 URL 取 rank 更高者，同 rank 时取"可达"者）；
+  ② **`loopback:<port><path>`**（把 `127.0.0.1:8080` 与 `localhost:8080` 视为同一主机，保留 rank 更优者）。
+  这就是 spec §3.2 的"去重两个键"。返回前用 `compareEntries` 稳定排序。
+- `compareEntries(hostContext?)` — rank 升序 → 路径深度（浅者优先）→ 端口升序 → URL 字典序；
+  完全确定，测试可断言。`pathDepth` 解析失败给 99、`urlPort` 解析失败给 9999（坏 URL 排最后，不抛）。
+- `pickEntry(entries): ServiceEntry | null` — **首个 `accessible === true`** 的候选；一个都没有 → `null`
+  （UI 显示"无可达入口"+ 原因）。
+- `ContainerState = 'running' | 'stopped' | 'absent'`、`ServiceHealth = 'ok' | 'fail' | 'unknown' | 'skipped'`、
+  `ServiceStatus`、`ResolveStatusInput`。
+- `resolveServiceStatus(input): ServiceStatus` — 三维判定与 `reasons`：
+  - 容器：有容器按 `state === 'running'` 分 running/stopped；`sourceType === 'docker'` 但没有容器 → `absent`
+    （**不是"服务挂了"**）；纯 serve/手工服务 → `null`。
+  - 可达：有任一可达候选 → `true`；**Docker 与 serve 都不可用 → `null`（不确定 ≠ 不可达）**；
+    否则 `false` 并区分"没有发现任何入口"/"所有候选入口都只能在宿主机本机访问"。
+  - 典型误报专门处理：容器端口 `localhost-only` 但存在 serve 入口 → `reachable=true` 且 reasons 写明
+    "容器端口仅绑本机，经 Serve 提供 tailnet 入口"；没有 serve 才提示"局域网与 tailnet 都访问不到"。
+  - 健康：没配目标 → `skipped`（默认，不探测）；配了但没结果 → `unknown`；有结果取 `ok`/`fail` 并把 detail 写进 reasons。
+  - serve 不可用且该服务没有任何 serve 候选 → reasons 补"Serve 配置读不到，Serve 入口可能缺失"。
+- `findContainerForService({ sourceRef, containerIds, containerNames, containers })` — 匹配顺序：
+  绑定里的容器 ID（可能过期）→ 绑定的容器名 → 由 `sourceRef` 反推的稳定标识。
+  **不能只看 ID**：容器重建后 ID 变了而 `sourceRef` 不变，这正是身份稳定的价值所在。
+- `serveRoutesForService({ bindingRefs, container, serveRoutes })` — 按稳定 ref 或"当前容器的 id/name 归属"过滤，
+  并按 ref 去重。
+- `slugBaseFor(displayName, sourceRef): string` — 用"展示名 + ref 派生词"拼 slug 基名：
+  中文会被 `slugify` 剥空，所以必须带 ref 兜底，否则所有中文服务会撞成同一个 slug。
+
+#### 新增：`server/src/modules/services/service.ts`（S1-03 编排 + S1-05）
+
+分层：**本文件只做编排**（发现→落库→算视图），业务判断在 `registry.ts`，存取在 `db/services.ts`，
+探测安全边界在 `healthProbe.ts`。三条实现纪律写在文件头，其中第一条最容易违反：
+
+1. **不在启动时拉数据**：构造函数不发起任何请求，第一次请求（或 `discover`）才触发 `sync()`
+   —— 否则"设置还没生效就去读 Docker"会在冷启动时读到过期配置。
+2. 发现过程只调用仓储的 `insert` / `upsertDiscovered` / `replaceBindings`，**绝不自己写 UPDATE**。
+3. 候选入口、可达性、运行态、健康结果当场算，DB 里只留发现快照。
+
+- `type ServiceRole = 'admin' | 'viewer'`、`interface ServiceActor { userId; username; ip }`、`ServiceRegistryServiceDeps`
+  （`containers` / `tailscale` / `repository` / `audit` / `config` / `logger`）。
+- `DiscoverySnapshot` / `ServiceListQuery` / `ServiceCreateInput` / `ServiceUpdateInput` / `ServiceOrderEntry`。
+- `DISCOVERY_CACHE_TTL_FALLBACK_MS = 5000` — 发现缓存 TTL 优先跟随
+  `config.cache.containersTtlMs`（默认 2s，可在设置页热调）；仅在配置值非法（NaN/负）时才回退 5000ms
+  （理由：底层 `containers.list` 本来就是这个 TTL，发现比它更频繁只会重复扫同样的数据）。
+- `HEALTH_RESULT_LIMIT = 512` — 内存里保留的健康结果上限（超出淘汰最早一条）。
+- `class ServiceRegistryService`
+  - `constructor(deps)` — 建 `TtlCache<DiscoverySnapshot>`（`maxEntries: 4`）与内存 `healthResults`；
+    **不拉数据**（`servicesDiscovery.test.ts` 有一条用例直接钉住这一点）。
+  - `sync(request?, { force? }): Promise<DiscoverySnapshot>` — 默认走 TTL 缓存（页面刷新、
+    多客户端同时打开不会各扫一遍 Docker）；`force: true` 先删缓存键再执行（供 `POST /discover`）。
+  - `runDiscovery(request?)`（私有）— 取实时数据 → `planDiscovery` → 对每个发现结果：
+    既有服务走 `upsertDiscovered`（用户字段由 SQL 保护）、新服务 `insert`（`slug` 由 `uniqueSlug` 保证唯一、
+    `userEdited: false`）→ `replaceBindings` 整体重建快照；返回 `{ plan, discoveredAt }`。
+  - `list(request, query = {}, role = 'viewer'): Promise<ServiceListResponse>` — `sync` + 取实时容器 +
+    按 `canSee` 过滤（非 admin 永远只看 `visible`）+ `matchesQuery` + 构建视图；
+    返回 `{ items, total, categories, discovery, generatedAt }`。
+  - `detail(id, request, role = 'viewer'): Promise<ServiceDetailResponse>` — 列表项 + **全部候选入口**
+    （`candidates`）+ 诊断（`containerPorts` / `serveRoutes` / `plan.notes`）。
+    hidden 服务对非 admin 抛 **`notFound`（不是 403）**：403 会泄露"这里确实有一个你看不到的服务"。
+  - `create(input, actor, request): Promise<ServiceView>` — 手工服务：名称 trim 后为空 → 400；
+    `preferredUrl`/`healthTarget`/`healthPath`/`icon` 全部**先校验再落库**；
+    身份固定为 `manual:<uuid>`、`userEdited: true`（手工创建即"用户编辑过"，后续发现不许改写）；
+    返回前写审计 `service.create`。
+  - `update(id, patch, actor, request)` — 逐字段清洗（`emptyToNull` / `cleanIcon` / `cleanOptionalUrl` /
+    `cleanHealthPath`）后交给 `updateUserFields`；审计 `service.update`，detail 只记**改了哪些字段名**，
+    不把 URL 之类写进日志噪声。
+  - `remove(id, mode, actor, request)` — 三种语义（S1-03 验收）：
+    `mode === 'reset'` → `clearUserOverrides` + 删内存健康结果 + 审计 `service.reset`；
+    `sourceType === 'manual'` → 真删（它只存在于注册表里，没有"自动层"可回退）+ `service.delete`；
+    其它 → `setVisibility('hidden')` 保留配置 + `service.hide`
+    （**容器临时没起来就把用户配置删掉，是这类面板最容易犯的错**）。
+  - `reorder(entries, actor, request)` — 先逐个确认服务存在（不存在 → 404，不做部分写入），
+    再单事务排序，返回**含 hidden 的完整列表**供前端整体替换本地状态；审计 `service.reorder`。
+  - `probeHealth(id, overrideTarget, actor, request)` — 目标优先级见 `resolveHealthTarget`；
+    没有目标 → 400；`runHealthProbe` 后 `rememberHealth`（只进内存）+ 审计 `service.health`
+    （含结果与原因）；返回最新视图与本次结果。
+  - 私有 `viewOf` / `computeContext` / `buildView` / `loadLive` / `buildHost` / `neutralRequest` /
+    `groupBindings` / `requireService` / `requireVisible` / `rememberHealth` / `audit`。
+    其中 `computeContext` 是视图的唯一来源（入口与状态**每次请求重算**，只用 DB 里的用户配置）；
+    `neutralRequest()` 给无请求上下文的调用（后台/测试直接 `sync()`）一个中性 host 上下文；
+    `audit()` **失败只 warn**（写操作已完成，不该因为审计失败回滚或报 500）。
+- 导出的纯辅助函数（便于直接单测）：
+  - `resolveHealthTarget({ overrideTarget?, healthTarget?, healthPath?, entry? }): string | null` —
+    显式覆盖 → 已保存 `healthTarget` → `healthPath` 追加到首选入口（相对路径语义）；都没有 → `null`。
+  - `hasHealthTarget(service: Pick<Service, 'healthTarget' | 'healthPath'>): boolean` — 任一非空即"配了健康检查"
+    （决定默认 `skipped` 还是 `unknown`）。
+  - `cleanOptionalUrl(value, field: 'preferredUrl' | 'healthTarget'): string | null` — 校验并规范化，
+    非法直接抛 400 并带 `fieldErrors`。**刻意复用 `validateHealthTarget`**：保存时与探测时同一套判定，
+    不会出现"存得进去但探不出去"（副作用见"已知限制"）。
+  - `cleanHealthPath(value): string | null` — 必须以 `/` 开头（否则会变成一个任意的跳转目标）、上限 512。
+  - `cleanIcon(value): string | null` — 内置白名单键，或 `https://` URL（复用同一校验），其它一律 400。
+  - `emptyToNull(value)` — 空串/空白 → `null`（"清空字段"的统一语义，与"没传"区分）。
+  - `canSee(service, role, includeHidden?): boolean` — `includeHidden` **只对 admin 生效**。
+  - `matchesQuery(view, query): boolean` — 标题/slug/描述/分类/来源/首选入口/容器名子串匹配；
+    分类精确匹配；`favorite === true` 时过滤非收藏。
+  - `collectCategories(items): string[]` — 去重分类，顺序 = 列表顺序（已按 `sort_order`/`display_name` 排好）；
+    `NULL`/空串统一显示为 `未分类` 并**排在最后**。
+  - `toDiscoveryState(snapshot): ServiceDiscoveryState` — 发现结果 → HTTP 契约。
+
+#### 新增：`server/src/modules/services/healthProbe.ts`（S1-05 安全边界）
+
+本项目里**唯一**"服务器主动向用户提供的地址发起请求"的功能，也就是典型 SSRF 面；
+单独成文件、写得啰嗦，是为了让它成为**可审计的一小块**，而不是散在路由里的一行 `fetch(...)`。
+
+- `HEALTH_PROBE_TIMEOUT_MS = 3000`、`HEALTH_PROBE_MAX_BODY_BYTES = 16 * 1024`（**常量已导出，
+  但当前实现未按字节截断 —— 见"已知限制"第 9 条**）。
+- `type HealthProbeRejectReason = 'EMPTY' | 'TOO_LONG' | 'BAD_SCHEME' | 'NO_HOST' | 'CREDENTIALS_IN_URL' |
+  'METADATA_ADDRESS' | 'DOCKER_API' | 'UNIX_SOCKET' | 'BAD_HOST'`；`HealthProbeTarget` / `HealthProbeValidation`。
+- 私有拒绝清单：`METADATA_HOSTS`（`metadata.google.internal` / `metadata.goog` / `instance-data` /
+  `localhost.localdomain`）、`DOCKER_API_PORTS = [2375, 2376, 2377]`、`MAX_URL_LENGTH = 2048`、
+  `isLinkLocalIpv4`（`169.254.0.0/16`）、`isLinkLocalIpv6`（`fd00:ec2::254` 与 `fe80:` 前缀）。
+- `validateHealthTarget(raw: string | null | undefined): HealthProbeValidation` — **纯函数，不发请求**；
+  拒绝顺序刻意从"格式"到"危险目标"，错误信息面向管理员（要能看懂为什么被拒）：
+  空 → 超长（>2048）→ URL 解析失败 → scheme 非 `http`/`https`（显式点名拒绝
+  `javascript:`/`data:`/`file:` 等）→ URL 内嵌凭据（`user:pass@`）→ 主机名缺失 →
+  **`docker.sock`（主机名或路径）与 `unix://`** → 通配地址（`0.0.0.0`/`::`/`*`）→
+  云元数据主机名 → link-local IPv4/IPv6 → 主机名合法性（IP 或以 `[a-z0-9-]` 组成、可含点的域名）→
+  **Docker API 端口**（注释写明"即使只读也可能泄露容器信息"）。通过则返回规范化后的
+  `{ url, host, port, scheme }`。
+- `runHealthProbe({ target, fetchImpl?, timeoutMs?, now? }): Promise<HealthProbeResult>` —
+  先走 `validateHealthTarget`，**校验不通过直接返回 `fail` 且一个请求都不发**；
+  请求纪律：`method: 'GET'`、**`redirect: 'manual'`（不跟随跳转）**、`AbortController` + 3s 超时、
+  `user-agent: HomePort-HealthProbe/1.0`；读完响应体后丢弃，只取状态码与耗时；
+  2xx/3xx → `ok`，其余 → `fail` + `目标返回 HTTP <code>`；超时/网络错误 → `fail` + 人类可读原因，
+  **绝不抛给调用方，也不重试**；`finally` 清定时器。`fetchImpl` / `now` 只用于测试注入，
+  生产路径走 `globalThis.fetch`。
+
+#### 新增：`server/src/api/services.ts`（S1-03 路由）
+
+- `registerServiceRoutes(app: FastifyInstance, ctx: RouteContext): void` — 成功响应**不带信封**
+  （列表直接返回 `ServiceListResponse`，与 spec 的 JSON 示例逐字段对应）。
+- 内部 `actorOf(session, ip): ServiceActor` — 路由层 → 服务层的审计执行者转换。
+- 路由表：`GET /`（`requireAuth` + `serviceListQuerySchema`，角色传入服务层决定 hidden 可见性）、
+  `GET /:id`、`POST /`（`assertAdmin`，**201**）、`POST /reorder`（admin，静态路径放在 `/:id` 之前，
+  语义更直观且 Fastify 优先匹配静态段）、`POST /discover`（admin，`sync({ force: true })` 后返回
+  **含 hidden** 的最新列表）、`PATCH /:id`（admin）、`DELETE /:id`（admin，`?mode=reset` 归一成
+  `'reset' | null`）、`POST /:id/health`（admin，body 可带一次性覆盖目标）。
+- 权限模型**两层**：`/api/services` 在 `PROTECTED_PREFIXES` 里（登录 + CSRF 前缀守卫），
+  写操作在 handler 内再 `assertAdmin` —— 与 `api/settings.ts` 同一写法；
+  "默认安全"不变：新增路由即使忘记加守卫，最坏是"需要登录"，不会匿名开放。
+
+#### 新增：`server/src/api/search.ts`（S1-04 聚合搜索）
+
+- `SEARCH_DEFAULT_LIMIT = 8`、`SEARCH_MAX_LIMIT = 20`（注释写明"再多也没人看，且会让前端弹层滚动成负担"）。
+- `KIND_ORDER` — 分组顺序固定 服务 → 容器 → 设备 → 工具。
+- `SearchIndexInput` — 四类内容，且**调用方保证已按角色过滤过**（这个类型里没有"设置/用户/审计/Token"的位置）。
+- `buildSearchHits(index, query, limit): ServiceSearchHit[]` — **纯函数**，路由只负责取数与鉴权：
+  标题与 keywords 大小写不敏感子串匹配；同组内"标题命中"排在"keywords 命中"之前；
+  分组顺序 → 命中优先级 → 标题字典序，截断到 `limit`；空查询或 `limit <= 0` 返回 `[]`
+  （**不返回全量**，避免"搜索没生效"的错觉）；`dedupe` 按 `kind:id` 去重。
+  索引字段：服务（slug/sourceRef/sourceType/category/容器名/镜像）、容器（镜像/shortId/compose/宿主端口）、
+  设备（dnsName/ipv4/ipv6/os/tags；**`url: null`** —— 给一个打不开的设备地址会诱导用户点击）、
+  工具（id/category/description/宿主端口）。
+- `registerSearchRoutes(app, ctx): void` — `GET /`：`requireAuth` + `searchQuerySchema`（`q` 至少 1 字符，
+  空查询 400）；`limit` 取 `min(query.limit ?? 8, 20)`；
+  四个数据源 `Promise.allSettled` 并行，**任何单源失败都不 500**（降级为该组空结果 + 一条 `warn`）；
+  服务走 `ctx.services.list(..., { includeHidden: role === 'admin' })`（非 admin 不含 hidden）、
+  容器走 `containers.list({ all: true, stats: false })`、
+  设备走 `tailscale.getStatus()`（self + peers）、
+  **工具走 `probe: false`**（搜索框每敲一个字就发一次 HTTP/端口探测是不可接受的）；
+  返回 `{ items, query }`。
+- 私有 `includes` / `serviceSubtitle`（`分类 · 入口标签`，与 spec 示例一致）/ `toolStatusLabel` / `dedupe`。
+
+#### 修改：`server/src/api/index.ts` / `context.ts` / `app.ts`（装配）
+
+- `PROTECTED_PREFIXES` 增加 `{ prefix: '/api/services', register: registerServiceRoutes }` 与
+  `{ prefix: '/api/search', register: registerSearchRoutes }`（注释写明：读接口 viewer 可用，
+  写接口 handler 内要求 admin，聚合搜索按角色过滤索引内容）。
+- `RouteContext` 增加 `services: ServiceRegistryService`（注释：发现 / 列表 / 管理 / 健康探测）。
+- `app.ts`：新增 `const servicesRepo = new ServicesRepository(db)`；
+  新增 `const serviceRegistry = new ServiceRegistryService({ containers, tailscale, repository: servicesRepo,
+  audit: auditRepo, config, logger })`，并写进 `RouteContext`。注释强调**构造期不拉数据**：
+  第一次请求（或管理员 discover）才 `sync()`，保证"`settings.initialize()` 之后才读 Docker"这条顺序
+  不会被这里破坏。
+
+#### 修改：`server/src/http/schemas.ts`（请求校验）
+
+全部 `.strict()`（未知字段直接 400，避免"拼错了却没报错"），`boolQuerySchema` 只认
+`1`/`0`/`true`/`false` 且**省略时不给默认值**（默认值统一在路由层显式给出）：
+
+- `serviceListQuerySchema` — `query`(≤128) / `category`(≤32) / `favorite` / `includeHidden`。
+- `serviceCreateBodySchema` — `displayName` 必填 1–64，`description`≤280，`icon`≤2048，
+  `category`≤32，`preferredUrl`≤2048，`healthTarget`≤2048，`healthPath`≤512，
+  `visibility` enum，`sortOrder` int ±10000，`favorite` boolean。
+- `serviceUpdateBodySchema` — 同上任意子集，可选字段 `nullable()`（**`null` = 清空该字段**，
+  与"没传"区分开），并 `.refine()` 要求至少一个字段。
+- `serviceDeleteQuerySchema` — `mode: z.literal('reset').optional()`（其它值 400，不做模糊匹配）。
+- `serviceReorderBodySchema` — `order[]` 每项 `{ id, sortOrder }`，1–500 项。
+- `serviceHealthBodySchema` — 可带一次性 `healthTarget`（服务层同一套校验）。
+- `searchQuerySchema` — `q` 必填 1–128、`limit` coerce 1–20；
+  注释写明空查询**直接 400 而不是返回全部**的理由。
+
+#### 修改：`web/src/App.tsx` / `layout/AppShell.tsx` / `components/ui.tsx`（外壳与路由）
+
+- `App.tsx`：`/` 从 `<OverviewPage/>` 改为 `<ServicesPage/>`（首页 = 服务墙）；
+  **新增 `/overview` 承载原样未改的 `<OverviewPage/>`**（这是本 Sprint 唯一对用户可见的
+  路径破坏性变更）；新增 `/services/:id`（`Protected`，viewer 可看，hidden 由后端 404）；
+  新增 `/admin/services`（`Protected` + `AdminOnly`）。文件头注释同步 viewer 访问
+  `/admin` 或 `/admin/services` 都进 403 页面。
+- `AppShell.tsx`：`NavItem` 增加 `end?: boolean`；导航表把 `'/'` 从「总览」改成
+  **「服务」（`server` 图标，`end: true`）**，新增 `/overview`「总览」与 `/admin/services`
+  「服务管理」（`adminOnly`、`end`）；`end` 统一为 `item.to === '/' || item.end === true`
+  （有子路由的条目必须精确匹配，否则父项与子项同时高亮）；
+  整个外壳包进 **`CommandPaletteProvider`**（任意页面都能 `Ctrl/Cmd+K` 唤起）；
+  页脚文案从"只读展示"改成"容器与设备只读展示（不提供容器写操作），服务配置可由管理员编辑"。
+- `ui.tsx`：`Icon` 的 `paths` 增加 `dashboard` 与 `server` 两个内联 SVG（侧栏新增条目用），
+  不改任何既有图形与签名。
+
+#### 修改：`web/src/api/types.ts` / `web/src/api/client.ts`
+
+- `api/types.ts`：新增 `ServiceEntryKind` / `ContainerState` / `ServiceHealth` / `ServiceSourceType` /
+  `ServiceVisibility` / `ServiceDeleteMode` 与 `ServiceEntryView` / `ServiceStatusView` /
+  `ServiceContainerRef` / `ServiceView` / `ServiceDiscoveryState` / `ServiceListResponse` /
+  `ServiceDiagnostics` / `ServiceDetailResponse` / `ServiceSearchKind` / `ServiceSearchHit` /
+  `ServiceSearchResponse` / `ServiceHealthView` / `ServiceHealthResponse` / `ServiceDeleteResponse` /
+  `ServiceListParams` / `ServiceCreateRequest` / `ServiceUpdateRequest` / `ServiceReorderRequest`
+  —— 与 `server/src/modules/services/types.ts` **逐字段镜像**（改一处必须改两处）。
+- `api/client.ts`：`ApiClient` 新增 9 个方法（成功响应形状与后端一致，无信封）：
+  `services(params: ServiceListParams = {}): Promise<ServiceListResponse>`（`favorite`/`includeHidden`
+  转 `'1'`，`timeoutMs: SLOW_TIMEOUT_MS`；注释强调**前端不要再并行调 `/containers` 自行拼装**，
+  那会引入两套口径）、`service(id): Promise<ServiceDetailResponse>`、
+  `createService(input): Promise<ServiceView>`（201 裸对象）、
+  `updateService(id, patch): Promise<ServiceView>`、
+  `deleteService(id, mode?: 'reset'): Promise<ServiceDeleteResponse>`（`query: { mode }`）、
+  `reorderServices(order: Array<{ id: string; sortOrder: number }>): Promise<ServiceListResponse>`、
+  `discoverServices(): Promise<ServiceListResponse>`、
+  `probeServiceHealth(id, healthTarget?): Promise<ServiceHealthResponse>`（不传则 body 为 `{}`）、
+  `search(q: string, limit?: number): Promise<ServiceSearchResponse>`。所有 id 走 `encodeURIComponent`。
+
+#### 新增：`web/src/components/Modal.tsx`
+
+- `ModalProps` — `{ open; onClose; title: ReactNode; description?; children; footer?; size?: 'sm'|'md'|'lg';
+  closeLabel?; initialFocusRef?: RefObject<HTMLElement | null>; className? }`。
+- `Modal(props): ReactNode` — `role="dialog"` + `aria-modal` + `aria-labelledby`（`useId`，`description`
+  挂 `aria-describedby`）；打开时记录 `document.activeElement` 并把焦点移入（有 `initialFocusRef` 用它，
+  否则面板内第一个可聚焦元素）；Tab/Shift+Tab 在面板内循环（**焦点不逃逸**）；Esc、遮罩、关闭按钮都走 `onClose`；
+  关闭后**归还焦点**给打开前的元素。用 ref 持有最新 `onClose`，避免父组件传内联箭头函数时 effect 反复重跑抢焦点
+  （StrictMode 双跑 effect 下幂等）。
+
+#### 新增：`web/src/components/ServiceIcon.tsx` / `UrlCandidateList.tsx` / `ServiceCard.tsx`
+
+- `ServiceIcon.tsx` — `SERVICE_ICON_NAMES`（与后端 `BUILTIN_ICONS` 对齐的白名单）、
+  `ServiceIconName`、`SERVICE_FALLBACK_ICON = 'container'`、`isServiceIconName`、`isServiceIconUrl`、
+  `ServiceIconProps`（`{ icon; className?; alt? }`）、`ServiceIcon(...)`：
+  白名单键 → 内联 SVG；`https://` → `<img loading="lazy" referrerPolicy="no-referrer">`；
+  其它（含空、`javascript:`）→ 一律回退 `container`。**不引图标字体/CDN**（默认 CSP `img-src 'self' data:`
+  会拦掉，见"已知限制"）。
+- `UrlCandidateList.tsx` — `UrlCandidateListProps`（`{ entries; emptyHint?; className? }`）、
+  `unreachableLabel(entry): string`、`UrlCandidateList(...)`：卡片抽屉与详情页共用的候选入口列表；
+  **不可达项照列**并明确标注"仅本机/不可达"，可达项才是可点击外链。
+- `ServiceCard.tsx` — `ServiceStatusBadgesProps`、`ServiceStatusBadges({ status, className })`：
+  **三个独立状态点**（容器 / 可达 / 健康）各带 `title` 悬停解释与 `data-status="container|reachable|health"`
+  （E2E 可断言），容器 running 时脉冲点；
+  `describeSourceType(sourceType): string`（Docker 自动发现 / Serve 路由 / 手工创建）；
+  `ServiceCardProps`（`{ service; canManage?; onEdit?; onToggleFavorite?; busy?; defaultExpanded?; to? }`）、
+  `ServiceCard(...)`：图标 + 名称链接（默认 `/services/:id`）+ 分类 + 状态点 + 首选入口外链 +
+  `entryCount > 1` 时展开 `UrlCandidateList`；`canManage=false`（viewer）**不渲染任何管理入口**；
+  `data-service-id` 便于测试定位。
+
+#### 新增：`web/src/components/ServiceForm.tsx`
+
+- `ServiceFormProps` — `{ service?: ServiceView | null; onSaved?; onCancel? }`；
+  `ServiceForm(...)` — 新建/编辑共用表单（名称/描述/图标选择器/分类/首选入口/健康检查目标/健康路径）。
+- E2E 依赖的稳定契约：`#service-name` / `#service-description` / `#service-icon` / `#service-category` /
+  `#service-url` / `#service-health-path`（每个都有 `<label htmlFor>`），
+  另外实现补了 `#service-health-target`（spec 只列了健康路径，实际把显式目标也放进表单；
+  该输入目前**没有测试/E2E 覆盖**，见"已知限制"第 12 条）；
+  按钮可访问名固定为 `保存` / `取消`。
+- 前端拦截：首选入口填 `javascript:` / `data:` / `file:` 等时**本地提示并禁用保存**
+  （不把明显非法的值发到后端再等 400）；图标既不是内置键也不是 `https://` 时提示，
+  并说明"外部图标需在 `PORTAL_CSP` 的 `img-src` 中放行"。
+- 提交契约：编辑走 `PATCH /api/services/:id`；新建走 `POST /api/services`，**空的可选字段整个省略**
+  （后端创建 schema 不接受 `null`）—— 这一点有专门的用例钉住；
+  后端 400 的 `fieldErrors` 回填到对应输入（`aria-invalid` + `aria-describedby` + `role="alert"`）。
+
+#### 新增：`web/src/components/CommandPalette.tsx`
+
+- `DEBOUNCE_MS = 150`；`CommandPaletteContextValue`（`{ visible; open(); close() }`）、
+  `useCommandPalette()`（没有 Provider 时返回安全兜底值，单测单独渲染不会崩）、
+  `CommandPaletteProvider({ children })`（注册全局 `Ctrl/Cmd+K`，`ctrlKey || metaKey` 且不带 alt，
+  `preventDefault`；StrictMode 下 add/remove 成对，只有一个监听器；渲染面板本体）、
+  `CommandPaletteProps`（`{ open; onClose }`）、`CommandPalette(...)`。
+- 状态：每次打开清空关键词/结果/选中项/错误；输入后 `setTimeout(150ms)` 防抖请求
+  `api.search(keyword, 8)`，并用**递增序号 `seqRef`** 丢弃过期响应（先发后到的旧响应不得覆盖新结果）；
+  请求失败只显示错误文案，不残留旧结果。
+- 无障碍：输入框 `role="combobox"` + `aria-activedescendant`（指向 `${listId}-option-${index}`）、
+  结果 `role="listbox"`、选项 `role="option"` + `aria-selected`，**焦点始终留在输入框**（不靠移动焦点选条目）。
+- 键盘与 Enter 行为固定（E2E 断言 URL）：`service` → `navigate('/services/:id')`、
+  `container` → `navigate('/containers/:id')`、`device` → `navigate('/devices')`、
+  `tool` → `window.open(hit.url, '_blank', 'noopener,noreferrer')`（没有 url 时退回 `/tools`）；
+  **服务条目绝不走 `window.open`**。↑↓ 移动、Esc 关闭（焦点归还触发元素）、无结果给可读文案。
+
+#### 新增：`web/src/pages/ServicesPage.tsx`（首页服务墙）
+
+- `buildServiceGroups(items: ServiceView[], categories: string[]): { favorites: ServiceView[]; groups: ServiceGroup[] }`
+  — 收藏置顶区 + 分类分组；**收藏项不从分类里重复出现**（同一张卡出现两次会让
+  `getByRole('link', { name })` 命中多个元素，E2E 直接失败，也让"墙上到底有几个服务"变含糊）；
+  分组顺序按后端 `categories`，后端没给的分类附在后面（zh 排序），**「未分类」永远最后**；
+  组内按 `sortOrder` → `displayName`（zh）排序。
+- `discoveryMessages(discovery: ServiceDiscoveryState): string[]` — 降级文案：后端 `notes` 是面向人的解释，
+  **必须原样透出**；只有后端没给对应说明时才用兜底句子（且兜底句子里也明确写出 `Docker` / `Serve`，
+  便于用户与 E2E 定位）；其余 notes 一律附上，不静默丢弃。
+- `ServicesPage(): ReactNode` — 顶部搜索框（点击打开命令面板，右侧提示 `Ctrl/Cmd K`）→
+  数据源降级提示条（`role="status"`，`⚠` 图标 `aria-hidden`）→ 收藏区 → 分类分组（可折叠，空分类不显示）
+  → 卡片网格（移动端 1 列 / `sm` 2 列 / `xl` 3 列）；0 个服务时 admin 看到「新建服务」入口、
+  viewer 只看到说明；viewer 不渲染任何管理入口。
+
+#### 新增：`web/src/pages/ServiceDetailPage.tsx`
+
+- `ServiceDetailPage(): ReactNode` — `/services/:id` 的数据源是 `GET /api/services/:id`；
+  页面按"为什么这个服务是现在这个样子"组织：三个独立状态点 + **`status.reasons` 逐条列出** +
+  首选入口（外链，`entry === null` 时明确写"暂无可达入口，所有候选入口都只能在宿主机本机访问"）
+  + `UrlCandidateList` 展示**全部**候选（含不可达）+ 诊断区块（容器端口 / serve 路由 / notes）；
+  admin 额外有「编辑」（`Modal` + `ServiceForm`）与「健康检查」。
+  404（服务不存在，或 hidden 且当前账号不是管理员）时给出可读错误与「← 返回服务墙」，
+  **不白屏**。存在这个页面的理由就是 S1 的最终验收："管理员能解释某个服务为什么不可达"。
+
+#### 新增：`web/src/pages/AdminServicesPage.tsx`
+
+- `AdminServicesPage(): ReactNode` — `/admin/services`（`AdminOnly`）：
+  列表按 `sortOrder`，支持上移/下移（写回 `reorder`）、收藏切换、可见性开关、编辑、新建自定义服务、
+  重新发现（显示"已重新发现：当前 N 个服务"）、一次性健康探测。
+- **删除语义按来源区分并如实提示**：`manual` 服务是真删除（二次确认）；
+  自动发现的服务只能「隐藏」（可逆，因此不再弹确认框，少一次打断）或「重置为自动」
+  （明确告知"名称/图标/分类/首选入口/顺序/收藏等自定义都会被清除"）。
+- 可见性用开关而不是又一个叫「隐藏」的按钮：同行已有一个语义为"隐藏自动服务"的按钮，
+  同名按钮会让读屏与 E2E 选择器产生歧义（开关的 `aria-label` 是"在服务墙显示「X」"）。
+- 顶部一行状态摘要透出 `discovery.dockerAvailable` / `serveAvailable`；所有写操作显示后端错误信息
+  （校验失败要能看到"scheme 不允许"这类原因）。
+
+#### 新增：`server/tests/*` 与 `server/tests/support/`
+
+- `support/serviceFixtures.ts` — `TS_HOST`、`PORTAL_HOST_PORT = 8899`、`makeHostContext(primaryHost?)`、
+  `makePort`、`makeContainer`、`makeServeRoute`、`makeContainerList`、`makeDevice`、`makeTool`、
+  `interface Topology`、`realTopology({ containerIdSuffix? })`：把"开发机/`family-nas` 上的真实拓扑"
+  （日历容器 + `/calendar` 等 serve 路由 + 门户自身 443 `/` + 冲突端口）固化成夹具，
+  让纯函数测试不必起 Docker；`containerIdSuffix` 用来模拟"容器重建换 ID"。
+- `servicesDiscovery.test.ts`（22 用例，6 组）— 稳定身份（容器重建 → 同 `sourceRef` 且不含容器 ID、
+  副本后缀剥离、副本合并、用户字段重新发现后保留）；serve 归属与门户自身（三条 serve 归属容器、
+  门户 443 `/` 归根域名、日历首选 `/calendar` 而非 `:36065`、Gitea 取 `/git/`、
+  多容器冲突不猜并在 notes 说明、serve/Docker 不可用给可读解释）；
+  入口优先级与去重（路径浅优先、同 rank 稳定排序、`0.0.0.0`/`::` 去重、`127.0.0.1`/`localhost` 同一主机、
+  默认端口与尾斜杠规范化、用户指定恒 rank 0、无可达候选 → `entry: null` 但候选全保留）；
+  三维状态（`container=absent` 不是"挂了"、数据源不可用 → `reachable=null`、
+  只绑本机但经 Serve 可达 → `reachable=true` 且 reasons 说明、健康三维独立）；
+  构造时机（`new` 不发请求、首次 `sync` 才拉数据、之后走 TTL 缓存）；
+  性能（0/1/20/100 个服务，100 个 < 150ms）。
+- `servicesApi.test.ts`（22 用例，4 组）— 鉴权与 CSRF（匿名 401、viewer 读得到、viewer 写 403、
+  admin 缺 CSRF 403）；手工服务与校验（201 且身份 `manual:<uuid>`、重名 slug 互不相同、
+  未知字段 400 且不落库、缺必填/空 PATCH/非法查询 400、
+  **危险 URL 一律 400 且不落库**（`javascript:`/`data:`/内嵌凭据/元数据地址）、
+  PATCH 各字段生效、列表四种过滤、hidden 对 viewer 不可见且详情 404、`includeHidden` 只对 admin 生效）；
+  详情/排序/删除/重新发现（详情含不可达候选与诊断、reorder、DELETE 三种语义各自的作用域、
+  `/discover` 返回最新列表、写操作留下 `service.*` 审计）；
+  健康探测（未配置目标 → 400 且零请求、云元数据 → `fail` 且 detail 说明"已拒绝"、
+  结果进内存但不把覆盖目标落库）。
+- `servicesHealthProbe.test.ts`（17 用例，3 组）— `validateHealthTarget` 的拒绝清单与格式校验
+  （接受 loopback/私网、空值与超长、非 http(s) scheme、内嵌凭据、云元数据与 link-local、
+  通配与 unix socket、Docker API 端口、非法主机名给可读原因）；
+  `runHealthProbe` 注入 fetch 的请求纪律（`redirect: 'manual'` + GET + 超时信号、
+  2xx/3xx → ok 与 4xx/5xx → fail、超时 → fail 且不重试、网络错误 → fail 带原因、
+  **被拒目标零请求**）；`resolveHealthTarget` 优先级（显式覆盖 > 已保存 > `healthPath` 追加到入口，
+  都没有 → null）。全部走注入 `fetchImpl`，测试期间**不产生真实网络流量**。
+- `servicesSearch.test.ts`（12 用例，2 组）— `buildSearchHits` 纯函数（分组顺序、标题命中优先、
+  大小写不敏感子串与 keywords、limit 与空查询、设备 `url` 为 null）；
+  `GET /api/search` 契约与权限（匿名 401、默认/上限 limit 且 21 → 400、空查询 400、
+  **viewer 搜不到 hidden 而 admin 能搜到**、容器与设备沿用只读权限、
+  工具走 `probe: false` 不发探测、**拿用户名与设置值搜不到任何东西**）。
+- `migrationV4.test.ts`（9 用例，2 组）— v3 库升级后 `schema_migrations` 恰好 4 行、
+  v4 **没有 down**（append-only，回退只能靠备份恢复）、重复 `runMigrations` 幂等、
+  升级前管理员会话仍有效、用户与设置都在且来源仍标记为数据库；
+  服务行与用户覆盖在重新发现后保留（首次发现写行与快照、用户改过展示属性与首选入口后再次发现仍是同一 ID
+  且行不重复、**Docker 不可达的空发现不会删掉已有服务行**、API 层能读到这一行 —— 服务墙不会因迁移而空掉）。
+- `migrationV3.test.ts`（修改）— 回落脚本在删 v3 的 4 列 2 表之外**同时删掉 v4 三张表**并把
+  `schema_migrations` 的 `version IN (3, 4)` 一起删除；断言从硬编码 `toBe(3)` 改为
+  `Math.max(...MIGRATIONS.map(m => m.version))` + `toBeGreaterThanOrEqual(3)`。
+  **为什么**：v3 用例的假设是"库里只有 v3"，而 v4 落地后它实际测的是"整条迁移链在已有数据上前滚"；
+  不改的话用例会稳定失败于一条与 v3 无关的断言，而不是发现真问题。
+
+#### 新增：`web/tests/*`
+
+- `serviceTestUtils.ts` — `jsonResponse` / `errorResponse` / `RecordedCall` / `Handler` /
+  `stubFetch(routes)`（按 URL 命中并记录调用，用于断言"发了什么请求、带了什么 body"）/
+  `callsTo(calls, url)` / `sessionUser` / `sessionPayload` / `baseRoutes` /
+  `entry` / `LOCALHOST_ENTRY` / `serviceView` / `discoveryState` / `listResponse`。
+- `services.test.tsx`（12 用例，4 组）— 卡片与分组（收藏不重复、未分类最后）、
+  **三个状态点分别渲染且互不相同**、无容器绑定显示"无容器/可达性未知"而不是"不可达"；
+  降级提示与空态（后端原因原样透出、后端没给也要有含 "Docker" 的兜底、0 服务时 admin/viewer 的差别）；
+  权限与候选入口（viewer 不渲染任何管理入口、admin 能看到编辑/收藏、展开候选时不可达项被标注）；
+  详情页（三维状态 + 全部候选 + 诊断、404 给错误与返回入口不白屏、viewer 无管理按钮而 admin 有编辑与健康检查）。
+- `serviceForm.test.tsx`（9 用例，3 组）— 六个输入的 label/htmlFor 关联与按钮可访问名、
+  名称为空不能保存；危险输入（`javascript:` / `data:` / `file:` 本地拦截并禁用保存、
+  非法图标提示且说明 CSP 约束）；提交契约（编辑走 PATCH 且逐字段符合契约并带 CSRF、
+  **新建时空的可选字段整个省略**、填了的字段不含 `null`、后端 `fieldErrors` 回填到输入并带
+  `aria-invalid`/`aria-describedby`/`role="alert"`）。
+- `commandPalette.test.tsx`（8 用例，2 组）— 打开与关闭（Ctrl+K 的 dialog/aria 契约与焦点进入搜索框、
+  Meta+K 同样能开、Esc 关闭并归还焦点、点遮罩关闭）；搜索与键盘导航（防抖请求 + `aria-selected` 维护、
+  Enter 打开服务 → `/services/:id`、容器 → `/containers/:id`、设备 → `/devices`、
+  工具 → `window.open`、无结果给可读文案）。
+- `adminServices.test.tsx`（6 用例，1 组）— 管理页的**按钮契约与写操作 payload**：
+  渲染排序/收藏/可见性/编辑按钮，且手工服务给「删除」、自动服务给「隐藏 + 重置为自动」；
+  点「下移」调 `reorderServices` 且 payload 是重排后的完整顺序（`(index + 1) * 10`）；
+  点「重新发现」调 `POST /api/services/discover` 并提示结果；点「编辑」打开 Modal 且表单使用固定输入 id；
+  可见性开关调 PATCH `visibility`、取消收藏调 PATCH `favorite`；
+  「重置为自动」二次确认后调 `DELETE /api/services/:id?mode=reset`；
+  列表请求 URL 硬编码为 `/api/services?includeHidden=1`（钉住"管理页必须带 `includeHidden`"）。
+
+#### 修改：`e2e/smoke.spec.ts`
+
+- 既有断言的**必然修正**（首页迁移的连带影响，不改就是稳定失败）：
+  登录成功落点从 `heading '总览'` 改为 `heading '服务'`；bootstrap 后的落点断言同样改；
+  "聚合告警卡"用例在断言前显式 `page.goto('/overview')`（总览已不在 `/`）。
+- 文件末尾**追加 2 条用例**（不加新 spec 文件：`.e2e-data` 只在整轮开始时清空一次，
+  admin/viewer 账号由本文件第 2、5 条用例创建，`workers: 1` 且文件内顺序敏感，
+  新文件若文件名排序在前会先于建号用例运行）：
+  1. `服务墙：数据源全不可用时给出可解释的降级提示，管理员可手工新建服务且刷新后仍在`
+     —— 断言 `/` 是服务墙、页面出现 `Docker` 字样；`/admin/services` 新建「测试服务」→ 刷新仍在
+     → 回到 `/` 能在服务墙看到它且首选入口是 `https://example.ts.net/app`。
+  2. `服务墙：Ctrl+K 搜索并进入服务详情；viewer 看不到任何管理入口`
+     —— `getByRole('dialog')` + 输入并按 Enter → URL 落到 `/services/:id` 且出现「服务详情」；
+     退出登录换 viewer：侧栏有「服务」、**没有「服务管理」**、页面**没有「新建服务」**按钮、
+     服务本身可见；直接访问 `/admin/services` 得到「权限不足」。
+
+#### 顺手修掉的真实缺陷：`portal.sqlite` 在 WAL 模式下"只拷主文件"的备份会静默丢数据
+
+**这是本条目最值得单独记的一件事，因为它不是新功能的一部分，而是准备迁移演练时撞出来的生产风险。**
+
+- **现象**：准备 v3→v4 演练时，`docker cp homeport-portal:/data/portal.sqlite` 拿到的副本
+  **只有 v1/v2 迁移记录**，而生产库实际已经是 v3。
+- **原因**：数据库跑在 **WAL 模式**。主库文件停在 `03:59`，同目录 `portal.sqlite-wal` 有 **140KB**，
+  v3 迁移与近期审计**全在 WAL 里没有 checkpoint 回主文件**。
+- **危害**：这种"备份"能正常打开、`pragma integrity_check` 也过，**看起来完全正常**，
+  却悄悄少了几小时数据；恢复后甚至会被判定为"未迁移"而重跑迁移。
+  `portal.sqlite-shm` / `portal.sqlite-wal` 是数据库的一部分，不是临时文件。
+- **修法（`docs/static/08-operations.md` §10 已改写）**：
+  - 方案 A（**推荐，日常用，不停机**）：容器内 `VACUUM INTO '/tmp/snap.sqlite'` 做一致性导出
+    → `docker cp` 取出；导出后核对 `schema_migrations` 版本列表、`users`/`audit_log` 条数、
+    `integrity_check = ok`；**必须再单独备份 `secret.key`**，否则密文读不回来。
+    Windows 下把导出脚本落成文件再 `docker cp` 进容器，避免嵌套引号被 PowerShell 吃掉。
+  - 方案 B（**能停服务时最稳**）：`docker compose stop homeport`（停写，保证 WAL 已 checkpoint）
+    → `docker run --rm -v homeport-data:/data ... tar czf` 整卷打包（顺带包含密钥）→ `start`。
+    文档明确写出"容器仍在写时 `tar` 卷是活文件拷贝、一致性没有保证"，所以必须显式停。
+  - 核对项与"恢复后如何确认迁移状态"一并写入 §10；`todo.md` 也记了一条勾选项。
+
+#### 删除：无
+
+本轮**没有删除任何文件**。唯一"消失"的是 `/` 上的总览页面内容 —— 它被**原样迁移**到 `/overview`
+（`OverviewPage.tsx` 一字未改，只是路由换了位置），侧栏同时保留「服务」与「总览」两个入口。
+
+### 配置/接口/数据模型影响
+
+- **环境变量：无新增**。发现规则、探测超时（3s）、响应体上限常量、发现缓存 TTL 都是代码常量；
+  健康检查目标与首选入口是**按服务存库**的数据，由管理员在 `/admin/services` 保存。
+  最小可用配置仍然是空 `.env`（见 `02-configuration.md`）。
+- **DB 迁移 v4 `services_registry`**：追加 `services` / `service_bindings` / `service_preferences`
+  与 `idx_service_bindings_service` / `idx_services_sort` / `idx_services_source`；
+  既有表**一列未改**；每个迁移在独立事务中执行并写 `schema_migrations`，失败回滚并让启动失败；
+  仅有 `up`（append-only），**回退 = 镜像回退 + 备份恢复**（旧版本代码看不到这三张表也不会报错，
+  因此回滚镜像不需要动数据库）。逐列语义见 `07-data-model.md` §2。
+- **新增 HTTP 接口 9 个**（契约见 `04-api-contract.md` §6.5 / §6.6，本节不重复字段表）：
+  `GET /api/services`、`GET /api/services/:id`、`POST /api/services`（201）、
+  `PATCH /api/services/:id`、`DELETE /api/services/:id`（`?mode=reset`）、
+  `POST /api/services/reorder`、`POST /api/services/discover`、`POST /api/services/:id/health`、
+  `GET /api/search`。**未新增错误码**（沿用 `VALIDATION_FAILED` / `NOT_FOUND` / `FORBIDDEN`）。
+- **权限**：`/api/services` 与 `/api/search` 进入 `PROTECTED_PREFIXES`（匿名 401、缺 CSRF 403）；
+  读接口 viewer 可用，写接口在 handler 内 `assertAdmin`（viewer 写 403）；
+  hidden 服务对非 admin → `NOT_FOUND`（不是 403，避免泄露"这里有一个你看不到的服务"）。
+- **审计动作**：`service.create` / `service.update` / `service.delete` / `service.hide` /
+  `service.reset` / `service.reorder` / `service.health`（target 为 `service:<id>`，
+  reorder 的 target 为 null）。
+- **⚠️ 对用户可见的破坏性变更（路径）**：`/` 从「总览」变为「**服务墙**」，总览迁到 `/overview`；
+  新增 `/services/:id` 与 `/admin/services`。侧栏同时提供「服务」与「总览」，
+  但**书签指向 `/` 的用户会看到服务墙而不是总览** —— 这是产品意图（首页就该是入口墙），
+  升级说明里必须写清（`08-operations.md` §7.1 已列）。
+- **前端 API 客户端**：`web/src/api/client.ts` 新增 9 个方法（见上文）；服务契约类型在
+  `web/src/api/types.ts` 与后端逐字段镜像。
+- **CSP 影响**：外部图标 URL（`icon` 为 `https://…`）会被默认 `img-src 'self' data:` 拦掉；
+  管理页如实提示"需在 `PORTAL_CSP` 的 `img-src` 中放行其来源"，**不为了图标放宽默认 CSP**
+  （见 `06-security.md`）。
+- **健康结果不落库**：只在进程内存里保留（`HEALTH_RESULT_LIMIT = 512`），重启回到 `unknown`。
+
+### 验证方式
+
+本轮实际执行的命令（未在本地重跑前的历史结论见 `IMPLEMENTATION_REPORT_S1.md` §6，
+那里记录的是当次运行的结果；本条只写命令本身与已确证的事实，**不臆造总数**）：
+
+```bash
+npm run typecheck                    # server + web 两个工作区
+npm run build                        # web（vite build）→ server（tsc）
+npx vitest run --root server         # server 单测/集成
+npx vitest run --root web            # web 单测（jsdom + RTL）
+npm run test:e2e                     # Playwright 冒烟（默认端口 8988，PORTAL_E2E_PORT 可覆盖）
+```
+
+新增测试的规模（按文件统计的用例数，可复现）：
+`servicesDiscovery.test.ts` 22、`servicesApi.test.ts` 22、`servicesHealthProbe.test.ts` 17、
+`servicesSearch.test.ts` 12、`migrationV4.test.ts` 9（server 合计 82）；
+`services.test.tsx` 12、`serviceForm.test.tsx` 9、`commandPalette.test.tsx` 8、
+`adminServices.test.tsx` 6（web 合计 35）；
+`e2e/smoke.spec.ts` 共 7 条用例（新增 2 条 + 修正既有 5 条）。
+server/web 的**文件总数与全绿结论**、E2E 通过条数见 `IMPLEMENTATION_REPORT_S1.md` §6。
+
+**真实库迁移演练**（不是空库测试，而是拿生产库副本跑的）：
+
+```bash
+node _homeport-backups/migrate-rehearsal.mjs <v2 库副本> <v3 库副本>
+```
+
+结论：`portal-pre-sprint0-….sqlite`（v2，v1,v2 · users=2 sessions=11 audit=17）与
+`portal-live-pre-sprint1.sqlite`（v3，v1,v2,v3 · 同计数）两份样本，
+迁移后**用户/会话/审计/设置数不变、密文逐字未变、三张表建出、重复迁移幂等**。
+脚本只读源库（复制到临时目录再迁移），不会污染原始样本。
+
+**实机发现验证**（真实 Docker + 真实 `tailscale serve` CLI，非夹具）：
+
+```bash
+node _homeport-backups/real-discovery.mjs   # buildApp() + 真实登录 + app.inject()
+```
+
+结论：家庭日历首选 `https://sisi-laptop.tail921448.ts.net/calendar`（Serve HTTPS，rank 1 胜过
+只绑本机的端口）；门户自身 443 `/` 归到根域名 HTTPS；`localhost:443` 作为**不可达候选保留并标注**；
+4 条 serve 路径各自保留；`/dsh`（多容器端口冲突）**不猜测归属**，作为独立服务列出并写进 notes；
+不可达服务的 `status.reasons` 给出人话；匿名 `GET /api/services` → 401；搜索 `calendar` 命中服务与容器；
+`dockerAvailable` / `serveAvailable` 自洽。
+`family-nas` 上 443 `/`、8443 `/calendar`、8443 `/git/` 的拓扑本机没有，由夹具覆盖、NAS 部署时复核
+（已记入 `todo.md`）。
+
+### 已知限制 / 后续
+
+1. **健康探测刻意允许 loopback 与私网**：家用场景"本机服务 + Serve 暴露"是主流形态，
+   探测 `http://127.0.0.1:36065/health` 是刚需；拒绝清单只覆盖"被请求就会造成危害"的目标
+   （云元数据、Docker API 端口）。缓解：**默认不探测、必须管理员显式配置**（见 `06-security.md` §3）。
+2. **`preferredUrl` 与 `healthTarget` 共用一套校验**（一个真相来源，避免"存得进去却探不出去"）。
+   副作用：指向 Docker API 端口（2375/2376/2377）的**链接**也会被拒。
+   将来若确有"指向 Docker API 的入口"需求，需要把"链接校验"与"服务器出站校验"拆成两套并分别测试。
+3. **外部图标 URL 需要 CSP 放行**：默认 `img-src 'self' data:`，`https://` 图标会被浏览器拦掉。
+   管理页已提示，**不为了图标放宽默认 CSP**。
+4. **API 模式读不到 serve 配置**：此时服务墙的入口会偏保守（只有端口映射）。
+   界面会明确说明（`discovery.serveDetail` + 兜底文案），不是静默少几条入口；
+   serve 路由需要 `PORTAL_TAILSCALE_MODE=cli`。
+5. **健康结果不落库**：进程重启后回到 `unknown`。这是刻意的（结果会过期，落库会把"某一刻的探测结果"
+   变成"永久的谎话"）。
+6. **serve 归属不做猜测**：多容器共用同一目标端口时列为独立服务并写 `notes`；
+   代价是可能多出一个服务条目，收益是绝不把入口挂到错的容器上。
+7. **首页路径变更**：书签指向 `/` 的用户会看到服务墙（见上文"破坏性变更"）。
+8. **两个内联弹窗未迁移到新的 `Modal`**（`web/src/pages/admin/SecurityTab.tsx` /
+   `UsersTab.tsx`）：无功能问题，仅为无障碍一致性与去重收益，已记入 `todo.md` 技术债。
+9. **`HEALTH_PROBE_MAX_BODY_BYTES` 曾被"声明但未接线"——已在本次提交内修掉**：归档时发现
+   `runHealthProbe` 实际执行的是 `await response.text()` 后丢弃，读的是**完整响应体**，
+   而 `06-security.md` 与本条上文按设计意图写的是"最多读 16KB"。健康目标可以是任意进程
+   （包括返回无限流的服务），`text()` 等于让对端决定门户分配多少内存。
+   修法：新增 `discardProbeBody(response, maxBytes)` —— 用 `response.body.getReader()`
+   逐块累计到上限即 `reader.cancel()`（释放连接、不读完），无流式 body 时退回一次性读取；
+   状态码判定不受影响。用例 `无限流：读满上限就主动断开，而不是把响应体整个读进内存`
+   （构造真实 `ReadableStream` 无限流，断言 `cancel` 被调用且读入量 ≤ 上限 + 2 个分片）
+   在新实现下 50ms 内结束，在旧实现下会一直读到 3s 超时且 `cancel` 不会被调用 —— 可区分。
+10. **NAS 实机复核未做**：`family-nas` 上三条 serve 路由的服务墙呈现只能在那台机器上验（本机无此拓扑）。
+11. **未做项（计划内不在 Sprint 1 范围）**：服务分组/标签体系、批量编辑、服务级健康历史曲线、
+    把 `service_preferences` 真正用到视图偏好上。`git push` 仍未执行（Sprint 0/1 提交都在本地）。
+12. **`#service-health-target` 的契约覆盖已在本次提交内补齐**：`ServiceForm` 文件头注释原只列了
+    6 个固定 id，`serviceForm.test.tsx` 的 label 关联用例也只校验 6 个，第 7 个输入
+    `#service-health-target`（可访问名「健康探测目标」）当时没被守住。现已在文件头注释与
+    测试的 id 表里补上（用例名同步改为"七个输入"）。
+13. **归档时发现的三处"文档与实现不一致"——其中两处已在本次提交内修正**：
+    - `03-server-modules.md`：`listBindings` 改为 `(serviceIds?) => ServiceBinding[]`（实现返回扁平
+      数组，按服务分组在服务层），`uniqueSlug` 改为 `(base) => string`（无 `excludeId` 参数）；
+    - `02-configuration.md`：补回 §3 Docker 变量表被删掉的分隔行 `| --- | --- | --- |`
+      （原会导致该表不渲染），并把 `DISCOVERY_CACHE_TTL_FALLBACK_MS = 5000` 兜底值、
+      `HEALTH_RESULT_LIMIT = 512` 与"响应体读满即 cancel"一起补成常量表；
+    - `web/src/api/types.ts` 导出的 `ServiceReorderRequest` 在 `web/` 内仍零引用
+      （`client.ts` 的 `reorderServices` 用的是内联对象数组类型）—— 属类型镜像的冗余导出，
+      保留不影响行为，不再单独修。
+
+### 新增文档
+
+- `docs/sprint1-implementation-spec.md` — Sprint 1 冻结设计契约（**唯一实现依据**；发现契约有问题先改它）。
+- `IMPLEMENTATION_REPORT_S1.md` — 索引级实施报告：交付概览、迁移 v4 与回滚、升级步骤、
+  验收记录（含真实库演练与实机发现验证）、风险清单、未做项。
+- 同步更新的既有静态文档（内容**不在本条重复**，只在此列出以便追溯）：
+  `01-architecture.md`（服务层分层）、`02-configuration.md`（无新环境变量）、
+  `03-server-modules.md`（模块与仓储函数表）、`04-api-contract.md`（§6.5 / §6.6）、
+  `05-web-modules.md`（页面与组件契约）、`06-security.md`（SSRF 与图标 CSP）、
+  `07-data-model.md`（迁移 v4 逐列）、`08-operations.md`（§7.1 升级回滚、§10 备份修正）。
+
 
 

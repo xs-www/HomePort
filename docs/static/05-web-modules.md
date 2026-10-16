@@ -19,10 +19,12 @@ web/src/
 │   └── useMetricsStream.ts   # SSE 订阅
 ├── lib/format.ts             # 展示格式化（与后端 util/format 职责互补）
 ├── components/ui.tsx         # Badge / Card / ProgressBar / StatCard / ...
+├── components/               # 服务相关（S1）：ServiceCard / ServiceIcon / UrlCandidateList
+│                             #   / ServiceForm / Modal / CommandPalette
 ├── layout/
 │   ├── AppShell.tsx          # 侧边导航 + 顶栏 + 内容区
 │   └── Shell.tsx             # AppShell 的薄包装（供页面直接使用）
-└── pages/                    # 7 个页面 + 404
+└── pages/                    # 10 个页面 + 404
 ```
 
 **分层约定**
@@ -41,6 +43,14 @@ web/src/
 `ContainerSummary` `ContainerDetail` `ContainerPortView` `ContainerLogsResponse`
 `TailnetDevice` `TailnetStatusResponse` `SystemSnapshotResponse` `SystemMetricsFrame`
 `ToolView` `ToolListResponse` `OverviewResponse` `AuditEntry`
+
+服务注册表（S1）**逐字段镜像** `server/src/modules/services/types.ts`：
+`ServiceView` `ServiceEntryView` `ServiceStatusView` `ServiceContainerRef` `ServiceDiscoveryState`
+`ServiceListResponse` `ServiceDiagnostics` `ServiceDetailResponse`、`ServiceSearchHit`（含
+`ServiceSearchKind`）/ `ServiceSearchResponse`、`ServiceHealthView` / `ServiceHealthResponse`、
+`ServiceDeleteResponse`，以及请求类型 `ServiceCreateRequest` / `ServiceUpdateRequest`。
+`ApiClient` 对应新增 `services()` / `service()` / `createService()` / `updateService()` /
+`deleteService()` / `reorderServices()` / `discoverServices()` / `probeServiceHealth()` / `search()`。
 
 两步验证（TOTP）相关：`LoginSuccessResponse` / `LoginTotpChallengeResponse` 与其判别联合
 `LoginResponse`（用导出的类型守卫 `isTotpChallenge()` 分支）、`LoginTotpRequest`、
@@ -177,16 +187,34 @@ class ApiError extends Error {
 
 | 页面 | 路由 | 数据来源 | 要点 |
 | --- | --- | --- | --- |
+| `ServicesPage`（**首页**，S1-04） | `/` | `/api/services` | 服务墙：搜索入口、数据源降级提示、收藏区 + 分类分组（可折叠）、卡片网格（`sm:2` / `xl:3` 列）；viewer **不渲染任何管理入口** |
+| `ServiceDetailPage`（S1-04） | `/services/:id` | `/api/services/:id` | 为什么这个服务是现在这个样子：`status.reasons` 逐条 + **全部**候选入口（含不可达）+ 诊断（容器端口 / serve 路由 / notes）；hidden 对非管理员 404（如实报错，不白屏） |
 | `LoginPage` | `/login` | `useAuth().login` / `completeTotpLogin` | **两步登录**（见下）；不做"忘记密码"（本地账号体系无邮件通道），明确提示联系管理员 |
 | `SetupPage` | `/setup` | `useAuth().bootstrap` | 需首启令牌；密码二次确认；已初始化时显示引导而非报错 |
-| `OverviewPage` | `/` | `/api/overview` + SSE | 四张指标卡、硬件进度条、在线设备、featured 工具、数据源告警 |
+| `OverviewPage` | `/overview` | `/api/overview` + SSE | 四张指标卡、硬件进度条、在线设备、featured 工具、数据源告警。**Sprint 1 起从 `/` 迁到 `/overview`** |
 | `ContainersPage` | `/containers` | `/api/containers` | 容器墙；搜索 + 可达性过滤 + 含已停止 + 实时占用开关（筛选条件持久化） |
 | `ContainerDetailPage` | `/containers/:id` | `/api/containers/:id` + `/logs` | 基础信息、实时占用、端口表（含可达性）、备选入口、挂载、脱敏环境变量、日志（可选行数） |
 | `DevicesPage` | `/devices` | `/api/tailscale/devices` | 设备表；搜索、只看在线、多种排序、点击复制 IP |
 | `SystemPage` | `/system` | `/api/system/snapshot` + SSE | CPU（含各核心热力条）、内存、GPU（含占用进程）、磁盘；每个数据源标注取数模式 |
 | `ToolsPage` | `/tools` | `/api/tools` | 工具卡；状态过滤、分类过滤、单工具强制探测、多候选入口折叠 |
 | `AdminPage` | `/admin` | `/api/users*` | **四个标签页**：用户与权限、审计日志、安全与偏好、系统设置 |
+| `AdminServicesPage`（S1-03） | `/admin/services` | `/api/services*` | 服务管理：排序（上移/下移）、收藏、可见性、编辑、新建、删除（手工）/隐藏（自动）/重置为自动、重新发现、一次性健康探测。**删除语义按来源区分**，错误原样呈现（`message` / `fieldErrors`） |
 | `NotFoundPage` | `*` | — | 404 |
+
+### 服务墙相关组件（S1-02…S1-05）
+
+| 组件 | 导出 | 要点 |
+| --- | --- | --- |
+| `components/ServiceCard.tsx` | `ServiceCard` `ServiceStatusBadges` `describeSourceType` | **三个状态维度永远分开渲染**（容器 / 可达 / 健康），各带 `title` 悬停解释与 `data-status`（E2E 可断言）；名称链接进详情页，首选入口是新窗口外链；`entryCount > 1` 时给「查看所有候选入口」 |
+| `components/UrlCandidateList.tsx` | `UrlCandidateList` `unreachableLabel` | 候选入口列表（卡片抽屉 + 详情页共用）。**不可达项也要列**并明确标注"仅本机/不可达" |
+| `components/ServiceIcon.tsx` | `ServiceIcon` `SERVICE_ICON_NAMES` `SERVICE_FALLBACK_ICON` `isServiceIconName` `isServiceIconUrl` | 白名单键 → 内联 SVG；`https://` → `<img loading="lazy" referrerPolicy="no-referrer">`；其它一律回退 `container`。**不引图标字体/CDN**（默认 CSP `img-src 'self' data:` 会拦掉） |
+| `components/ServiceForm.tsx` | `ServiceForm` | 新建/编辑表单（名称/描述/图标选择器/分类/首选入口/健康路径）；E2E 依赖的稳定 id：`#service-name` `#service-description` `#service-icon` `#service-category` `#service-url` `#service-health-path` |
+| `components/Modal.tsx` | `Modal` | 通用模态框：`role="dialog"` + `aria-modal` + `aria-labelledby`、打开时移入焦点（支持 `initialFocusRef`）、关闭后**归还焦点**、Esc/遮罩关闭、Tab 不逃逸。StrictMode 双跑 effect 下幂等 |
+| `components/CommandPalette.tsx` | `CommandPalette` `CommandPaletteProvider` `useCommandPalette` | `Ctrl/Cmd+K`（`e.ctrlKey \|\| e.metaKey`）全局唤起；数据来自 `/api/search`（服务端按角色过滤）；150ms 防抖 + 递增序号**竞态保护**；`role="combobox"` + `aria-activedescendant`，结果 `role="listbox"` / `role="option"` + `aria-selected`，焦点始终留在输入框 |
+| `pages/ServicesPage.tsx`（导出纯函数） | `buildServiceGroups` `discoveryMessages` | 分组（收藏置顶，**收藏项不从分类里重复出现**，避免同一张卡命中两次）；降级文案（后端 `notes` 原样透出，缺失时兜底句子里也明确写出 `Docker` / `Serve`） |
+
+**命令面板的 Enter 行为（固定，E2E 断言）**：`service` → `/services/:id`；`container` → `/containers/:id`；
+`device` → `/devices`（设备没有可点击入口，`url` 恒 `null`）；`tool` → 外部新窗口打开 `url`。
 
 ### 两步验证界面（S0-03）
 

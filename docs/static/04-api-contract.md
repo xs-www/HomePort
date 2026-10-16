@@ -346,6 +346,162 @@ data: {}
 
 ---
 
+## 6.5 服务注册表 `/api/services`
+
+把"容器 + serve 路由"归纳成用户看得懂的**服务**，并允许管理员调整展示方式。
+完整设计（发现规则 / 稳定身份 / 入口优先级 / 状态语义）见
+[sprint1-implementation-spec.md](../sprint1-implementation-spec.md) 与 [01-architecture.md](./01-architecture.md) §4.1。
+
+| 接口 | 权限 | 说明 |
+| --- | --- | --- |
+| `GET /api/services` | viewer | 服务墙数据（**聚合接口**：前端首页只调这一个） |
+| `GET /api/services/:id` | viewer | 详情：全部候选入口 + 诊断；hidden 对非 admin → `NOT_FOUND` |
+| `POST /api/services` | admin | 新建**手工服务**（`sourceType: "manual"`）→ `201` |
+| `PATCH /api/services/:id` | admin | 改展示属性 / 首选入口 / 可见性 / 排序 / 收藏 / 健康目标 |
+| `POST /api/services/reorder` | admin | 批量排序 |
+| `POST /api/services/discover` | admin | 强制重新发现（跳过 TTL 缓存），返回**含 hidden** 的最新列表 |
+| `DELETE /api/services/:id` | admin | 手工服务删除；自动服务改为隐藏；`?mode=reset` 重置用户覆盖 |
+| `POST /api/services/:id/health` | admin | 一次性健康探测（**目标每次重新校验**，见 06-security.md §3） |
+
+### `GET /api/services`
+
+查询参数：`query`（子串匹配名称/分类/容器名）、`category`、`favorite=1`、`includeHidden=1`（**仅 admin 生效**，非 admin 传了也会被忽略）。未知参数一律 `400`（schema `.strict()`）。
+
+```json
+{
+  "items": [
+    {
+      "id": "3f1c…",
+      "slug": "family-calendar",
+      "displayName": "家庭日历",
+      "description": null,
+      "icon": "calendar",
+      "category": "家庭",
+      "sourceType": "docker",
+      "sourceRef": "docker:sisi/sisi-calendar",
+      "bindingRefs": ["container:docker:sisi/sisi-calendar", "serve:family-nas.tail585599.ts.net:8443/calendar"],
+      "visibility": "visible",
+      "favorite": true,
+      "sortOrder": 10,
+      "preferredUrl": null,
+      "entry": "https://family-nas.tail585599.ts.net:8443/calendar",
+      "entries": [
+        { "kind": "serve", "label": "Serve HTTPS", "url": "https://family-nas.tail585599.ts.net:8443/calendar", "rank": 1, "accessible": true, "detail": "tailscale serve 8443 /calendar" },
+        { "kind": "tailnet", "label": "Tailnet", "url": "http://100.101.102.103:36065/", "rank": 2, "accessible": true, "detail": null },
+        { "kind": "localhost", "label": "仅本机", "url": "http://127.0.0.1:36065/", "rank": 4, "accessible": false, "detail": "只能从宿主本机访问" }
+      ],
+      "entryCount": 3,
+      "status": { "container": "running", "reachable": true, "health": "unknown", "reasons": [] },
+      "container": { "id": "9c2f…", "name": "sisi-calendar", "state": "running", "image": "sisi/calendar:1.4" },
+      "userEdited": true,
+      "healthTarget": null,
+      "healthPath": null,
+      "createdAt": "2026-10-16T12:00:00.000Z",
+      "updatedAt": "2026-10-16T12:30:00.000Z"
+    }
+  ],
+  "total": 1,
+  "categories": ["家庭", "基础设施"],
+  "discovery": {
+    "dockerAvailable": true,
+    "serveAvailable": true,
+    "serveDetail": null,
+    "discoveredAt": "2026-10-16T12:34:56.000Z",
+    "notes": []
+  },
+  "generatedAt": "2026-10-16T12:34:56.000Z"
+}
+```
+
+**数据源不可用时不允许"静默为空"**：`discovery.dockerAvailable` / `serveAvailable` 必须为 `false`
+并在 `serveDetail` / `notes` 里给出人能读懂的原因（例如 API 模式读不到 `tailscale serve` 配置），
+前端据此显示降级提示条。
+
+### 入口与状态语义（读的时候必须一起看）
+
+| 字段 | 含义 | 注意 |
+| --- | --- | --- |
+| `entries[]` | **全部**候选入口（含不可达） | 永远不丢候选，诊断靠它 |
+| `entries[].rank` | 0 用户指定 / 1 Serve HTTPS / 2 Tailnet / 3 LAN / 4 仅本机 | 只用于排序，不用于隐藏 |
+| `entries[].accessible` | 是否可能从旁路访问 | "仅本机"恒 `false` |
+| `entry` | 首选入口 = **第一个可达候选** | 一个可达的都没有 → `null`（前端必须解释原因，不能给死链） |
+| `entryCount` | `entries.length` | `>1` 时前端提供"查看所有候选入口" |
+| `status.container` | 容器状态（`null` = 无关联容器） | 三维状态**分开报**，不得合成"服务挂了" |
+| `status.reachable` | 是否存在可达入口（`null` = 未知） | 与容器状态独立（容器在跑但只在 127.0.0.1 上 → `reachable:false`） |
+| `status.health` | `ok` / `fail` / `unknown` / `skipped` | **默认 `skipped`**：没配健康目标就不探测 |
+| `status.reasons[]` | 面向人的解释 | 容器不可达、serve 不可用等都必须在里面说清 |
+
+### `POST /api/services`（admin）
+
+```json
+{ "displayName": "家庭日历", "category": "家庭", "icon": "calendar",
+  "preferredUrl": "https://family-nas.tail585599.ts.net:8443/calendar",
+  "description": null, "healthPath": null }
+```
+
+`displayName` 必填；`icon` 只接受内置图标键或 `https://` URL；`preferredUrl` / `healthTarget`
+只接受 `http` / `https`，且拒绝内嵌凭据、通配地址与超过 2048 字符的值（细节见 06-security.md §3）。
+返回 `201` + `ServiceView`。
+
+### `PATCH /api/services/:id`（admin）
+
+只传要改的字段。`visibility` 为 `hidden` 时 viewer 侧完全看不到；`clearPreferredUrl: true`
+用于把首选入口交还给自动优先级。**任何一次 `PATCH` 都会把该服务标记为 `userEdited`**，
+此后自动发现不再覆盖它的展示属性（这是"名字/图标/顺序刷新与重启后不丢"的机制）。
+
+校验失败 → `400 VALIDATION_FAILED`，`fieldErrors` 指出具体字段（例如 `preferredUrl: "只允许 http/https"`）。
+
+### `DELETE /api/services/:id`（admin）
+
+```json
+{ "ok": true, "mode": "hidden", "service": { "id": "3f1c…", "visibility": "hidden" } }
+```
+
+`mode` 三态：`deleted`（手工服务，真的删）、`hidden`（自动服务，自动发现还会再出现，只是不展示）、
+`reset`（清掉用户覆盖，回到自动派生）。**自动服务永远不会被"删除"** —— 它下轮发现就会回来，
+假装删掉才是骗人。
+
+### `POST /api/services/:id/health`（admin）
+
+请求体可选 `{ "healthTarget": "http://127.0.0.1:36065/health" }`（不传则用服务自身配置的目标）。
+
+```json
+{ "service": { "id": "3f1c…", "status": { "health": "ok", "…": "…" } },
+  "health": { "state": "ok", "statusCode": 200, "durationMs": 42, "detail": null, "at": "2026-10-16T12:40:00.000Z" } }
+```
+
+被拒绝的目标同样返回 `200` + `health.state: "fail"`，但 `detail` 明确写"已拒绝"，
+且**不会发出任何请求**（`validateHealthTarget()` 在探测之前拦截）；未配置目标 → `400`。
+探测结果**只在内存里**（不落库、不当成"该地址可信"的凭据）。
+
+---
+
+## 6.6 聚合搜索 `/api/search`
+
+| 接口 | 权限 | 说明 |
+| --- | --- | --- |
+| `GET /api/search?q=<关键词>&limit=<1-20>` | viewer | 服务 / 容器 / 设备 / 工具，**按调用者角色过滤** |
+
+```json
+{
+  "items": [
+    { "kind": "service", "id": "3f1c…", "title": "家庭日历", "subtitle": "家庭 · Serve HTTPS",
+      "url": "https://family-nas.tail585599.ts.net:8443/calendar", "keywords": ["family-calendar", "docker:sisi/sisi-calendar"] }
+  ],
+  "query": "日历"
+}
+```
+
+- `limit` 默认 `8`、上限 `20`（超出按 20 处理，不报错）。
+- 匹配：标题与 `keywords` 的大小写不敏感**子串**匹配；分组顺序 服务 → 容器 → 设备 → 工具，
+  同组内"标题命中"排在"keywords 命中"之前，其余按标题字典序。
+- **只索引调用者有权查看的内容**：服务走按角色过滤的列表（非 admin 不含 hidden），
+  **设置 / 用户 / 审计 / Token 一律不进索引**。设备条目 `url` 恒为 `null`（设备没有可点击入口）。
+- **搜索不产生副作用**：工具走 `probe: false`，不触发端口/HTTP 探测。
+- 单个数据源失败**不会**让搜索 500（降级为该组空结果，并写一条 `warn` 日志）。
+
+---
+
 ## 7. 用户与偏好
 
 ### `GET /api/users/me`
@@ -516,6 +672,8 @@ data: {}
 | `/api/auth/session`、`login`、`login/totp`、`bootstrap` | ✅ | ✅ | ✅ |
 | `/api/auth/logout`、`/api/auth/password` | ❌ | ✅ | ✅ |
 | `/api/overview`、`/api/containers*`、`/api/tailscale/*`、`/api/system/*`、`/api/tools*` | ❌ | ✅ | ✅ |
+| `/api/services`（GET）、`/api/services/:id`（GET）、`/api/search` | ❌ | ✅ | ✅（可见 hidden） |
+| `/api/services` 及 `/api/services/:id*` 的**写**方法（POST/PATCH/DELETE） | ❌ | ❌ | ✅ |
 | `/api/users/me*` | ❌ | ✅ | ✅ |
 | `/api/users` 及 `/api/users/:id*` | ❌ | ❌ | ✅ |
 | `/api/settings` 及 `/api/settings/*` | ❌ | ❌ | ✅ |
@@ -524,6 +682,10 @@ data: {}
 
 接口的任何变动必须同步更新本文件，并在 [09-changelog.md](./09-changelog.md) 记录。
 
+- **S1-01…S1-05（服务注册表、服务墙、快捷搜索）**：新增 `/api/services` 读写接口与
+  `GET /api/search`（见 §6.5 / §6.6）；`/api/services` 与 `/api/search` 已加入
+  `PROTECTED_PREFIXES`（前缀守卫 = 登录 + CSRF），写方法在 handler 内再 `assertAdmin`；
+  错误码沿用既有 `VALIDATION_FAILED` / `NOT_FOUND` / `FORBIDDEN`，**未新增错误码**。
 - **S0-03（两步验证 TOTP）**：新增 `POST /api/auth/login/totp`；
   `POST /api/auth/login` 对已启用 TOTP 的账号改回 `{ totpRequired, challengeToken, expiresAt }` 且不发 Cookie；
   `user` 对象新增 `totpEnabled`（另有 `totpConfirmedAt`）；

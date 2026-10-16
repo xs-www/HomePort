@@ -194,15 +194,85 @@
 > **清理**：`AuthService.purgeExpiredTotpState()` 由 `server/src/app.ts` 的定时器调用，
 > 删除已过期、或已消费超过 24 小时的挑战（`TotpChallengesRepository.purgeExpired(24)`）。
 
+### `services`（迁移 v4）
+
+服务注册表的主表：**一行 = 用户看到的一个「服务」**（家庭日历 / Gitea / WorldForge…）。
+这是本项目里唯一一处"用户可写"的数据（除账号与设置外），因此写入纪律写得最细。
+
+| 列 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PK | `crypto.randomUUID()`；**与容器 ID 无关** |
+| `slug` | TEXT | NOT NULL UNIQUE | 稳定可读键（`[a-z0-9-]`），冲突时由 `ServicesRepository.uniqueSlug()` 追加 `-2`、`-3` |
+| `display_name` | TEXT | NOT NULL | 展示名（自动派生或用户改写） |
+| `description` / `icon` / `category` | TEXT | NULL | 展示属性；`icon` = 内置图标键或 `https://` URL |
+| `preferred_url` | TEXT | NULL | **用户指定并验证过**的首选入口，入口优先级最高（rank 0） |
+| `source_type` | TEXT | NOT NULL | `docker` / `serve` / `manual` |
+| `source_ref` | TEXT | NOT NULL，`UNIQUE(source_type, source_ref)` | **稳定来源标识，不含容器 ID**（见下） |
+| `binding_refs` | TEXT | NOT NULL DEFAULT `'[]'` | JSON 数组：稳定绑定标识（本仓唯一的 JSON 列） |
+| `visibility` | TEXT | NOT NULL DEFAULT `'visible'` | `visible` / `hidden` |
+| `sort_order` | INTEGER | NOT NULL DEFAULT 100 | 越小越靠前 |
+| `favorite` | INTEGER | NOT NULL DEFAULT 0 | 0/1 |
+| `health_target` / `health_path` | TEXT | NULL | 可选的健康探测目标（**显式配置才探测**） |
+| `user_edited` | INTEGER | NOT NULL DEFAULT 0 | 1 = 用户改过展示属性，**自动发现不得覆盖** |
+| `created_at` / `updated_at` | TEXT | NOT NULL | ISO |
+| `updated_by` | TEXT | NULL | 最后修改者用户名（审计线索） |
+
+索引：`idx_services_sort(visibility, sort_order, display_name)`、`idx_services_source(source_type, source_ref)`
+
+> **为什么身份不认容器 ID**：容器被 `docker compose up -d` 重建后 ID 一定变，
+> 而 Compose 项目/服务名与容器名不变。因此 `source_ref` 取
+> `docker:<composeProject>/<composeService>`，没有 Compose 标签时退化为
+> `docker:<规范化容器名>`（去掉 `-1`/`_2` 这类副本后缀）；serve 路由取
+> `serve:<host>:<port><path>`。容器 ID 只出现在 `service_bindings` 里，作为"当前关联"的快照。
+> 这条规则直接支撑验收用例「容器重建更换 ID 后关联仍可恢复」。
+>
+> **自动发现与用户配置的边界**：`ServicesRepository.updateUserFields()` 是唯一能改展示属性的入口，
+> 且必然置 `user_edited = 1`；发现走 `upsertDiscovered()`，其 SQL 用
+> `CASE WHEN user_edited = 0 THEN ? ELSE 列名 END` 保证不覆盖用户值。
+> 想把某个服务交还给自动层，只有显式「重置为自动」（`clearUserOverrides()`）。
+
+### `service_bindings`（迁移 v4）
+
+发现结果的**快照**（可丢可重算），用于展示归属与诊断，**不参与服务身份**。
+
+| 列 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `id` | INTEGER | PK AUTOINCREMENT | — |
+| `service_id` | TEXT | NOT NULL REFERENCES services(id) ON DELETE CASCADE | — |
+| `kind` | TEXT | NOT NULL | `container` / `serve` |
+| `ref` | TEXT | NOT NULL，`UNIQUE(service_id, kind, ref)` | 稳定绑定标识 |
+| `container_id` | TEXT | NULL | **当前**容器 ID（会变，仅作关联线索） |
+| `container_name` / `compose_project` / `compose_service` | TEXT | NULL | 用于容器重建后重新找回关联 |
+| `scheme` / `host` / `port` / `path` / `url` | — | NULL | 入口原始信息（serve 路由用） |
+| `reachability` / `accessible` / `rank` | — | — | 判定结果快照（rank 见 03 文档的入口优先级） |
+| `created_at` / `updated_at` | TEXT | NOT NULL | ISO |
+
+索引：`idx_service_bindings_service(service_id)`
+
+> 每次发现对该服务的绑定**整体替换**（单事务：`DELETE` + 批量 `INSERT`），
+> 所以这张表永远不会"越攒越脏"。候选入口、可达性、容器运行态、健康结果一律**实时计算**，
+> 不落库 —— 落库就会变成"缓存住的谎话"（例如容器已经停了，界面还显示可达）。
+
+### `service_preferences`（迁移 v4）
+
+单例偏好 KV（视图模式、折叠的分类等），**不含任何权限敏感内容**。
+
+| 列 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `key` | TEXT | PK | 偏好键 |
+| `value` | TEXT | NOT NULL | 值（统一 TEXT，避免为加一项就迁移） |
+| `updated_at` | TEXT | NOT NULL | ISO |
+
 ## 3. 迁移
 
-`MIGRATIONS`（`src/db/database.ts`）当前有三项：
+`MIGRATIONS`（`src/db/database.ts`）当前有四项：
 
 | version | name | 内容 |
 | --- | --- | --- |
 | 1 | `initial_auth_schema` | 用户 / 会话 / 偏好 / 审计 四张表与全部索引 |
 | 2 | `runtime_settings` | `settings` 表（运行时设置覆盖层） |
 | 3 | `totp_two_factor` | `users` 新增 `totp_secret` / `totp_enabled` / `totp_confirmed_at` / `totp_last_counter`；新建 `totp_recovery_codes` / `totp_challenges` 两张表与索引 |
+| 4 | `services_registry` | 新建 `services` / `service_bindings` / `service_preferences` 三张表与两个索引（服务注册表，Sprint 1） |
 
 **迁移规则**
 

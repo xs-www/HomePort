@@ -550,7 +550,63 @@ docker compose up -d
 
 - 数据库迁移在启动时自动执行（幂等，已应用的会跳过）。
 - 前端产物打进镜像，浏览器刷新即拿到新版本（`index.html` 强制 `no-cache`）。
-- 建议升级前备份（见 `07-data-model.md` §4）。
+- 建议升级前备份（见 §10 —— **别只拷 `portal.sqlite`**，WAL 模式会丢最新写入）。
+
+### 7.1 升级到 Sprint 1（服务注册表 / 服务墙）
+
+**结论先说：这次升级不动任何已有数据，也不需要改 compose 或 Serve 配置。**
+
+| 项 | 变化 |
+| --- | --- |
+| 数据库 | 迁移 **v4 `services_registry`** 追加三张新表（`services` / `service_bindings` / `service_preferences`） |
+| 已有表 | 用户、会话、偏好、设置、审计、TOTP **一列未改**（升级不改写任何既有行） |
+| 环境变量 | **无新增**（发现规则与探测超时是代码常量；健康目标按服务存在库里） |
+| 卷 | 不变（`homeport-data:/data`） |
+| Tailscale Serve | 不变（门户**只读** serve 配置，不会去写 `tailscale serve`） |
+| 首页 | **`/` 从「总览」变为「服务墙」，总览迁到 `/overview`**（书签请更新；侧栏已同时提供两个入口） |
+
+升级步骤（NAS / 任意 Docker 主机，保持数据卷不动）：
+
+```bash
+# 1) 一致性备份（§10 方案 A：不停服务；或方案 B：停容器后整卷打包）
+docker exec -e NODE_PATH=/app/node_modules homeport-portal \
+  node -e "const D=require('better-sqlite3');const db=new D('/data/portal.sqlite');db.exec(\"VACUUM INTO '/tmp/snap.sqlite'\");db.close()"
+docker cp homeport-portal:/tmp/snap.sqlite ./portal-pre-sprint1.sqlite
+
+# 2) 给当前镜像打回滚标签（出问题能秒退）
+docker tag homeport:local homeport:pre-sprint1     # CI 镜像换成对应 tag
+
+# 3) 升级（数据卷不动！绝对不要 docker compose down -v）
+docker compose stop homeport
+docker compose up -d --build homeport              # 或 docker compose pull homeport && docker compose up -d
+
+# 4) 确认迁移已应用 + 数据无损
+docker compose logs homeport | grep -i migration   # 若日志级别未开启，用 §5 的方式进库查
+docker exec -e NODE_PATH=/app/node_modules homeport-portal node -e "const D=require('better-sqlite3');const db=new D('/data/portal.sqlite',{readonly:true});console.log(db.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all());db.close()"
+```
+
+打开首页后应能看到服务墙；若提示 `serve` 数据源不可用，说明当前是 **API 模式** ——
+serve 路由需要 CLI 模式（§4 与 `02-configuration.md` §2 的说明），不是升级失败。
+
+**回滚**（迁移 v4 是纯追加，回滚安全 —— 旧版本代码看不到这三张表也不会报错）：
+
+```bash
+docker compose stop homeport
+docker tag homeport:pre-sprint1 homeport:local      # 或改 compose 里的 image 标签
+docker compose up -d homeport                       # 旧镜像照常启动，v3 数据结构完好
+```
+
+只有在**确认不再回滚**时才清理新表（可选，且务必先备份）：
+
+```sql
+DROP TABLE IF EXISTS service_bindings;
+DROP TABLE IF EXISTS services;
+DROP TABLE IF EXISTS service_preferences;
+DELETE FROM schema_migrations WHERE version = 4;
+```
+
+> 手工删 `schema_migrations` 那行是为了让下次升级能重跑 v4；如果只删表不删这行，
+> 新版代码启动会认为迁移已应用 → 表不存在 → 接口 500。**两者必须一起处理**。
 
 ## 8. 资源占用与调优
 
@@ -619,18 +675,55 @@ server {
 
 **必须把密钥与数据库一起备份**（分开备份 = 恢复时读不出敏感字段）：
 
+> **⚠️ 千万不要只拷 `portal.sqlite`。** 数据库跑在 **WAL 模式**下，已提交的数据可能还留在
+> `portal.sqlite-wal` 里没有 checkpoint 回主文件。Sprint 1 实测：主库文件停在 `03:59`，
+> 而同目录的 `portal.sqlite-wal` 有 140KB —— **v3 迁移记录与近期审计全在 WAL 里**，
+> 直接拷主文件的"备份"能正常打开、看起来没问题，却悄悄少了几小时的数据（含迁移状态，
+> 恢复后可能被判定为"未迁移"而重跑）。`portal.sqlite-shm` / `portal.sqlite-wal` 是数据库的一部分。
+
+推荐两种做法，按"能不能停容器"选：
+
+**A. 不停服务：用 SQLite 自己导出一致快照（推荐，日常用它）**
+
 ```bash
-# 备份到当前目录（Linux/NAS/macOS）
+# 容器内导出到 /tmp（不动正在服务的库）
+docker exec -e NODE_PATH=/app/node_modules homeport-portal \
+  node -e "const D=require('better-sqlite3');const db=new D('/data/portal.sqlite');db.exec(\"VACUUM INTO '/tmp/snap.sqlite'\");db.close()"
+docker cp homeport-portal:/tmp/snap.sqlite ./portal-$(date +%Y%m%d-%H%M%S).sqlite
+```
+
+Windows（PowerShell）把脚本落成文件再拷进去，避免嵌套引号被 PowerShell 吃掉：
+
+```powershell
+# 脚本内容见仓库外维护的 db-consistent-export.js（Sprint 1 验证时使用）
+docker cp .\db-consistent-export.js homeport-portal:/tmp/
+docker exec -e NODE_PATH=/app/node_modules homeport-portal node /tmp/db-consistent-export.js
+docker cp homeport-portal:/tmp/consistent.sqlite .\portal-live.sqlite
+```
+
+导出完成后务必核对（脚本已内置）：`schema_migrations` 的版本列表、`users`/`audit_log` 条数、
+`pragma integrity_check` = `ok`。这条路径**必须再单独备份 `secret.key`**，否则密文读不回来。
+
+**B. 能停服务：整卷打包（最稳，且顺带包含密钥）**
+
+```bash
+docker compose stop homeport     # 停写，保证 WAL 已 checkpoint
 docker run --rm -v homeport-data:/data -v "$PWD:/backup" alpine \
   tar czf /backup/homeport-data-$(date +%Y%m%d-%H%M%S).tgz -C /data .
+docker compose start homeport
 ```
 
 Windows（PowerShell）：
 
 ```powershell
+docker compose stop homeport
 docker run --rm -v homeport-data:/data -v "${PWD}:/backup" alpine `
   tar czf /backup/homeport-data-$(Get-Date -Format yyyyMMdd-HHmmss).tgz -C /data .
+docker compose start homeport
 ```
+
+> 注意 `docker run ... tar` 在**容器仍在写**的情况下读取卷，理论上是活文件拷贝，
+> 一致性没有保证 —— 所以这里显式 `stop` 再打包。若不能停机，用 A 方案。
 
 恢复：`docker compose down` → 把压缩包解回卷 → `docker compose up -d`：
 

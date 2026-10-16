@@ -112,21 +112,54 @@ HomePage/                     # 仓库目录名（产品名为 HomePort，目录
 浏览器
   │  1) GET /                     → 静态前端（SPA）
   │  2) GET /api/auth/session     → 会话/角色/CSRF token
-  │  3) GET /api/overview         → 首屏聚合（并行取 4 个数据源）
-  │  4) GET /api/system/stream    → SSE 实时指标（默认 3s 一帧）
-  │  5) GET /api/containers       → 容器墙
-  │  6) GET /api/tailscale/devices→ 设备表
-  │  7) GET /api/tools            → 工具卡
+  │  3) GET /api/services         → 首页服务墙（聚合：容器 + serve 路由 + 服务注册表 + 健康）
+  │  4) GET /api/search?q=        → Ctrl/Cmd+K 快捷检索（按角色过滤）
+  │  5) GET /api/overview         → 总览聚合（并行取 4 个数据源）
+  │  6) GET /api/system/stream    → SSE 实时指标（默认 3s 一帧）
+  │  7) GET /api/containers       → 容器墙
+  │  8) GET /api/tailscale/devices→ 设备表
+  │  9) GET /api/tools            → 工具卡
   ▼
 Fastify
   ├─ 鉴权钩子（会话 cookie → 用户/角色）
   ├─ DockerProvider   ← /var/run/docker.sock
   ├─ TailscaleProvider← tailscale CLI 或 Tailscale API
   ├─ SystemProvider   ← 宿主 /proc、df、nvidia-smi
-  └─ ToolProbe        ← 缓存 + 并发探测本机端口/HTTP
+  ├─ ToolProbe        ← 缓存 + 并发探测本机端口/HTTP
+  └─ ServiceRegistry  ← services 表 + 上面这些数据源的**归纳层**（见 §4.1）
 ```
 
 **缓存策略**：`util/cache.ts` 提供 TTL 缓存。容器列表 TTL 2s、tailnet 设备 5s、工具探测 10s、系统指标 1s（SSE 直取实时值）。缓存的作用是防止多标签页把宿主打爆。
+
+### 4.1 服务层（Sprint 1 起）
+
+```
+容器端口(hostIp:hostPort) ─┐
+tailscale serve 路由       ─┼─→ planDiscovery() ─→ services 表（稳定身份 + 用户配置）
+tailscale 设备（仅搜索）   ─┘        │                      │
+                                     │                      ▼
+            实时容器/端口/可达性 ────┴─→ buildServiceEntries() ─→ 入口候选（含全部备选）
+                                            │
+                                            ├─→ pickEntry()            首选入口（只从可达里选）
+                                            └─→ resolveServiceStatus() 容器/可达/健康 三维状态
+```
+
+三层职责必须分清，混起来就会写出"看起来对但会骗人"的界面：
+
+| 层 | 内容 | 存储 |
+| --- | --- | --- |
+| **事实层** | 容器、端口绑定、可达性、serve 路由 | 不落库，实时取（容器 2s / 设备 5s 缓存） |
+| **注册表层** | 服务身份、展示属性、用户配置（名称/图标/分类/首选入口/排序/收藏/健康目标） | `services` 表（**用户可写**） |
+| **派生层** | 入口候选与优先级、首选入口、三维状态 | 不落库，每次读请求实时算 |
+
+**为什么不把派生层缓存进库**：容器随时可能停、Serve 配置随时可能变。把"可达"写进数据库，
+就会出现"容器已经停了、界面还显示绿色"的谎话 —— 而这类谎话在故障排查时最致命。
+`service_bindings` 只是"上一次发现结果"的快照（用于诊断与容器重建后找回关联），
+候选入口与状态永远现算。
+
+**服务身份为什么不认容器 ID**：`docker compose up -d` 之后容器 ID 一定变，而 Compose 项目/服务名、
+容器名、serve 路由的 `host:port/path` 不变。服务身份取后者（`source_type + source_ref`），
+容器 ID 只作为绑定快照里的"当前关联"。这是"容器重建后用户配置不丢"的唯一实现方式。
 
 ## 5. tailnet 可达性判定（F1 核心算法）
 

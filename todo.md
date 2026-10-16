@@ -12,6 +12,46 @@
 - [x] 统一错误契约 `{ error: { code, message, details } }`
 - [x] `.gitattributes` 统一换行符
 
+### F0 服务墙 / 服务注册表（Sprint 1）
+- [x] 迁移 **v4 `services_registry`**：`services` / `service_bindings` / `service_preferences`
+      （纯追加，既有表一列未改；真实库演练 v2→v4、v3→v4 均通过且幂等）
+- [x] **稳定服务身份**：`source_type + source_ref`（`docker:<compose项目>/<compose服务>` /
+      规范化容器名 / `serve:<host>:<port><path>` / `manual:<uuid>`），**不含容器 ID** ——
+      容器重建换 ID 后用户配置仍能挂回同一服务
+- [x] **自动发现不得覆盖用户配置**：`upsertDiscovered()` 的 SQL 用
+      `CASE WHEN user_edited = 0` 保护用户值；`updateUserFields()` 是唯一能改展示属性的入口
+- [x] **发现与合并**：容器端口 + `tailscale serve` 路由（路径级）归并成服务；
+      serve 归属优先用 `targetPort` + 容器名匹配，多容器冲突**不猜**（作为独立服务并写进 notes）
+- [x] **入口优先级与去重（S1-02）**：用户指定 0 > Serve HTTPS 1 > Tailnet 2 > LAN 3 > 仅本机 4；
+      `127.0.0.1`/`localhost` 与 `0.0.0.0`/`::` 去重；默认端口与尾斜杠规范化；
+      **保留全部候选入口**（含不可达）供诊断
+- [x] **首选入口只从可达候选里取**；一个可达的都没有 → `entry: null` 并给出原因，不给死链
+- [x] **三维状态分离（S1-05）**：`status.container`（容器运行）/ `status.reachable`（入口可达）/
+      `status.health`（健康检查）各自独立，永远不合并成"服务挂了"；`reasons[]` 给人话解释
+- [x] **健康探测防 SSRF（S1-05）**：默认 `skipped` 不探测；只允许 http/https、拒绝内嵌凭据 /
+      通配地址 / 云元数据 / link-local / Docker API 端口(2375-2377) / unix socket；
+      不跟随跳转、3s 超时、响应体截断 16KB、结果只在内存不落库
+- [x] **API（S1-03）**：`GET/POST/PATCH/DELETE /api/services*`、`POST /api/services/reorder|discover`、
+      `POST /api/services/:id/health`；写操作 admin + CSRF，viewer 只读且看不到 hidden
+- [x] **聚合搜索（S1-04）**：`GET /api/search`，服务/容器/设备/工具四类，
+      **只索引调用者有权查看的内容**（设置/用户/审计/Token 不进索引），工具走 `probe:false` 无副作用
+- [x] **首页服务墙**（`/`，原总览迁到 `/overview`）：收藏区 + 分类分组 + 卡片网格（移动端 1 列 / ≥640px 2 列 / ≥1024px 3 列）、
+      搜索入口、数据源降级提示（`discovery` 必须透出，不静默为空）、空态引导
+- [x] **服务详情页** `/services/:id`：全部候选入口（含不可达）+ `status.reasons` + 诊断
+      （容器端口 / serve 路由 / notes）——"为什么这个服务不可达"必须查得到
+- [x] **服务管理页** `/admin/services`：排序、收藏、可见性、编辑、新建、重新发现、健康探测；
+      删除语义按来源区分（手工=删除，自动=隐藏，另有"重置为自动"）
+- [x] **`Ctrl/Cmd+K` 命令面板**：全局唤起、防抖 + 竞态保护、`role="combobox"`/`listbox`/`option` +
+      `aria-activedescendant`、↑↓/Enter/Esc 键盘操作
+- [x] **可复用组件**：`Modal`（焦点陷阱 + 归还焦点 + Esc/遮罩关闭）、`ServiceCard`、`ServiceIcon`、
+      `UrlCandidateList`、`ServiceForm`
+- [x] **测试**：服务发现/入口优先级/三维状态/100 服务性能、健康探测 SSRF、API 鉴权与 hidden 过滤、
+      迁移 v4 数据无损、搜索按角色过滤、前端组件与命令面板、E2E（服务墙降级提示 + 手工服务持久化 +
+      Ctrl+K 进详情 + viewer 管理边界）
+- [x] **真实库迁移演练**：用生产库副本（v2 与 v3 各一份）跑 v4，用户/会话/审计/密文逐字不变、幂等
+- [x] **实机发现验证**：真实 Docker + 真实 `tailscale serve` 下，日历首选 `/calendar`、
+      门户 443 归根域名、不可达候选保留并标注、诊断数据完整
+
 ### F1 容器入口墙
 - [x] Docker 只读数据源（dockerode；**类型层面不存在写方法**）
 - [x] endpoint 解析：npipe / unix / tcp / http / https（含 named pipe 归一化）
@@ -236,6 +276,19 @@
       **注意**：E2E 不是发布前置 —— `build-and-push` 只依赖同文件的 `quality`；
       要让它卡住发布需在该文件里也定义 `e2e` job 并把依赖写成 `needs: [quality, e2e]`
       （`needs` 不能跨工作流引用）
+
+- [x] **备份方式修正（Sprint 1 实测发现）**：`portal.sqlite` 跑在 **WAL 模式**，
+      只拷主文件的"备份"会静默丢掉未 checkpoint 的写入（实测主库停在 03:59、`-wal` 有 140KB，
+      v3 迁移与近期审计全在 WAL 里）。`08-operations.md` §10 已改成
+      方案 A（`VACUUM INTO` 一致性导出，不停机）+ 方案 B（停容器后整卷打包），
+      并给出核对项（`schema_migrations` / 条数 / `integrity_check`）
+- [ ] 两个内联弹窗（`pages/admin/SecurityTab.tsx` / `UsersTab.tsx`）尚未迁移到新的
+      `components/Modal.tsx`（Sprint 1 新建，带焦点陷阱与焦点归还）。当前无功能问题，
+      迁移收益是无障碍一致性 + 少两份重复实现
+- [ ] 服务注册表的**外部图标 URL** 需要 `PORTAL_CSP` 的 `img-src` 放行对应来源才能显示
+      （默认 CSP 是 `img-src 'self' data:`）。**不为了图标放宽默认 CSP** —— 管理页已提示这一点
+- [ ] Gitea `/git/` 与 `family-nas` 8443 `/calendar` 的验收用例在 NAS 上复核
+      （开发机上没有这两个容器；夹具测试 `servicesDiscovery.test.ts` 已覆盖该拓扑）
 
 ## 环境备忘
 

@@ -109,6 +109,29 @@ SQLite 连接与迁移。
 
 **`AuditRepository`**：`append(AuditInput)`、`list(limit=100)`、`pruneOlderThan(iso)`
 
+### `src/db/services.ts`
+
+**`ServicesRepository`**（S1-01）——唯一能写 `services` 表的地方，写入纪律写死在 SQL 里。
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `listAll` / `findById` / `findBySlug` | `() => Service[]` / `(id) => Service \| null` / `(slug) => Service \| null` | — |
+| `findBySource` | `(sourceType, sourceRef) => Service \| null` | **稳定身份**查重（发现落库靠它） |
+| `listBindings` | `(serviceIds?) => ServiceBinding[]` | **单条 SQL** 取全部绑定（返回扁平数组，按服务分组的辅助逻辑在服务层），避免 N+1 |
+| `uniqueSlug` | `(base) => string` | 冲突追加 `-2`/`-3`… |
+| `insert` | `(NewServiceInput) => Service` | 新建（手工服务与首次发现） |
+| `upsertDiscovered` | `(DiscoveryUpdateInput) => Service` | **只写自动字段**：`CASE WHEN user_edited = 0 THEN ? ELSE 列名 END` |
+| `updateUserFields` | `(id, UserFieldPatch, updatedBy) => Service \| null` | **唯一**能改展示属性的入口，**必然**置 `user_edited = 1` |
+| `clearUserOverrides` | `(id) => Service \| null` | 「重置为自动」：清用户覆盖并复位 `user_edited` |
+| `setVisibility` / `reorder` / `delete` | — | 隐藏 / 批量排序（单事务）/ 删除 |
+| `replaceBindings` | `(serviceId, BindingInput[]) => void` | 单事务 `DELETE` + 批量 `INSERT`，快照永不越攒越脏 |
+| `getPreference` / `setPreference` / `count` | — | 单例偏好 KV / 计数 |
+
+> **为什么"用户配置不丢"是靠 SQL 而不是靠代码自觉**：发现流程只有 `upsertDiscovered()` 一条路，
+> 它连"写用户字段"的能力都没有（`CASE WHEN user_edited = 0` 在语句里）。想覆盖用户值，
+> 只能显式走 `updateUserFields()`（必然留下 `user_edited = 1`）或 `clearUserOverrides()`。
+> 这样"自动发现不得覆盖用户别名与顺序"就成了**结构保证**，不是"记得别写错"。
+
 ### `src/http/errors.ts`
 
 | 导出 | 签名 | 说明 |
@@ -450,6 +473,41 @@ await settings.initialize();
 任一失败只影响自身并把原因写入 `warnings`，其余照常返回。
 `pickPrimaryDisk(disks)` 选挂载点最短的可读磁盘作为"主磁盘"。
 
+### `src/modules/services/`（服务注册表，S1-01…S1-05）
+
+把"容器 + serve 路由"归纳成用户看得懂的**服务**。四个文件职责严格分开，
+前两个是**纯逻辑**（无 I/O、可直接单测），第三个是编排，第四个是安全边界：
+
+| 文件 | 性质 | 导出 | 说明 |
+| --- | --- | --- | --- |
+| `registry.ts` | 纯函数 | `planDiscovery` `buildServiceEntries` `dedupeEntries` `pickEntry` `compareEntries` `resolveServiceStatus` `findContainerForService` `serveRoutesForService` `containerServiceRef` `serveServiceRef` `normalizeUrl` `normalizeHost` `normalizePath` `defaultPresentation` `humanizeName` `isBuiltinIcon` `BUILTIN_ICONS` `ENTRY_RANK` `ENTRY_LABEL` `slugBaseFor` `DEFAULT_CATEGORY` | 发现规划、入口候选与优先级、三维状态、稳定身份。**不认识数据库，也不发请求**。注意 `planDiscovery` **不盲信** `mapper.mapServeRoutes()` 给出的 serve 归属：它按实时容器列表自己数"有多少容器声称占用同一宿主端口"，`>1` 即视为不可确定（`containers.find` 在冲突时取第一个匹配，停止的容器也会报告自己的端口绑定），改为独立 serve 服务 + 可读原因，快照里也不记该 owner |
+| `healthProbe.ts` | 纯函数 + 单次 fetch | `validateHealthTarget` `runHealthProbe` `HEALTH_PROBE_TIMEOUT_MS` `HEALTH_PROBE_MAX_BODY_BYTES` | 健康探测的 SSRF 拒绝清单与请求纪律（见 [06-security.md](./06-security.md) §3） |
+| `service.ts` | 编排 | `ServiceRegistryService` `resolveHealthTarget` `cleanOptionalUrl` `cleanHealthPath` `cleanIcon` `emptyToNull` `canSee` `matchesQuery` `collectCategories` `toDiscoveryState` `DISCOVERY_CACHE_TTL_FALLBACK_MS` `HEALTH_RESULT_LIMIT` | 取数（容器/设备/serve）→ 规划 → 落库 → 生成视图；写操作校验与审计 |
+| `types.ts` | 类型 | `ServiceView` `ServiceEntryView` `ServiceStatusView` `ServiceListResponse` `ServiceDetailResponse` `ServiceSearchResponse` … | **HTTP 契约**，前端逐字段镜像 |
+
+**三层不可混淆**（`01-architecture.md` §4.1）：事实层（容器/端口/可达性）实时取、不落库；
+注册表层（身份与用户配置）落 `services` 表；派生层（候选入口、首选入口、三维状态）每次读请求现算。
+`service_bindings` 只是"上次发现"的快照，用于诊断与容器重建后找回关联 —— **不是真相**。
+
+**服务身份**：`sourceRef` 取 `docker:<compose项目>/<compose服务>`（无 Compose 标签时退化为
+`docker:<规范化容器名>`：去副本后缀、小写、非字母数字转 `-`）或 `serve:<host>:<port><path>`；
+手工服务取 `manual:<uuid>`。**容器 ID 不在身份里**，只作为绑定快照的"当前关联"——
+这是"容器重建换 ID 后配置不丢"的唯一实现方式。
+
+**发现缓存**：`TtlCache`（TTL 与容器列表一致，默认 2s；配置为 0 则不缓存），
+`sync({ force: true })` 由 `POST /api/services/discover` 触发。
+`ServiceRegistryService` 在**第一次读请求**时才取数，启动阶段不发任何请求
+（`settings.initialize()` 之前不许有网络/进程调用）。
+
+**入口优先级**（`ENTRY_RANK`，数字越小越优先）：`0` 用户指定 → `1` Serve HTTPS →
+`2` Tailnet → `3` LAN → `4` 仅本机。`dedupeEntries()` 按 URL 与
+`loopback:<port><path>` 两个键去重（后者解决 `127.0.0.1` 与 `localhost` 同时出现），
+`pickEntry()` **只从可达候选里**取第一个；一个可达的都没有 → `entry: null`，
+并在 `status.reasons` 里说明原因（前端据此解释而不是给死链）。
+
+**健康探测**：默认 `skipped`（不配置就不探测）；结果只在内存（`HEALTH_RESULT_LIMIT = 512`，
+超限淘汰最早一条），进程重启即清空 —— **落库会把"某一刻的探测结果"变成"永久的谎话"**。
+
 ---
 
 ## 3. 路由层 `src/api/`
@@ -464,6 +522,8 @@ await settings.initialize();
 | `tailscale.ts` | `registerTailscaleRoutes` | `/api/tailscale/*` |
 | `system.ts` | `registerSystemRoutes` `SSE_PING_INTERVAL_MS` `SSE_MAX_LIFETIME_MS` | `/api/system/*` |
 | `tools.ts` | `registerToolRoutes` | `/api/tools/*` |
+| `services.ts` | `registerServiceRoutes` | `/api/services/*`（写操作 handler 内 `assertAdmin`） |
+| `search.ts` | `registerSearchRoutes` `buildSearchHits` `SEARCH_DEFAULT_LIMIT` `SEARCH_MAX_LIMIT` | `GET /api/search` |
 | `users.ts` | `registerUserRoutes` `DEFAULT_AUDIT_LIMIT` | `/api/users/*` |
 | `index.ts` | `registerRoutes` `PROTECTED_PREFIXES` | 总装 + 权限模型 |
 

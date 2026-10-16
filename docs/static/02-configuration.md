@@ -183,6 +183,28 @@ connect-src 'self'; form-action 'self'; frame-ancestors 'none'
 - 本节（安全响应头 / TOTP）的所有变量都是**引导期读取**（`config.ts` 在启动时构造一次配置），
   改完需重启容器，且**不在**「界面设置」里 —— 与 §0 的 `restart` 级项同类。
 
+### 服务注册表（S1-01…S1-05）
+
+**没有新增任何环境变量**。服务发现的规则、健康探测的超时、发现缓存的 TTL 都是代码里的常量：
+
+| 常量 | 值 | 说明 |
+| --- | --- | --- |
+| `HEALTH_PROBE_TIMEOUT_MS` | `3000` | 单次探测超时（`healthProbe.ts`） |
+| `HEALTH_PROBE_MAX_BODY_BYTES` | `16384`（16KB） | 响应体**读满即 cancel**（不读完整响应体，防对端用无限流撑爆内存） |
+| `DISCOVERY_CACHE_TTL_FALLBACK_MS` | `5000` | 发现缓存的**兜底** TTL：正常情况下跟随 `PORTAL_CACHE_CONTAINERS_TTL_MS`（默认 2000，随设置热调，`0` 表示不缓存），只有配置值非法时才用它 |
+| `HEALTH_RESULT_LIMIT` | `512` | 内存里保留的最近健康结果条数（结果不落库） |
+
+理由是它们属于"实现细节"，调大调小只会让行为更难预测。
+
+需要按部署调整的是**每服务的数据**（不在这里配）：健康检查目标与首选入口由管理员在
+`/admin/services` 里逐个服务保存，存在 `services` 表（见 [07-data-model.md](./07-data-model.md) §2）。
+
+> **唯一与配置有关的坑**：服务墙能不能显示 `tailscale serve` 路由，取决于 §4 的模式选择 ——
+> **API 模式读不到 serve 配置**（`tailscale serve status` 是 CLI 的能力）。此时
+> `GET /api/services` 会返回 `discovery.serveAvailable: false` 并在 `serveDetail` 里写明原因，
+> 前端显示降级提示条，而**不是**假装"这些服务不存在"。要做"家庭日历挂 `/calendar`"这类
+> 路径暴露，必须用 `PORTAL_TAILSCALE_MODE=cli`。
+
 ## 3. Docker 数据源（F1）
 
 | 变量 | 默认值 | 说明 |
